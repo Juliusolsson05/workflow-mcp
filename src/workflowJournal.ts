@@ -230,7 +230,7 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
 
 class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
   readonly #identity: JournalIdentity
-  readonly #previous: readonly HistoricalCall[]
+  readonly #previous: ReadonlyMap<string, readonly HistoricalCall[]>
   readonly #records: JournalRecord[]
   readonly #sessions: JournalSessionRecord[]
   readonly #pending = new Map<number, JournalMiss & { completed: boolean }>()
@@ -245,7 +245,14 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     sessions: JournalSessionRecord[],
   ) {
     this.#identity = identity
-    this.#previous = previous?.sourceHash === identity.sourceHash ? historicalCalls(previous) : []
+    const historical = previous?.sourceHash === identity.sourceHash ? historicalCalls(previous) : []
+    const byKey = new Map<string, HistoricalCall[]>()
+    for (const call of historical) {
+      const matches = byKey.get(call.key)
+      if (matches) matches.push(call)
+      else byKey.set(call.key, [call])
+    }
+    this.#previous = byKey
     this.#records = records
     this.#sessions = sessions
     this.#previousKey = ''
@@ -257,27 +264,29 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     const key = createJournalKey(this.#previousKey, call.prompt, call.options)
     this.#previousKey = key
 
-    const historical = this.#previous[callIndex]
-    const reusable =
-      this.#canReusePrefix &&
-      historical !== undefined &&
-      historical.key === key &&
-      historical.hasResult &&
-      // Claude records null outcomes, but a null means the agent did not produce usable work. Replaying
-      // it forever would turn a transient provider failure or user skip into a permanent workflow hole.
-      historical.result !== null
+    // Parallel calls are admitted in deterministic JavaScript order, but Claude appends `started`
+    // records when scheduler/provider work actually begins. File order is therefore not call order.
+    // The chained v2 key already commits to every preceding call, so key lookup is both sufficient
+    // and the only ordering rule that survives a saturated or retried parallel phase.
+    const candidates = this.#previous.get(key) ?? []
+    const historicalResult = this.#canReusePrefix
+      ? candidates.find((candidate) => candidate.hasResult && candidate.result !== null)
+      : undefined
+    const historicalSession = this.#canReusePrefix
+      ? candidates.find((candidate) => candidate.providerSession !== undefined)
+      : undefined
 
     this.#records.push({ type: 'started', key, agentId: call.agentId })
 
-    if (reusable) {
-      this.#records.push({ type: 'result', key, agentId: call.agentId, result: historical.result })
+    if (historicalResult !== undefined) {
+      this.#records.push({ type: 'result', key, agentId: call.agentId, result: historicalResult.result })
       return {
         callIndex,
         key,
         agentId: call.agentId,
         reused: true,
-        sourceAgentId: historical.agentId,
-        result: historical.result,
+        sourceAgentId: historicalResult.agentId,
+        result: historicalResult.result,
       }
     }
 
@@ -290,9 +299,9 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       key,
       agentId: call.agentId,
       reused: false,
-      ...(historical?.key === key && historical.providerSession !== undefined
-        ? { providerSession: { ...historical.providerSession } }
-        : {}),
+      ...(historicalSession?.providerSession === undefined
+        ? {}
+        : { providerSession: { ...historicalSession.providerSession } }),
     }
     this.#pending.set(callIndex, { ...decision, completed: false })
     return decision

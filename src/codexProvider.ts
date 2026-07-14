@@ -11,6 +11,7 @@ import {
   AgentProviderAbortError,
   AgentProviderFailure,
 } from './agentProvider.js'
+import { adaptCodexOutputSchema } from './codexSchema.js'
 import type {
   AgentProvider,
   AgentProviderActivity,
@@ -79,6 +80,16 @@ export class CodexAgentProvider implements AgentProvider {
       )
     }
 
+    let schemaAdapter
+    try {
+      schemaAdapter = request.schema === undefined ? undefined : adaptCodexOutputSchema(request.schema)
+    } catch (cause) {
+      throw new AgentProviderFailure(
+        `Codex cannot represent this workflow output schema: ${cause instanceof Error ? cause.message : String(cause)}`,
+        { code: 'codex-schema-unsupported', cause },
+      )
+    }
+
     const threadOptions = this.#threadOptions(request)
     const thread = request.session
       ? this.#client.resumeThread(request.session.id, threadOptions)
@@ -88,7 +99,7 @@ export class CodexAgentProvider implements AgentProvider {
       : `${request.instructions}\n\nTask:\n${request.prompt}`
     const turnOptions: TurnOptions = {
       signal: context.signal,
-      ...(request.schema === undefined ? {} : { outputSchema: request.schema }),
+      ...(schemaAdapter === undefined ? {} : { outputSchema: schemaAdapter.outputSchema }),
     }
 
     let providerSession: ProviderSessionReference | undefined
@@ -185,7 +196,10 @@ export class CodexAgentProvider implements AgentProvider {
     return {
       output: request.schema === undefined
         ? { type: 'text', text: finalResponse }
-        : { type: 'structured', value: parseStructuredOutput(finalResponse, providerSession) },
+        : {
+            type: 'structured',
+            value: schemaAdapter?.restore(parseStructuredOutput(finalResponse, providerSession)),
+          },
       ...(usage === undefined ? {} : { usage }),
       ...(providerSession === undefined ? {} : { providerSession }),
       diagnostics: {

@@ -38,4 +38,45 @@ describe.skipIf(process.env.WORKFLOW_CODEX_INTEGRATION !== '1')('Codex SDK integ
       clearTimeout(timer)
     }
   }, 70_000)
+
+  it('runs a Claude-style schema with an optional field through Codex strict output', async () => {
+    const provider = new CodexAgentProvider()
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort('Codex schema integration timeout'), 60_000)
+    const workflow = parseWorkflowSource(`
+      export const meta = {
+        name: 'codex-schema-integration',
+        description: 'Real strict-schema compatibility check',
+      }
+      return await agent('Return value WORKFLOW_SCHEMA_OK. There is no optional value, so return null for it. Do not use tools.', {
+        schema: {
+          type: 'object',
+          required: ['value'],
+          properties: {
+            value: { type: 'string' },
+            optional: { type: 'string', description: 'No value exists; return null.' },
+          },
+        },
+      })
+    `)
+
+    try {
+      const run = runWorkflow({
+        workflow,
+        cwd: process.cwd(),
+        provider,
+        sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+        signal: controller.signal,
+      })
+      const consume = (async () => {
+        for await (const _event of run.events) {
+          // Draining is required even when this focused assertion does not inspect event payloads.
+        }
+      })()
+      await expect(run.result).resolves.toEqual({ value: 'WORKFLOW_SCHEMA_OK' })
+      await consume
+    } finally {
+      clearTimeout(timer)
+    }
+  }, 70_000)
 })

@@ -21,6 +21,15 @@ export type {
 } from './findWorkflows.js'
 
 export {
+  ClaudeResumeError,
+  claudeResumeSidecarPath,
+  loadClaudeWorkflowResume,
+} from './claudeResume.js'
+export type { ClaudeWorkflowResume, ClaudeWorkflowRunMetadata } from './claudeResume.js'
+
+export { PersistentJournalError, PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
+
+export {
   AgentProviderAbortError,
   AgentProviderFailure,
   throwIfAgentProviderAborted,

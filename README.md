@@ -14,10 +14,10 @@ MCP transport, and Agent Code UI state belong outside the portable `.js` file.
 
 The repository now contains the loader plus the first complete in-process execution baseline:
 restricted workflow workers, provider-neutral scheduling, Claude-compatible helpers, normalized
-events and state projection, an in-memory compatibility journal, nested workflows, a deterministic
-fake provider, and a pinned Codex SDK adapter. It is not registered in Agent Code's `.gitmodules`
-and does not expose an MCP server yet. Durable storage, MCP transport, and Agent Code UI integration
-remain later milestones. The execution decisions are recorded in
+events and state projection, Claude journal import, a private crash-safe resume sidecar, nested
+workflows, a deterministic fake provider, and a pinned Codex SDK adapter. It is not registered in
+Agent Code's `.gitmodules` and does not expose an MCP server yet. MCP transport and Agent Code UI
+integration remain later milestones. The execution decisions are recorded in
 [`EXECUTION_PLAN.md`](./EXECUTION_PLAN.md).
 
 ## Current commands
@@ -37,11 +37,19 @@ node dist/cli.js list ./path/to/project
 # The optional second argument is one JSON value exposed to the workflow as `args`.
 node dist/cli.js run ./path/to/workflow.js '{"files":["src/index.ts"]}'
 
+# Resume the exact source and v2 journal of a persisted Claude run. The optional workflow path
+# selects a live copy; it must byte-match the source Claude saved. Imported runs are read-only.
+node dist/cli.js resume /path/to/claude/session/workflows/wf_id.json \
+  /path/to/project/.claude/workflows/review.js
+
 # Opt-in: consumes a real Codex turn and uses the existing Codex login or API-key setup.
 WORKFLOW_CODEX_INTEGRATION=1 npm run test:integration
 
 # Expensive and never run by CI: 49 real turns across the planned 1/4/8/16/20 fan-outs.
 WORKFLOW_CODEX_BENCHMARK=1 npm run benchmark:codex
+
+# Operator-only override for a measured machine; the normal default remains four native turns.
+WORKFLOW_MCP_CONCURRENCY=12 node dist/cli.js resume /path/to/wf_id.json
 ```
 
 The public API deliberately uses plain names:
@@ -80,12 +88,16 @@ tests or the Codex provider in production. The Codex adapter uses the existing l
 the SDK's API-key mode, passes only an explicit environment allowlist, defaults to workspace-write
 with no network and no approvals, and requires explicit mappings for Claude model aliases.
 
-The in-memory journal implements sequential longest-prefix reuse and interrupted provider-session
-resume. It is intentionally non-durable and must not be shared by concurrent runs of the same
-workflow identity. A persistent journal belongs with the later MCP service/store, not in workflow
-JavaScript. Token budgets charge the explicit provider `totalTokens`; the Codex adapter defines this
-as input plus output tokens (cached input and reasoning are already reported as subsets). Default
-provider concurrency is four pending fan-out measurements; callers can configure it through
+The in-memory journal implements longest-prefix reuse and interrupted provider-session resume. The
+`resume` command imports Claude's saved source and v2 JSONL, then atomically persists the combined
+Claude-plus-Codex run under `~/.workflow-mcp/journals/`. It never rewrites Claude's metadata or
+journal. The sidecar records completed results and Codex thread IDs after every mutation, so a
+second interruption resumes the new suffix instead of restarting it. Concurrent writers for the
+same run remain unsupported until the MCP service owns run locking.
+
+Token budgets charge the explicit provider `totalTokens`; the Codex adapter defines this as input
+plus output tokens (cached input and reasoning are already reported as subsets). Default provider
+concurrency is four pending fan-out measurements; callers can configure it through
 `limits.concurrency`.
 
 ## Why the name
@@ -558,9 +570,12 @@ unchanged sequential call prefix. Once one call misses, every later call execute
 later historical key happens to exist. A `started` entry without a result respawns. `null` results
 are not reusable cache entries.
 
-Claude documents same-session resume. `workflow-mcp` may add durable cross-session caching, but it
-must keep that state external and define stronger invalidation around side effects. A cached
-read-only research result and a cached write-capable agent are not equally safe to replay.
+`workflow-mcp resume` now reads this exact saved run metadata and journal. It verifies the workflow
+name and SHA-256 source identity before execution, restores records by their chained key rather than
+parallel file-arrival order, and continues after the longest reusable prefix. Newly completed
+suffix calls and provider thread IDs go to a private workflow-mcp sidecar; Claude's files remain
+untouched. The CLI forces imported runs to read-only because a cached research result and a cached
+write-capable agent are not equally safe to replay.
 
 ## Local corpus findings
 
@@ -866,7 +881,7 @@ The public TypeScript surface maps cleanly onto most of one workflow `agent()` c
 | Workflow concern | Codex SDK surface | Adapter responsibility |
 | --- | --- | --- |
 | prompt | `thread.runStreamed(prompt)` | preserve Claude string-coercion behavior before the call |
-| schema | `TurnOptions.outputSchema` | parse `finalResponse` as JSON and validate it independently |
+| schema | `TurnOptions.outputSchema` | convert Claude-ordinary objects/options to Codex strict schema, remove synthetic nulls, then validate the original schema |
 | model | `ThreadOptions.model` | resolve provider-neutral/Claude aliases through configuration |
 | effort | `ThreadOptions.modelReasoningEffort` | validate and map the observed effort values |
 | cancellation | `TurnOptions.signal` | join the signal to workflow, timeout, and server cancellation |
@@ -893,6 +908,8 @@ or private session-file parsing:
   response;
 - JSON Schema output produced parseable conforming JSON while command start/completion events were
   delivered during the turn;
+- a Claude-style schema with omitted `additionalProperties` and an optional field passed the Codex
+  strict-output boundary and projected its synthetic null back to omission;
 - aborting through `AbortSignal` while a command was active rejected with `AbortError`;
 - the interrupted thread ID could immediately be passed to `resumeThread()` and completed a later
   turn successfully.
@@ -1005,9 +1022,12 @@ workflow-mcp/
 │   ├── workflowEvents.ts      # provider-neutral event contract
 │   ├── workflowState.ts       # pure replay projection
 │   ├── workflowJournal.ts     # in-memory compatibility journal
+│   ├── persistentWorkflowJournal.ts # private atomic resume sidecar
+│   ├── claudeResume.ts        # persisted Claude metadata/journal importer
 │   ├── agentProvider.ts       # provider boundary
 │   ├── fakeProvider.ts        # deterministic conformance provider
 │   ├── codexProvider.ts       # supported Codex SDK adapter
+│   ├── codexSchema.ts         # portable-to-strict output schema bridge
 │   ├── cli.ts
 │   └── index.ts
 ├── test/
@@ -1024,8 +1044,8 @@ databases, and custom transport would add architecture before conformance exists
 ## Implementation sequence
 
 Phases 0–3 now have an executable baseline on this branch. Worktree creation remains an injected
-host callback, journal storage remains in-memory, and the real Codex fan-out benchmark is opt-in
-work still to be measured. Phase 4 has deliberately not started.
+host callback, Claude import/standalone resume use a private atomic sidecar, and the synthetic Codex
+fan-out benchmark remains opt-in work still to be measured. Phase 4 has deliberately not started.
 
 ### Phase 0: corpus and specification
 

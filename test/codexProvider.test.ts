@@ -209,6 +209,88 @@ describe('CodexAgentProvider', () => {
     expect(result.output).toEqual({ type: 'structured', value: { ok: true } })
   })
 
+  it('bridges Claude-optional schema fields through Codex strict output without changing the result', async () => {
+    const { client, calls } = mockClient([
+      { type: 'thread.started', thread_id: 'thread-schema' },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'message-1',
+          type: 'agent_message',
+          text: '{"findings":[{"title":"real issue","line":null,"details":{"note":null}}]}',
+        },
+      },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 0,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      },
+    ])
+    const provider = new CodexAgentProvider({ client })
+    const schema = {
+      type: 'object',
+      required: ['findings'],
+      properties: {
+        findings: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['title', 'details'],
+            properties: {
+              title: { type: 'string' },
+              line: { type: 'integer' },
+              details: {
+                type: 'object',
+                properties: { note: { type: 'string' } },
+              },
+            },
+          },
+        },
+      },
+    }
+
+    const result = await provider.execute(request({ schema }), {
+      signal: new AbortController().signal,
+      emit: async () => undefined,
+    })
+
+    expect(calls[0]?.turnOptions?.outputSchema).toEqual({
+      type: 'object',
+      required: ['findings'],
+      properties: {
+        findings: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['title', 'line', 'details'],
+            properties: {
+              title: { type: 'string' },
+              line: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+              details: {
+                type: 'object',
+                required: ['note'],
+                properties: {
+                  note: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+                },
+                additionalProperties: false,
+              },
+            },
+            additionalProperties: false,
+          },
+        },
+      },
+      additionalProperties: false,
+    })
+    expect(result.output).toEqual({
+      type: 'structured',
+      value: { findings: [{ title: 'real issue', details: {} }] },
+    })
+  })
+
   it('fails clearly for unmapped Claude models, invalid JSON, and provider session mismatches', async () => {
     const empty = mockClient([])
     const provider = new CodexAgentProvider({ client: empty.client })

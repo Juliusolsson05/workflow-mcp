@@ -265,6 +265,35 @@ describe('InMemoryWorkflowJournal', () => {
     })
   })
 
+  it('restores parallel calls by their chained keys when persisted starts arrive out of order', () => {
+    const firstKey = createJournalKey('', 'one')
+    const secondKey = createJournalKey(firstKey, 'two')
+
+    // Claude persists these records from concurrent scheduler callbacks. A faster second launch can
+    // therefore reach the journal before the first launch even though workflow JavaScript admitted
+    // them in the opposite order. Sorting or trusting file position would silently discard a valid
+    // resume prefix; the chained key is the durable statement of logical order.
+    const capturedClaudeSnapshot: JournalSnapshot = {
+      ...identity,
+      records: [
+        { type: 'started', key: secondKey, agentId: 'old-second' },
+        { type: 'started', key: firstKey, agentId: 'old-first' },
+        { type: 'result', key: secondKey, agentId: 'old-second', result: 'two' },
+        { type: 'result', key: firstKey, agentId: 'old-first', result: 'one' },
+      ],
+    }
+
+    const restored = new InMemoryWorkflowJournal([capturedClaudeSnapshot]).beginRun(identity)
+    expect(restored.admit({ agentId: 'new-first', prompt: 'one' })).toMatchObject({
+      reused: true,
+      result: 'one',
+    })
+    expect(restored.admit({ agentId: 'new-second', prompt: 'two' })).toMatchObject({
+      reused: true,
+      result: 'two',
+    })
+  })
+
   it('exposes interrupted state immediately and guards result ownership', () => {
     const journal = new InMemoryWorkflowJournal()
     const run = journal.beginRun(identity)
