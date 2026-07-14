@@ -12,10 +12,34 @@ The reverse direction matters too: real Claude workflow files should run through
 without an importer or translation step. Provider selection, durable caching, custom metadata,
 MCP transport, and Agent Code UI state belong outside the portable `.js` file.
 
-This directory is only a research and design seed today. It is not registered in `.gitmodules`,
-is not installed by the root package, and does not yet contain an implementation. It is intended
-to become an isolated repository and a submodule under `packages/workflow-mcp` after the corpus,
-scope, and security boundary have been reviewed.
+The repository now contains the first compatibility baseline: a parser for one workflow file,
+project/personal workflow discovery, a validation CLI, and tests against the local reference
+corpus. It is not registered in Agent Code's `.gitmodules` and is not installed by Agent Code yet.
+Agent execution, providers, caching, MCP transport, and UI integration remain future milestones.
+
+## Current commands
+
+```bash
+npm install --include=dev
+npm run check
+
+# Validate one direct workflow path. Direct paths do not require a .js extension.
+npm run build
+node dist/cli.js validate ./path/to/workflow.js
+
+# List personal and project workflows visible from a directory.
+node dist/cli.js list ./path/to/project
+```
+
+The public API deliberately uses plain names:
+
+```ts
+import { findWorkflows, loadWorkflowFile, parseWorkflowSource } from 'workflow-mcp'
+```
+
+`parseWorkflowSource` parses a supplied string. `loadWorkflowFile` adds file-size and byte-hash
+handling. `findWorkflows` performs `.js` discovery and user/project precedence. None of these
+functions executes the workflow body.
 
 ## Why the name
 
@@ -159,13 +183,17 @@ Observed Claude Code `2.1.209` behavior:
 3. User workflows are read from `~/.claude/workflows`.
 4. Project workflow directories are discovered while walking from the repository root toward the
    current working directory.
-5. When project workflows share a normalized name, the definition closest to the current working
+5. When project workflows share the exact same name, the definition closest to the current working
    directory wins.
 6. A project definition beats a personal definition with the same name.
-7. Local project or personal definitions beat plugin definitions.
-8. Plugin definitions beat colliding built-in definitions.
-9. The final visible list is sorted alphabetically by normalized `meta.name`.
-10. Symlinked files can participate subject to Claude's normal path/read safety checks.
+7. Workflow names are exact and case-sensitive; they are not trimmed or normalized.
+8. Plugin workflows normally use the visible identity `<plugin-name>:<workflow-name>`, so plugin
+   composition is not equivalent to inserting plain local names into one map.
+9. Local definitions beat an exact plugin-visible identity, and local/plugin identities beat an
+   exact built-in identity.
+10. The surviving personal/project list is sorted with raw `meta.name.localeCompare()`. The later
+    combined built-in/plugin/local resolver is not globally resorted.
+11. Symlinked files can participate subject to Claude's normal path/read safety checks.
 
 Claude Code `2.1.178` introduced the documented nearest-directory save and lookup behavior. The
 compatibility suite needs collisions at every layer because discovery mistakes can execute a
@@ -177,7 +205,8 @@ different workflow than the user approved.
 
 Observed for `2.1.209`:
 
-- maximum source size: 524,288 bytes;
+- file size limit: 524,288 bytes before UTF-8 decoding;
+- inline source limit: 524,288 JavaScript string code units;
 - Acorn parses with the latest ECMAScript grammar, module source type, top-level await, and
   top-level return enabled;
 - comments and a BOM may precede metadata because they are not AST statements;
@@ -198,7 +227,7 @@ same statement, or a computed initializer are incompatible.
 
 Claude accepts these metadata values:
 
-- strings, numbers, booleans, and `null`;
+- Acorn literal values, including the regexp and bigint values that Acorn represents as literals;
 - arrays without holes or spreads;
 - plain object initializers with noncomputed keys;
 - negative numeric literals;
@@ -233,9 +262,10 @@ type WorkflowMeta = {
 }
 ```
 
-`name` and `description` must be nonempty strings. `phases` is not proven mandatory in the
-installed parser, although all 12 unique local workflows use it. Invalid phase entries are dropped
-rather than making the whole file invalid.
+`name` and `description` must be strings with `length > 0`. Claude does not trim them: a whitespace
+name is accepted and remains distinct, including during collision resolution. `phases` is not
+proven mandatory in the installed parser, although all 12 unique local workflows use it. Invalid
+phase entries are dropped rather than making the whole file invalid.
 
 Unknown literal metadata keys are accepted by the parser but discarded from Claude's normalized
 metadata. Consequently, custom metadata inside `meta` may remain syntactically compatible but is
@@ -1078,4 +1108,3 @@ The initial suite must cover more than happy-path example files.
 - [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 - [MCP Tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)
 - [Node `vm` documentation](https://nodejs.org/api/vm.html)
-
