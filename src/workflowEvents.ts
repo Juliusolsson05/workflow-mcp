@@ -150,6 +150,18 @@ export type RunCancelledEvent = EventEnvelope<
   }
 >
 
+/**
+ * Recovery writes this terminal event when a process died without completing its active run.
+ * It is distinct from cancellation: no cooperative cancel was observed, and claiming otherwise
+ * would make resume diagnostics lie about the previous process's last durable state.
+ */
+export type RunInterruptedEvent = EventEnvelope<
+  'run.interrupted',
+  {
+    reason: string
+  }
+>
+
 export type PhaseDiscoveredEvent = PhaseEvent<
   'phase.discovered',
   {
@@ -161,6 +173,11 @@ export type PhaseDiscoveredEvent = PhaseEvent<
 >
 
 export type PhaseEnteredEvent = PhaseEvent<'phase.entered', { title: string }>
+export type PhaseCompletedEvent = PhaseEvent<'phase.completed', { title: string }>
+export type PhaseFailedEvent = PhaseEvent<
+  'phase.failed',
+  { title: string; error: WorkflowErrorReference }
+>
 
 export type AgentAdmittedEvent = AgentEvent<'agent.admitted', AgentAdmitted>
 export type AgentQueuedEvent = AgentEvent<'agent.queued', { reason?: string }>
@@ -254,8 +271,11 @@ export type WorkflowEvent =
   | RunFailedEvent
   | RunCancellationRequestedEvent
   | RunCancelledEvent
+  | RunInterruptedEvent
   | PhaseDiscoveredEvent
   | PhaseEnteredEvent
+  | PhaseCompletedEvent
+  | PhaseFailedEvent
   | AgentAdmittedEvent
   | AgentQueuedEvent
   | AgentReusedEvent

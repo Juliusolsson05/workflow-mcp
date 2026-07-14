@@ -12,12 +12,12 @@ The reverse direction matters too: real Claude workflow files should run through
 without an importer or translation step. Provider selection, durable caching, custom metadata,
 MCP transport, and Agent Code UI state belong outside the portable `.js` file.
 
-The repository now contains the loader plus the first complete in-process execution baseline:
-restricted workflow workers, provider-neutral scheduling, Claude-compatible helpers, normalized
-events and state projection, Claude journal import, a private crash-safe resume sidecar, nested
-workflows, a deterministic fake provider, and a pinned Codex SDK adapter. It is not registered in
-Agent Code's `.gitmodules` and does not expose an MCP server yet. MCP transport and Agent Code UI
-integration remain later milestones. The execution decisions are recorded in
+The repository now contains the loader, execution runtime, durable service, and standalone MCP
+server: restricted workflow workers, provider-neutral scheduling, Claude-compatible helpers,
+normalized events and browser-safe state projection, append-only run storage, linked managed and
+Claude-run resume, stdio and authenticated loopback HTTP transports, a deterministic fake provider,
+and a pinned Codex SDK adapter. Agent Code embeds the same service and tool registrar rather than
+starting a second server inside Electron. The execution decisions are recorded in
 [`EXECUTION_PLAN.md`](./EXECUTION_PLAN.md).
 
 ## Current commands
@@ -50,7 +50,68 @@ WORKFLOW_CODEX_BENCHMARK=1 npm run benchmark:codex
 
 # Operator-only override for a measured machine; the normal default remains four native turns.
 WORKFLOW_MCP_CONCURRENCY=12 node dist/cli.js resume /path/to/wf_id.json
+
+# Start a normal stdio MCP server scoped to one project.
+node dist/cli.js serve --stdio /path/to/project
+
+# Start an authenticated loopback Streamable HTTP server. Its URL and generated bearer token are
+# printed once to stderr. WORKFLOW_MCP_STATE_DIR can relocate the private durable store.
+node dist/cli.js serve --http /path/to/project 0
 ```
+
+## Durable service and MCP embedding
+
+The service is the long-lived owner of runs; an individual MCP connection is not. Every engine
+event is appended and fsynced before live subscribers see it, and every run can be reconstructed
+from its strict cursor stream after a renderer reload or provider reconnect:
+
+```text
+<state>/runs/<run-id>/
+  manifest.json
+  workflow.js
+  args.json
+  journal.json
+  events.jsonl
+  artifacts/
+```
+
+```ts
+import {
+  CodexAgentProvider,
+  FileWorkflowStore,
+  WorkflowService,
+  registerWorkflowMcpTools,
+} from 'workflow-mcp'
+
+const service = new WorkflowService({
+  store: new FileWorkflowStore('/private/application/state/workflows'),
+  provider: () => new CodexAgentProvider({ codexPathOverride: '/approved/codex' }),
+  modelAliases: { inherit: null, haiku: null, sonnet: null, opus: null },
+  sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+})
+await service.initialize()
+
+// The host still owns McpServer and its transport/authentication lifecycle.
+registerWorkflowMcpTools(mcpServer, service, { cwd: projectDirectory, clientId: sessionId })
+```
+
+The eight stable tools are `workflow_list`, `workflow_describe`, `workflow_validate`,
+`workflow_run`, `workflow_run_status`, `workflow_run_events`, `workflow_run_cancel`, and
+`workflow_resume`. Machine results are returned as both `structuredContent` and JSON text so Claude
+and Codex transcript envelopes preserve the same run ID. `workflow_run_events` is bounded long
+polling over the durable cursor, not a transport-specific notification protocol.
+
+Managed resume creates a new run with `resumedFromRunId`; it never appends a second execution to an
+old event stream. The same tool can import a Claude run with `{ claudeRunPath, workflowPath? }`.
+The service accepts only Claude manifests beneath the scoped Claude project directory, and an
+optional live workflow path must be one of that project's discovered definitions. Source and v2
+journal byte-identity checks still belong to the existing Claude importer.
+
+Renderer code imports only from `workflow-mcp/state`. That subpath exports events, immutable state
+types, and `createWorkflowState`/`reduceWorkflowState` without pulling filesystem, Codex SDK, or MCP
+server code into a browser bundle. Electron embedders import `startWorkflowWorker` from
+`workflow-mcp/worker` and inject a `WorkflowWorkerLauncher` backed by `utilityProcess.fork`; ordinary
+Node use keeps the default `child_process.fork` adapter.
 
 The public API deliberately uses plain names:
 
@@ -92,8 +153,8 @@ The in-memory journal implements longest-prefix reuse and interrupted provider-s
 `resume` command imports Claude's saved source and v2 JSONL, then atomically persists the combined
 Claude-plus-Codex run under `~/.workflow-mcp/journals/`. It never rewrites Claude's metadata or
 journal. The sidecar records completed results and Codex thread IDs after every mutation, so a
-second interruption resumes the new suffix instead of restarting it. Concurrent writers for the
-same run remain unsupported until the MCP service owns run locking.
+second interruption resumes the new suffix instead of restarting it. `WorkflowService` is the one
+writer and active-run owner; direct callers must still not point two executors at one journal.
 
 Token budgets charge the explicit provider `totalTokens`; the Codex adapter defines this as input
 plus output tokens (cached input and reasoning are already reported as subsets). Default provider

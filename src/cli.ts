@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { findWorkflows } from './findWorkflows.js'
+import { FileWorkflowStore } from './fileWorkflowStore.js'
 import { loadWorkflowFile, WorkflowError } from './loadWorkflow.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import { claudeResumeSidecarPath, loadClaudeWorkflowResume } from './claudeResume.js'
@@ -8,10 +9,14 @@ import { CodexAgentProvider } from './codexProvider.js'
 import { runWorkflow } from './runWorkflow.js'
 import type { WorkflowJournal } from './workflowJournal.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
+import { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
+import { WorkflowService } from './workflowService.js'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 function usage(): never {
   console.error(
-    'Usage: workflow-mcp validate <workflow.js> | workflow-mcp list [directory] | workflow-mcp run <workflow.js> [args-json] | workflow-mcp resume <claude-run.json> [workflow.js]',
+    'Usage: workflow-mcp validate <workflow.js> | workflow-mcp list [directory] | workflow-mcp run <workflow.js> [args-json] | workflow-mcp resume <claude-run.json> [workflow.js] | workflow-mcp serve --stdio [directory] | workflow-mcp serve --http [directory] [port]',
   )
   process.exit(2)
 }
@@ -107,6 +112,42 @@ async function main(): Promise<void> {
     return
   }
 
+  if (command === 'serve') {
+    if (argument !== '--stdio' && argument !== '--http') usage()
+    if (rest.length > (argument === '--http' ? 2 : 1)) usage()
+    const cwd = resolve(rest[0] ?? process.cwd())
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(
+        resolve(process.env.WORKFLOW_MCP_STATE_DIR ?? join(homedir(), '.workflow-mcp')),
+      ),
+      provider: () => new CodexAgentProvider(),
+      sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+    })
+    await service.initialize()
+
+    if (argument === '--stdio') {
+      await serveWorkflowMcpStdio(service, { cwd, clientId: 'standalone-stdio' })
+      return
+    }
+
+    const port = rest[1] === undefined ? undefined : Number(rest[1])
+    if (port !== undefined && (!Number.isSafeInteger(port) || port < 0 || port > 65_535)) {
+      throw new TypeError('HTTP port must be an integer from 0 through 65535')
+    }
+    const server = await serveWorkflowMcpHttp(
+      service,
+      { cwd, clientId: 'standalone-http' },
+      port === undefined ? {} : { port },
+    )
+    // The token is emitted only to stderr so stdout remains available for operator tooling. It is
+    // never put in the URL, shell history, or workflow-visible process environment.
+    process.stderr.write(`${JSON.stringify({ url: server.url, token: server.token })}\n`)
+    await waitForShutdownSignal()
+    await server.close()
+    await service.stop()
+    return
+  }
+
   usage()
 }
 
@@ -169,6 +210,18 @@ function configuredConcurrency(): number | undefined {
     throw new TypeError('WORKFLOW_MCP_CONCURRENCY must be an integer from 1 through 64')
   }
   return value
+}
+
+function waitForShutdownSignal(): Promise<void> {
+  return new Promise((resolveSignal) => {
+    const finish = (): void => {
+      process.removeListener('SIGINT', finish)
+      process.removeListener('SIGTERM', finish)
+      resolveSignal()
+    }
+    process.once('SIGINT', finish)
+    process.once('SIGTERM', finish)
+  })
 }
 
 main().catch((error: unknown) => {
