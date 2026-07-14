@@ -12,10 +12,35 @@ The reverse direction matters too: real Claude workflow files should run through
 without an importer or translation step. Provider selection, durable caching, custom metadata,
 MCP transport, and Agent Code UI state belong outside the portable `.js` file.
 
-This directory is only a research and design seed today. It is not registered in `.gitmodules`,
-is not installed by the root package, and does not yet contain an implementation. It is intended
-to become an isolated repository and a submodule under `packages/workflow-mcp` after the corpus,
-scope, and security boundary have been reviewed.
+The repository now contains the first compatibility baseline: a parser for one workflow file,
+project/personal workflow discovery, a validation CLI, and tests against the local reference
+corpus. It is not registered in Agent Code's `.gitmodules` and is not installed by Agent Code yet.
+Agent execution, providers, caching, MCP transport, and UI integration remain future milestones.
+The implementation-ready execution milestones are tracked in [`EXECUTION_PLAN.md`](./EXECUTION_PLAN.md).
+
+## Current commands
+
+```bash
+npm install --include=dev
+npm run check
+
+# Validate one direct workflow path. Direct paths do not require a .js extension.
+npm run build
+node dist/cli.js validate ./path/to/workflow.js
+
+# List personal and project workflows visible from a directory.
+node dist/cli.js list ./path/to/project
+```
+
+The public API deliberately uses plain names:
+
+```ts
+import { findWorkflows, loadWorkflowFile, parseWorkflowSource } from 'workflow-mcp'
+```
+
+`parseWorkflowSource` parses a supplied string. `loadWorkflowFile` adds file-size and byte-hash
+handling. `findWorkflows` performs `.js` discovery and user/project precedence. None of these
+functions executes the workflow body.
 
 ## Why the name
 
@@ -159,13 +184,17 @@ Observed Claude Code `2.1.209` behavior:
 3. User workflows are read from `~/.claude/workflows`.
 4. Project workflow directories are discovered while walking from the repository root toward the
    current working directory.
-5. When project workflows share a normalized name, the definition closest to the current working
+5. When project workflows share the exact same name, the definition closest to the current working
    directory wins.
 6. A project definition beats a personal definition with the same name.
-7. Local project or personal definitions beat plugin definitions.
-8. Plugin definitions beat colliding built-in definitions.
-9. The final visible list is sorted alphabetically by normalized `meta.name`.
-10. Symlinked files can participate subject to Claude's normal path/read safety checks.
+7. Workflow names are exact and case-sensitive; they are not trimmed or normalized.
+8. Plugin workflows normally use the visible identity `<plugin-name>:<workflow-name>`, so plugin
+   composition is not equivalent to inserting plain local names into one map.
+9. Local definitions beat an exact plugin-visible identity, and local/plugin identities beat an
+   exact built-in identity.
+10. The surviving personal/project list is sorted with raw `meta.name.localeCompare()`. The later
+    combined built-in/plugin/local resolver is not globally resorted.
+11. Symlinked files can participate subject to Claude's normal path/read safety checks.
 
 Claude Code `2.1.178` introduced the documented nearest-directory save and lookup behavior. The
 compatibility suite needs collisions at every layer because discovery mistakes can execute a
@@ -177,7 +206,8 @@ different workflow than the user approved.
 
 Observed for `2.1.209`:
 
-- maximum source size: 524,288 bytes;
+- file size limit: 524,288 bytes before UTF-8 decoding;
+- inline source limit: 524,288 JavaScript string code units;
 - Acorn parses with the latest ECMAScript grammar, module source type, top-level await, and
   top-level return enabled;
 - comments and a BOM may precede metadata because they are not AST statements;
@@ -198,7 +228,7 @@ same statement, or a computed initializer are incompatible.
 
 Claude accepts these metadata values:
 
-- strings, numbers, booleans, and `null`;
+- Acorn literal values, including the regexp and bigint values that Acorn represents as literals;
 - arrays without holes or spreads;
 - plain object initializers with noncomputed keys;
 - negative numeric literals;
@@ -233,9 +263,10 @@ type WorkflowMeta = {
 }
 ```
 
-`name` and `description` must be nonempty strings. `phases` is not proven mandatory in the
-installed parser, although all 12 unique local workflows use it. Invalid phase entries are dropped
-rather than making the whole file invalid.
+`name` and `description` must be strings with `length > 0`. Claude does not trim them: a whitespace
+name is accepted and remains distinct, including during collision resolution. `phases` is not
+proven mandatory in the installed parser, although all 12 unique local workflows use it. Invalid
+phase entries are dropped rather than making the whole file invalid.
 
 Unknown literal metadata keys are accepted by the parser but discarded from Claude's normalized
 metadata. Consequently, custom metadata inside `meta` may remain syntactically compatible but is
@@ -778,9 +809,53 @@ and SDK lifecycle belong below it.
 ## Codex SDK findings
 
 The official TypeScript `@openai/codex-sdk` is the natural first adapter for a Node package, but it
-is not an in-process model runtime. The current TypeScript SDK depends on the matching
-`@openai/codex` package, launches `codex exec --experimental-json` for a turn, and exchanges JSONL
-over stdio.
+is not an in-process model runtime. As of 2026-07-14, the latest stable SDK is `0.144.4`. It depends
+on the matching `@openai/codex` package, launches `codex exec --experimental-json` for every turn,
+and exchanges JSONL over stdio. Using the SDK still matters: it gives us the supported typed
+boundary and keeps CLI discovery, argument construction, JSONL parsing, and process cleanup out of
+this project.
+
+The public TypeScript surface maps cleanly onto most of one workflow `agent()` call:
+
+| Workflow concern | Codex SDK surface | Adapter responsibility |
+| --- | --- | --- |
+| prompt | `thread.runStreamed(prompt)` | preserve Claude string-coercion behavior before the call |
+| schema | `TurnOptions.outputSchema` | parse `finalResponse` as JSON and validate it independently |
+| model | `ThreadOptions.model` | resolve provider-neutral/Claude aliases through configuration |
+| effort | `ThreadOptions.modelReasoningEffort` | validate and map the observed effort values |
+| cancellation | `TurnOptions.signal` | join the signal to workflow, timeout, and server cancellation |
+| session identity | `thread.id` and `resumeThread(id)` | persist the ID before publishing resumable state |
+| token usage | `turn.completed.usage` | charge the shared workflow budget once per completed turn |
+| working directory | `ThreadOptions.workingDirectory` | choose the repository or runtime-created worktree |
+| permissions | `sandboxMode`, `approvalPolicy`, network and extra-directory options | enforce server policy; never trust the workflow to broaden it |
+| label and phase | no provider equivalent | keep these in workflow events and cache metadata |
+| `agentType` | no direct SDK equivalent | resolve installed agent instructions before calling the provider |
+| worktree isolation | no lifecycle API | create and clean the worktree above the provider adapter |
+
+The SDK's public stream currently contains thread/turn lifecycle events and started, updated, or
+completed items for agent messages, reasoning, commands, file changes, MCP calls, web searches,
+todo lists, and errors. It does **not** currently expose token-by-token agent-message deltas in its
+TypeScript `ThreadEvent` union. `agent.output.delta` therefore cannot be a Codex portability
+requirement. The adapter can publish useful command/file/tool progress immediately, but must treat
+the completed `agent_message` item as the first authoritative text result.
+
+A local integration spike used SDK `0.144.4` with the installed Codex CLI `0.144.3` through
+`codexPathOverride` and the existing ChatGPT login. It verified all of the following without a PTY
+or private session-file parsing:
+
+- a streamed read-only turn produced a thread ID, lifecycle events, usage, and the expected final
+  response;
+- JSON Schema output produced parseable conforming JSON while command start/completion events were
+  delivered during the turn;
+- aborting through `AbortSignal` while a command was active rejected with `AbortError`;
+- the interrupted thread ID could immediately be passed to `resumeThread()` and completed a later
+  turn successfully.
+
+The basic adapter is consequently small. The production risk is fan-out, not API complexity. Each
+TypeScript SDK turn starts a native Codex process, so a Claude-compatible parallel workflow may
+start up to the runtime concurrency ceiling at once. The matching macOS arm64 Codex npm artifact
+for `0.144.4` also reports an unpacked size of 311,570,619 bytes. We must benchmark process count,
+memory, startup latency, and packaging before declaring high-fan-out execution ready.
 
 The official Python `openai-codex` beta instead maintains one pinned `codex app-server` process and
 uses stdio JSON-RPC. Its current high-level surface has stronger primitives for concurrent turn
@@ -803,8 +878,8 @@ If the per-turn process model is unsuitable, a Python `AsyncCodex` worker can re
 without changing workflow files or MCP tools.
 
 Both SDKs accept an output schema but return the final structured response as text. The adapter
-must parse and independently validate it. Completed provider items are authoritative; token/delta
-events exist for live progress and UI only.
+must parse and independently validate it. Completed provider items are authoritative; richer
+provider progress is best-effort UI data rather than part of workflow correctness.
 
 Default provider policy should be workspace-write with network disabled. Network access, extra
 writable roots, and dangerous full access require explicit server policy. An unattended MCP server
@@ -1078,4 +1153,3 @@ The initial suite must cover more than happy-path example files.
 - [MCP transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 - [MCP Tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks)
 - [Node `vm` documentation](https://nodejs.org/api/vm.html)
-
