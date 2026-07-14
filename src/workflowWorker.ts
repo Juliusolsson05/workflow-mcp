@@ -39,9 +39,19 @@ const pendingAgents = new Map<string, PendingRequest>()
 const pendingWorkflows = new Map<string, PendingRequest>()
 const timers = new Map<number, NodeJS.Timeout>()
 
+type ElectronParentPort = {
+  postMessage(message: WorkerToParentMessage): void
+  on(event: 'message', listener: (event: { data: ParentToWorkerMessage }) => void): void
+}
+
+const electronParentPort = (process as NodeJS.Process & { parentPort?: ElectronParentPort }).parentPort
+
 function send(message: WorkerToParentMessage): void {
-  if (!process.send || !process.connected) return
-  process.send(message)
+  if (electronParentPort) {
+    electronParentPort.postMessage(message)
+    return
+  }
+  if (process.send && process.connected) process.send(message)
 }
 
 function nextRequestId(prefix: string): string {
@@ -104,7 +114,12 @@ function finish(message: Extract<WorkerToParentMessage, { type: 'complete' | 'fa
   // IPC delivery is asynchronous. Exiting immediately after process.send() intermittently loses
   // the only terminal record, which would leave the parent guessing whether a clean exit meant
   // success. Disconnect only from the send callback so the terminal message wins that race.
-  if (process.send && process.connected) {
+  if (electronParentPort) {
+    // Electron's MessagePort has no delivery callback. Posting before the next macrotask is the
+    // strongest portable handoff available, and the parent terminates the utility process after it
+    // has observed this terminal message rather than relying on a self-disconnect.
+    electronParentPort.postMessage(message)
+  } else if (process.send && process.connected) {
     process.send(message, () => {
       if (process.connected) process.disconnect()
     })
@@ -535,15 +550,35 @@ function receive(message: ParentToWorkerMessage): void {
   }
 }
 
-process.on('message', (message: ParentToWorkerMessage) => receive(message))
-process.on('disconnect', () => {
-  if (!terminal) {
-    cancelled = true
-    clearTimers()
-    rejectPending(cancellationError())
-  }
-})
-process.on('uncaughtException', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
-process.on('unhandledRejection', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
+let transportStarted = false
 
-send({ type: 'ready' })
+/**
+ * Install the worker-side transport for either Node child_process or Electron utilityProcess.
+ *
+ * WHY this is exported even though the standalone worker starts itself below: Electron's main
+ * bundle needs a stable public entry it can call from its separately-built utility-process file.
+ * Keeping that entry public prevents Agent Code from importing package internals, while the guard
+ * makes the automatic standalone call and an explicit embedder call safely idempotent.
+ */
+export function startWorkflowWorker(): void {
+  if (transportStarted) return
+  transportStarted = true
+
+  if (electronParentPort) {
+    electronParentPort.on('message', (event) => receive(event.data))
+  } else {
+    process.on('message', (message: ParentToWorkerMessage) => receive(message))
+    process.on('disconnect', () => {
+      if (!terminal) {
+        cancelled = true
+        clearTimers()
+        rejectPending(cancellationError())
+      }
+    })
+  }
+  process.on('uncaughtException', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
+  process.on('unhandledRejection', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
+  send({ type: 'ready' })
+}
+
+startWorkflowWorker()

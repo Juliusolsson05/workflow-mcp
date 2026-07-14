@@ -48,7 +48,11 @@ export class WorkflowError extends Error {
     message: string,
     options?: { filePath?: string | undefined; cause?: unknown },
   ) {
-    super(message, options?.cause === undefined ? undefined : { cause: options.cause })
+    super(message)
+    // ErrorOptions is an ES2022 type even though Node 20 supports it at runtime. Assigning the
+    // standard `cause` property explicitly keeps the browser-safe state declarations consumable by
+    // Agent Code's ES2020 renderer without weakening the package's error chain.
+    if (options?.cause !== undefined) Object.defineProperty(this, 'cause', { value: options.cause })
     this.name = 'WorkflowError'
     this.code = code
     if (options?.filePath !== undefined) this.filePath = options.filePath

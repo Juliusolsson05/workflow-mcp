@@ -19,6 +19,7 @@ export type WorkflowRunStatus =
   | 'completed'
   | 'failed'
   | 'cancelled'
+  | 'interrupted'
 
 export type WorkflowAgentStatus =
   | 'admitted'
@@ -83,6 +84,9 @@ export type WorkflowPhaseSnapshot = {
   source: 'metadata' | 'runtime'
   discoveredAt: string
   enteredAt?: string
+  completedAt?: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  error?: WorkflowErrorReference
   agentIds: string[]
   /**
    * WHY this is a boolean rather than a normal running/completed state: an explicit phase can be
@@ -157,7 +161,12 @@ export type WorkflowSnapshot = {
   artifacts: WorkflowArtifactSnapshot[]
 }
 
-const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>(['completed', 'failed', 'cancelled'])
+const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
+  'completed',
+  'failed',
+  'cancelled',
+  'interrupted',
+])
 const TERMINAL_AGENT_STATUSES = new Set<WorkflowAgentStatus>([
   'completed',
   'failed',
@@ -302,11 +311,12 @@ function derivePhases(
   return phases.map((phase) => ({
     ...phase,
     complete:
-      runIsTerminal &&
+      phase.status === 'completed' ||
+      (phase.status !== 'failed' && runIsTerminal &&
       phase.agentIds.every((id) => {
         const agent = agents.find((candidate) => candidate.id === id)
         return agent !== undefined && TERMINAL_AGENT_STATUSES.has(agent.status)
-      }),
+      })),
   }))
 }
 
@@ -397,6 +407,19 @@ export function reduceWorkflowState(
       }
       break
 
+    case 'run.interrupted':
+      next = {
+        ...next,
+        status: 'interrupted',
+        completedAt: event.timestamp,
+        error: {
+          name: 'WorkflowInterruptedError',
+          code: 'run-interrupted',
+          message: event.payload.reason,
+        },
+      }
+      break
+
     case 'phase.discovered': {
       // The runtime promises one discovery event per phase. Guarding here preserves the original
       // order and prevents a later duplicate from silently rewriting metadata shown for old runs.
@@ -413,6 +436,7 @@ export function reduceWorkflowState(
             source: event.payload.source,
             discoveredAt: event.timestamp,
             agentIds: [],
+            status: 'pending',
             complete: false,
             ...(event.payload.detail === undefined ? {} : { detail: event.payload.detail }),
             ...(event.payload.model === undefined ? {} : { model: event.payload.model }),
@@ -430,8 +454,40 @@ export function reduceWorkflowState(
       const phases = next.phases.slice()
       const phase = phases[index]
       if (!phase) throw new Error(`Phase index ${index} disappeared during phase.entered`)
-      phases[index] = { ...phase, enteredAt: event.timestamp }
+      phases[index] = { ...phase, enteredAt: event.timestamp, status: 'running' }
       next = { ...next, phases, currentPhaseId: event.phaseId }
+      break
+    }
+
+    case 'phase.completed': {
+      const index = next.phases.findIndex((phase) => phase.id === event.phaseId)
+      if (index === -1) {
+        throw new Error(`phase.completed referenced unknown phase ${JSON.stringify(event.phaseId)}`)
+      }
+      const phases = next.phases.slice()
+      const phase = phases[index]
+      if (!phase) throw new Error(`Phase index ${index} disappeared during phase.completed`)
+      phases[index] = { ...phase, status: 'completed', complete: true, completedAt: event.timestamp }
+      next = { ...next, phases }
+      break
+    }
+
+    case 'phase.failed': {
+      const index = next.phases.findIndex((phase) => phase.id === event.phaseId)
+      if (index === -1) {
+        throw new Error(`phase.failed referenced unknown phase ${JSON.stringify(event.phaseId)}`)
+      }
+      const phases = next.phases.slice()
+      const phase = phases[index]
+      if (!phase) throw new Error(`Phase index ${index} disappeared during phase.failed`)
+      phases[index] = {
+        ...phase,
+        status: 'failed',
+        complete: false,
+        completedAt: event.timestamp,
+        error: event.payload.error,
+      }
+      next = { ...next, phases }
       break
     }
 

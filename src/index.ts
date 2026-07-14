@@ -119,6 +119,42 @@ export {
   canonicalizeJournalValue,
   createJournalKey,
 } from './workflowJournal.js'
+
+export type {
+  ParentToWorkerMessage,
+  WorkerToParentMessage,
+} from './workerMessages.js'
+export type {
+  WorkflowWorkerExit,
+  WorkflowWorkerHandle,
+  WorkflowWorkerLauncher,
+  WorkflowWorkerLaunchOptions,
+} from './workerLauncher.js'
+export { NodeWorkflowWorkerLauncher } from './nodeWorkflowWorkerLauncher.js'
+
+export { FileWorkflowStore, WorkflowStoreError } from './fileWorkflowStore.js'
+export type {
+  CreateWorkflowRunInput,
+  StoredWorkflowEvent,
+  WorkflowEventPage,
+  WorkflowRunManifest,
+  WorkflowRunSnapshot,
+  WorkflowStore,
+} from './workflowStore.js'
+
+export { WorkflowService, WorkflowServiceError } from './workflowService.js'
+export type {
+  WorkflowRunStartResult,
+  WorkflowResumeInput,
+  WorkflowServiceErrorCode,
+  WorkflowServiceListener,
+  WorkflowServiceOptions,
+  WorkflowServiceScope,
+} from './workflowService.js'
+
+export { registerWorkflowMcpTools } from './workflowMcp.js'
+export { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
+export type { WorkflowMcpHttpServer } from './standaloneServer.js'
 export type {
   JournalAgentOptions,
   JournalCall,

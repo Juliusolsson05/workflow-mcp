@@ -37,7 +37,8 @@ export type CodexProviderOptions = Omit<CodexOptions, 'env'> & {
   client?: CodexClientLike
   /** Additional explicit values are merged into the small safe environment allowlist. */
   env?: Record<string, string>
-  modelAliases?: Readonly<Record<string, string>>
+  /** A null mapping intentionally selects the SDK/CLI configured default model. */
+  modelAliases?: Readonly<Record<string, string | null>>
 }
 
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh'])
@@ -57,7 +58,7 @@ const CODEX_SDK_VERSION = '0.144.4'
 export class CodexAgentProvider implements AgentProvider {
   readonly name = 'codex'
   readonly #client: CodexClientLike
-  readonly #modelAliases: Readonly<Record<string, string>>
+  readonly #modelAliases: Readonly<Record<string, string | null>>
 
   constructor(options: CodexProviderOptions = {}) {
     const { client, modelAliases = {}, env, ...codexOptions } = options
@@ -235,7 +236,7 @@ export class CodexAgentProvider implements AgentProvider {
   #model(value: string | undefined): string | undefined {
     if (value === undefined) return undefined
     const mapped = this.#modelAliases[value]
-    if (mapped !== undefined) return mapped
+    if (mapped !== undefined) return mapped ?? undefined
     if (CLAUDE_MODEL_NAMES.has(value)) {
       throw new AgentProviderFailure(
         `Claude model alias ${JSON.stringify(value)} needs an explicit Codex model mapping`,
