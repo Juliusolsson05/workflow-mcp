@@ -2,18 +2,26 @@
 
 import { findWorkflows } from './findWorkflows.js'
 import { loadWorkflowFile, WorkflowError } from './loadWorkflow.js'
+import type { LoadedWorkflow } from './loadWorkflow.js'
+import { claudeResumeSidecarPath, loadClaudeWorkflowResume } from './claudeResume.js'
+import { CodexAgentProvider } from './codexProvider.js'
+import { runWorkflow } from './runWorkflow.js'
+import type { WorkflowJournal } from './workflowJournal.js'
+import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 
 function usage(): never {
-  console.error('Usage: workflow-mcp validate <workflow.js> | workflow-mcp list [directory]')
+  console.error(
+    'Usage: workflow-mcp validate <workflow.js> | workflow-mcp list [directory] | workflow-mcp run <workflow.js> [args-json] | workflow-mcp resume <claude-run.json> [workflow.js]',
+  )
   process.exit(2)
 }
 
 async function main(): Promise<void> {
   const [, , command, argument, ...rest] = process.argv
-  if (!command || rest.length > 0) usage()
+  if (!command) usage()
 
   if (command === 'validate') {
-    if (!argument) usage()
+    if (!argument || rest.length > 0) usage()
     const workflow = await loadWorkflowFile(argument)
     console.log(
       JSON.stringify(
@@ -31,6 +39,7 @@ async function main(): Promise<void> {
   }
 
   if (command === 'list') {
+    if (rest.length > 0) usage()
     const result = await findWorkflows({ cwd: argument ?? process.cwd() })
     console.log(
       JSON.stringify(
@@ -52,7 +61,114 @@ async function main(): Promise<void> {
     return
   }
 
+  if (command === 'run') {
+    if (!argument || rest.length > 1) usage()
+    let args: unknown
+    if (rest[0] !== undefined) {
+      try {
+        args = JSON.parse(rest[0]) as unknown
+      } catch (cause) {
+        throw new TypeError(
+          `Workflow args must be valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+        )
+      }
+    }
+
+    await executeAndPrint(await loadWorkflowFile(argument), args)
+    return
+  }
+
+  if (command === 'resume') {
+    if (!argument || rest.length > 1) usage()
+    const resume = await loadClaudeWorkflowResume(argument, {
+      ...(rest[0] === undefined ? {} : { workflowPath: rest[0] }),
+    })
+    const workflowId = resume.workflow.filePath ?? resume.workflow.meta.name
+    const imported = resume.journal.getSnapshot(workflowId)
+    const sidecarPath = claudeResumeSidecarPath(resume.metadataPath)
+    const journal = await PersistentWorkflowJournal.open(
+      sidecarPath,
+      imported === undefined ? [] : [imported],
+    )
+    process.stderr.write(
+      `${JSON.stringify({
+        type: 'claude.resume.loaded',
+        runId: resume.metadata.runId,
+        workflowName: resume.metadata.workflowName,
+        priorStatus: resume.metadata.status,
+        journalRecordCount: resume.journalRecordCount,
+        sidecarPath,
+      })}\n`,
+    )
+    // Claude workflows can contain write-capable agents, but importing a foreign historical run
+    // should never silently grant that capability. The standalone resume command is read-only;
+    // an embedding host can call runWorkflow directly with an explicitly approved broader policy.
+    await executeAndPrint(resume.workflow, undefined, journal, 'read-only')
+    return
+  }
+
   usage()
+}
+
+async function executeAndPrint(
+  workflow: LoadedWorkflow,
+  args?: unknown,
+  journal?: WorkflowJournal,
+  sandboxMode: 'read-only' | 'workspace-write' = 'workspace-write',
+): Promise<void> {
+  const concurrency = configuredConcurrency()
+  const run = runWorkflow({
+    workflow,
+    ...(args === undefined ? {} : { args }),
+    ...(journal === undefined ? {} : { journal }),
+    cwd: process.cwd(),
+    provider: new CodexAgentProvider(),
+    ...(concurrency === undefined ? {} : { limits: { concurrency } }),
+    sandbox: {
+      mode: sandboxMode,
+      approvalPolicy: 'never',
+      network: false,
+    },
+  })
+  const cancelOnInterrupt = (): void => {
+    // SIGINT is converted into the same ordered cancellation path as an MCP/UI request. Exiting
+    // immediately would orphan Codex CLI processes and lose the terminal event needed to explain
+    // why a large run stopped.
+    void run.cancel('Interrupted by SIGINT')
+  }
+  process.once('SIGINT', cancelOnInterrupt)
+
+  const consumeEvents = (async () => {
+    for await (const event of run.events) process.stderr.write(`${JSON.stringify(event)}\n`)
+  })()
+  try {
+    const result = await run.result
+    await consumeEvents
+    // JSON has no top-level undefined. Preserve the successful value in a small envelope so the
+    // CLI never prints an empty stdout that is indistinguishable from a crashed process.
+    console.log(
+      JSON.stringify(
+        result === undefined ? { resultType: 'undefined' } : { result },
+        null,
+        2,
+      ),
+    )
+  } finally {
+    process.removeListener('SIGINT', cancelOnInterrupt)
+    await consumeEvents
+  }
+}
+
+function configuredConcurrency(): number | undefined {
+  const raw = process.env.WORKFLOW_MCP_CONCURRENCY
+  if (raw === undefined || raw.length === 0) return undefined
+  const value = Number(raw)
+  // This is an operator escape hatch for measured machines, not a workflow-controlled capability.
+  // A finite ceiling prevents a typo from launching hundreds of native Codex processes at once.
+  if (!Number.isSafeInteger(value) || value < 1 || value > 64) {
+    throw new TypeError('WORKFLOW_MCP_CONCURRENCY must be an integer from 1 through 64')
+  }
+  return value
 }
 
 main().catch((error: unknown) => {

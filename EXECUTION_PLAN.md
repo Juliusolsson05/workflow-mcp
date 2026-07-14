@@ -7,6 +7,20 @@ and Agent Code UI. It does not implement either of those consumers.
 The plan is deliberately one package with plain filenames. We should not create a framework of
 folders or abstractions before the compatibility tests force one.
 
+## Implementation status — 2026-07-14
+
+Milestones 1–7 now have a tested baseline in `feat/workflow-execution`: closed events and pure
+projection, a credential-free child worker, the shared scheduler and helpers, v2 journal reuse,
+persisted Claude-run import, a private atomic resume sidecar, one-level composition, interrupted
+provider-session resume, fake-provider conformance, and the pinned Codex SDK adapter. The full
+deterministic suite includes a 76-agent state fixture and a 17-agent execution fan-out. Real
+authenticated Codex text and Claude-style structured workflows are covered by the opt-in suite.
+
+The native-process benchmark harness for milestone 8 is implemented as `npm run benchmark:codex`,
+but its 49 real turns are intentionally not run by CI or as a side effect of installation. Until
+those measurements are recorded, default concurrency is the conservative value four. Service-level
+storage/locking, MCP transport, and UI code remain outside this execution change exactly as planned.
+
 ## Outcome
 
 Given a workflow such as `fat-bug-hunt`, the execution layer must be able to represent and run:
@@ -539,8 +553,9 @@ support:
 - immediate materialization of `agent.reused` events;
 - provider session references for interrupted live calls.
 
-Journal persistence can begin behind an interface with an in-memory implementation. SQLite belongs
-to the later service milestone, not this execution PR.
+Journal persistence begins behind the same interface: ordinary embedders can use the in-memory
+implementation, while standalone Claude resume uses one bounded, atomically replaced sidecar. The
+later service may replace that file with SQLite when it also owns run locking and event storage.
 
 ## Codex provider
 
@@ -548,7 +563,7 @@ to the later service milestone, not this execution PR.
 
 ```text
 prompt -> runStreamed()
-schema -> outputSchema
+schema -> strict outputSchema adapter -> original-schema validation
 model -> configured alias or explicit Codex model
 effort -> modelReasoningEffort
 cwd/worktree -> workingDirectory
@@ -560,7 +575,10 @@ usage -> turn.completed usage
 
 The adapter consumes the SDK generator once, emits normalized activity, captures the thread ID as
 soon as `thread.started` arrives, and resolves only after a terminal turn event. It parses and
-independently validates structured final text.
+independently validates structured final text. Because Codex requires strict object schemas while
+Claude workflows permit ordinary optional properties, the provider adapter adds
+`additionalProperties: false`, represents optionals as nullable required fields, and removes only
+those synthetic nulls before runtime validation.
 
 Default unattended policy is:
 
@@ -663,6 +681,9 @@ Acceptance gate:
 - reused agents have no provider attempt but remain fully inspectable;
 - started-only and `null` entries respawn;
 - a first miss invalidates every later historical result.
+- persisted Claude starts are restored by chained key even when parallel scheduler arrival reordered
+  their JSONL records;
+- the standalone sidecar survives process restart with results and provider session IDs intact.
 
 ### Milestone 6: nested workflow
 
