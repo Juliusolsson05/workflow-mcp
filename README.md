@@ -808,9 +808,53 @@ and SDK lifecycle belong below it.
 ## Codex SDK findings
 
 The official TypeScript `@openai/codex-sdk` is the natural first adapter for a Node package, but it
-is not an in-process model runtime. The current TypeScript SDK depends on the matching
-`@openai/codex` package, launches `codex exec --experimental-json` for a turn, and exchanges JSONL
-over stdio.
+is not an in-process model runtime. As of 2026-07-14, the latest stable SDK is `0.144.4`. It depends
+on the matching `@openai/codex` package, launches `codex exec --experimental-json` for every turn,
+and exchanges JSONL over stdio. Using the SDK still matters: it gives us the supported typed
+boundary and keeps CLI discovery, argument construction, JSONL parsing, and process cleanup out of
+this project.
+
+The public TypeScript surface maps cleanly onto most of one workflow `agent()` call:
+
+| Workflow concern | Codex SDK surface | Adapter responsibility |
+| --- | --- | --- |
+| prompt | `thread.runStreamed(prompt)` | preserve Claude string-coercion behavior before the call |
+| schema | `TurnOptions.outputSchema` | parse `finalResponse` as JSON and validate it independently |
+| model | `ThreadOptions.model` | resolve provider-neutral/Claude aliases through configuration |
+| effort | `ThreadOptions.modelReasoningEffort` | validate and map the observed effort values |
+| cancellation | `TurnOptions.signal` | join the signal to workflow, timeout, and server cancellation |
+| session identity | `thread.id` and `resumeThread(id)` | persist the ID before publishing resumable state |
+| token usage | `turn.completed.usage` | charge the shared workflow budget once per completed turn |
+| working directory | `ThreadOptions.workingDirectory` | choose the repository or runtime-created worktree |
+| permissions | `sandboxMode`, `approvalPolicy`, network and extra-directory options | enforce server policy; never trust the workflow to broaden it |
+| label and phase | no provider equivalent | keep these in workflow events and cache metadata |
+| `agentType` | no direct SDK equivalent | resolve installed agent instructions before calling the provider |
+| worktree isolation | no lifecycle API | create and clean the worktree above the provider adapter |
+
+The SDK's public stream currently contains thread/turn lifecycle events and started, updated, or
+completed items for agent messages, reasoning, commands, file changes, MCP calls, web searches,
+todo lists, and errors. It does **not** currently expose token-by-token agent-message deltas in its
+TypeScript `ThreadEvent` union. `agent.output.delta` therefore cannot be a Codex portability
+requirement. The adapter can publish useful command/file/tool progress immediately, but must treat
+the completed `agent_message` item as the first authoritative text result.
+
+A local integration spike used SDK `0.144.4` with the installed Codex CLI `0.144.3` through
+`codexPathOverride` and the existing ChatGPT login. It verified all of the following without a PTY
+or private session-file parsing:
+
+- a streamed read-only turn produced a thread ID, lifecycle events, usage, and the expected final
+  response;
+- JSON Schema output produced parseable conforming JSON while command start/completion events were
+  delivered during the turn;
+- aborting through `AbortSignal` while a command was active rejected with `AbortError`;
+- the interrupted thread ID could immediately be passed to `resumeThread()` and completed a later
+  turn successfully.
+
+The basic adapter is consequently small. The production risk is fan-out, not API complexity. Each
+TypeScript SDK turn starts a native Codex process, so a Claude-compatible parallel workflow may
+start up to the runtime concurrency ceiling at once. The matching macOS arm64 Codex npm artifact
+for `0.144.4` also reports an unpacked size of 311,570,619 bytes. We must benchmark process count,
+memory, startup latency, and packaging before declaring high-fan-out execution ready.
 
 The official Python `openai-codex` beta instead maintains one pinned `codex app-server` process and
 uses stdio JSON-RPC. Its current high-level surface has stronger primitives for concurrent turn
@@ -833,8 +877,8 @@ If the per-turn process model is unsuitable, a Python `AsyncCodex` worker can re
 without changing workflow files or MCP tools.
 
 Both SDKs accept an output schema but return the final structured response as text. The adapter
-must parse and independently validate it. Completed provider items are authoritative; token/delta
-events exist for live progress and UI only.
+must parse and independently validate it. Completed provider items are authoritative; richer
+provider progress is best-effort UI data rather than part of workflow correctness.
 
 Default provider policy should be workspace-write with network disabled. Network access, extra
 writable roots, and dangerous full access require explicit server policy. An unattended MCP server
