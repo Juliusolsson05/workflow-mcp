@@ -340,6 +340,13 @@ describe('cancellation, journal, and composition', () => {
     ], { limits: { concurrency: 1, cancellationGraceMs: 100 } })
     const rejected = expect(run.result).rejects.toMatchObject({ name: 'AbortError' })
 
+    // Provider start can win the IPC race before the worker's next two synchronous requests reach
+    // the parent. Wait for the state this test names instead of sleeping and assuming host speed.
+    let queued = 0
+    for await (const event of run.events) {
+      if (event.type === 'agent.queued') queued += 1
+      if (queued === 3) break
+    }
     while (provider.activeExecutions === 0) await new Promise((resolveWait) => setTimeout(resolveWait, 2))
     await run.cancel('stop queued work')
     await rejected
