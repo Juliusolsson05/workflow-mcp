@@ -16,6 +16,7 @@ The repository now contains the first compatibility baseline: a parser for one w
 project/personal workflow discovery, a validation CLI, and tests against the local reference
 corpus. It is not registered in Agent Code's `.gitmodules` and is not installed by Agent Code yet.
 Agent execution, providers, caching, MCP transport, and UI integration remain future milestones.
+The implementation-ready execution milestones are tracked in [`EXECUTION_PLAN.md`](./EXECUTION_PLAN.md).
 
 ## Current commands
 
