@@ -7,6 +7,19 @@ and Agent Code UI. It does not implement either of those consumers.
 The plan is deliberately one package with plain filenames. We should not create a framework of
 folders or abstractions before the compatibility tests force one.
 
+## Implementation status — 2026-07-14
+
+Milestones 1–7 now have a tested baseline in `feat/workflow-execution`: closed events and pure
+projection, a credential-free child worker, the shared scheduler and helpers, in-memory v2 journal
+reuse, one-level composition, interrupted provider-session resume, fake-provider conformance, and
+the pinned Codex SDK adapter. The full deterministic suite includes a 76-agent state fixture and a
+17-agent execution fan-out. One real authenticated Codex workflow is covered by the opt-in suite.
+
+The native-process benchmark harness for milestone 8 is implemented as `npm run benchmark:codex`,
+but its 49 real turns are intentionally not run by CI or as a side effect of installation. Until
+those measurements are recorded, default concurrency is the conservative value four. Durable
+storage, MCP transport, and UI code remain outside this execution change exactly as planned.
+
 ## Outcome
 
 Given a workflow such as `fat-bug-hunt`, the execution layer must be able to represent and run:

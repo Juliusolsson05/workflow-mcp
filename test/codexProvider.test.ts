@@ -1,0 +1,274 @@
+import { describe, expect, it } from 'vitest'
+
+import type { ThreadEvent, ThreadOptions, TurnOptions } from '@openai/codex-sdk'
+
+import type {
+  AgentProviderEvent,
+  AgentRequest,
+} from '../src/agentProvider.js'
+import { CodexAgentProvider } from '../src/codexProvider.js'
+import type { CodexClientLike } from '../src/codexProvider.js'
+
+function eventStream(events: readonly ThreadEvent[]): AsyncGenerator<ThreadEvent> {
+  return (async function* stream() {
+    for (const event of events) yield event
+  })()
+}
+
+function request(overrides: Partial<AgentRequest> = {}): AgentRequest {
+  return {
+    prompt: 'Inspect the repository',
+    workingDirectory: '/tmp/project',
+    sandbox: {
+      mode: 'workspace-write',
+      approvalPolicy: 'never',
+      network: false,
+    },
+    ...overrides,
+  }
+}
+
+function mockClient(events: readonly ThreadEvent[]) {
+  const calls: Array<{
+    kind: 'start' | 'resume'
+    id?: string
+    threadOptions?: ThreadOptions
+    input?: unknown
+    turnOptions?: TurnOptions
+  }> = []
+  const thread = {
+    id: 'thread-fallback' as string | null,
+    async runStreamed(input: unknown, turnOptions?: TurnOptions) {
+      const call = calls.at(-1)
+      if (call) {
+        call.input = input
+        if (turnOptions !== undefined) call.turnOptions = turnOptions
+      }
+      return { events: eventStream(events) }
+    },
+  }
+  const client = {
+    startThread(threadOptions?: ThreadOptions) {
+      calls.push({ kind: 'start', ...(threadOptions === undefined ? {} : { threadOptions }) })
+      return thread
+    },
+    resumeThread(id: string, threadOptions?: ThreadOptions) {
+      calls.push({ kind: 'resume', id, ...(threadOptions === undefined ? {} : { threadOptions }) })
+      return thread
+    },
+  } as CodexClientLike
+  return { client, calls }
+}
+
+describe('CodexAgentProvider', () => {
+  it('maps thread policy, streamed activities, final text, session, and raw usage', async () => {
+    const { client, calls } = mockClient([
+      { type: 'thread.started', thread_id: 'thread-1' },
+      { type: 'turn.started' },
+      {
+        type: 'item.started',
+        item: {
+          id: 'command-1',
+          type: 'command_execution',
+          command: 'pwd',
+          aggregated_output: '',
+          status: 'in_progress',
+        },
+      },
+      {
+        type: 'item.updated',
+        item: {
+          id: 'command-1',
+          type: 'command_execution',
+          command: 'pwd',
+          aggregated_output: '/tmp/project\n',
+          status: 'in_progress',
+        },
+      },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'command-1',
+          type: 'command_execution',
+          command: 'pwd',
+          aggregated_output: '/tmp/project\n',
+          exit_code: 0,
+          status: 'completed',
+        },
+      },
+      {
+        type: 'item.completed',
+        item: { id: 'message-1', type: 'agent_message', text: 'Finished' },
+      },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 10,
+          cached_input_tokens: 4,
+          output_tokens: 3,
+          reasoning_output_tokens: 2,
+        },
+      },
+    ])
+    const provider = new CodexAgentProvider({ client })
+    const emitted: AgentProviderEvent[] = []
+    const result = await provider.execute(
+      request({
+        effort: 'high',
+        sandbox: {
+          mode: 'workspace-write',
+          approvalPolicy: 'never',
+          network: true,
+          additionalWritableDirectories: ['/tmp/shared'],
+        },
+      }),
+      {
+        signal: new AbortController().signal,
+        emit: async (event) => { emitted.push(event) },
+      },
+    )
+
+    expect(calls[0]).toMatchObject({
+      kind: 'start',
+      threadOptions: {
+        workingDirectory: '/tmp/project',
+        sandboxMode: 'workspace-write',
+        approvalPolicy: 'never',
+        networkAccessEnabled: true,
+        additionalDirectories: ['/tmp/shared'],
+        modelReasoningEffort: 'high',
+      },
+      input: 'Inspect the repository',
+    })
+    expect(emitted.map((event) => event.type)).toEqual([
+      'session.started',
+      'activity.started',
+      'activity.updated',
+      'activity.completed',
+      'activity.completed',
+    ])
+    expect(result).toEqual({
+      output: { type: 'text', text: 'Finished' },
+      usage: {
+        inputTokens: 10,
+        cachedInputTokens: 4,
+        outputTokens: 3,
+        reasoningTokens: 2,
+        totalTokens: 13,
+      },
+      providerSession: { provider: 'codex', id: 'thread-1' },
+      diagnostics: {
+        sdk: '@openai/codex-sdk',
+        sdkVersion: '0.144.4',
+        bundledCliVersion: '0.144.4',
+      },
+    })
+  })
+
+  it('resumes a thread, maps a Claude model alias, prepends agent instructions, and parses schema output', async () => {
+    const { client, calls } = mockClient([
+      { type: 'thread.started', thread_id: 'thread-old' },
+      {
+        type: 'item.completed',
+        item: { id: 'message-1', type: 'agent_message', text: '{"ok":true}' },
+      },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 0,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      },
+    ])
+    const provider = new CodexAgentProvider({ client, modelAliases: { sonnet: 'gpt-test' } })
+    const schema = {
+      type: 'object',
+      properties: { ok: { type: 'boolean' } },
+      required: ['ok'],
+      additionalProperties: false,
+    }
+    const result = await provider.execute(
+      request({
+        schema,
+        model: 'sonnet',
+        instructions: 'You are the review specialist.',
+        session: { provider: 'codex', id: 'thread-old' },
+      }),
+      { signal: new AbortController().signal, emit: async () => undefined },
+    )
+
+    expect(calls[0]).toMatchObject({
+      kind: 'resume',
+      id: 'thread-old',
+      threadOptions: { model: 'gpt-test' },
+      input: 'You are the review specialist.\n\nTask:\nInspect the repository',
+      turnOptions: { outputSchema: schema },
+    })
+    expect(result.output).toEqual({ type: 'structured', value: { ok: true } })
+  })
+
+  it('fails clearly for unmapped Claude models, invalid JSON, and provider session mismatches', async () => {
+    const empty = mockClient([])
+    const provider = new CodexAgentProvider({ client: empty.client })
+    await expect(
+      provider.execute(request({ model: 'opus' }), {
+        signal: new AbortController().signal,
+        emit: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: 'codex-model-unmapped' })
+    expect(empty.calls).toHaveLength(0)
+
+    await expect(
+      provider.execute(request({ session: { provider: 'claude', id: 'other' } }), {
+        signal: new AbortController().signal,
+        emit: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: 'provider-session-mismatch' })
+
+    const invalid = mockClient([
+      { type: 'thread.started', thread_id: 'thread-1' },
+      {
+        type: 'item.completed',
+        item: { id: 'message-1', type: 'agent_message', text: 'not json' },
+      },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 0,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      },
+    ])
+    const structured = new CodexAgentProvider({ client: invalid.client })
+    await expect(
+      structured.execute(request({ schema: { type: 'object' } }), {
+        signal: new AbortController().signal,
+        emit: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: 'codex-structured-output-invalid' })
+  })
+
+  it('normalizes stream failures and AbortSignal cancellation', async () => {
+    const failed = mockClient([
+      { type: 'thread.started', thread_id: 'thread-1' },
+      { type: 'turn.failed', error: { message: 'model failed' } },
+    ])
+    const provider = new CodexAgentProvider({ client: failed.client })
+    await expect(
+      provider.execute(request(), {
+        signal: new AbortController().signal,
+        emit: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: 'codex-turn-failed' })
+
+    const controller = new AbortController()
+    controller.abort('stop')
+    await expect(
+      provider.execute(request(), { signal: controller.signal, emit: async () => undefined }),
+    ).rejects.toMatchObject({ name: 'AbortError' })
+  })
+})

@@ -12,11 +12,13 @@ The reverse direction matters too: real Claude workflow files should run through
 without an importer or translation step. Provider selection, durable caching, custom metadata,
 MCP transport, and Agent Code UI state belong outside the portable `.js` file.
 
-The repository now contains the first compatibility baseline: a parser for one workflow file,
-project/personal workflow discovery, a validation CLI, and tests against the local reference
-corpus. It is not registered in Agent Code's `.gitmodules` and is not installed by Agent Code yet.
-Agent execution, providers, caching, MCP transport, and UI integration remain future milestones.
-The implementation-ready execution milestones are tracked in [`EXECUTION_PLAN.md`](./EXECUTION_PLAN.md).
+The repository now contains the loader plus the first complete in-process execution baseline:
+restricted workflow workers, provider-neutral scheduling, Claude-compatible helpers, normalized
+events and state projection, an in-memory compatibility journal, nested workflows, a deterministic
+fake provider, and a pinned Codex SDK adapter. It is not registered in Agent Code's `.gitmodules`
+and does not expose an MCP server yet. Durable storage, MCP transport, and Agent Code UI integration
+remain later milestones. The execution decisions are recorded in
+[`EXECUTION_PLAN.md`](./EXECUTION_PLAN.md).
 
 ## Current commands
 
@@ -30,17 +32,61 @@ node dist/cli.js validate ./path/to/workflow.js
 
 # List personal and project workflows visible from a directory.
 node dist/cli.js list ./path/to/project
+
+# Run through the Codex SDK. Events are JSONL on stderr; the final result is JSON on stdout.
+# The optional second argument is one JSON value exposed to the workflow as `args`.
+node dist/cli.js run ./path/to/workflow.js '{"files":["src/index.ts"]}'
+
+# Opt-in: consumes a real Codex turn and uses the existing Codex login or API-key setup.
+WORKFLOW_CODEX_INTEGRATION=1 npm run test:integration
+
+# Expensive and never run by CI: 49 real turns across the planned 1/4/8/16/20 fan-outs.
+WORKFLOW_CODEX_BENCHMARK=1 npm run benchmark:codex
 ```
 
 The public API deliberately uses plain names:
 
 ```ts
-import { findWorkflows, loadWorkflowFile, parseWorkflowSource } from 'workflow-mcp'
+import {
+  CodexAgentProvider,
+  InMemoryWorkflowJournal,
+  loadWorkflowFile,
+  projectWorkflowState,
+  runWorkflow,
+} from 'workflow-mcp'
+
+const workflow = await loadWorkflowFile('./review.js')
+const journal = new InMemoryWorkflowJournal()
+const run = runWorkflow({
+  workflow,
+  args: { files: ['src/index.ts'] },
+  cwd: process.cwd(),
+  provider: new CodexAgentProvider({
+    // Claude aliases are never guessed. Configure the capability mapping you intend.
+    modelAliases: { sonnet: 'your-codex-model' },
+  }),
+  journal,
+})
+
+const events = []
+for await (const event of run.events) events.push(event)
+const result = await run.result
+const snapshot = projectWorkflowState(run.id, events)
 ```
 
-`parseWorkflowSource` parses a supplied string. `loadWorkflowFile` adds file-size and byte-hash
-handling. `findWorkflows` performs `.js` discovery and user/project precedence. None of these
-functions executes the workflow body.
+`runWorkflow()` returns immediately with a replayable event stream, a result promise, and
+`cancel(reason)`. The same workflow file runs unchanged with the fake provider in deterministic
+tests or the Codex provider in production. The Codex adapter uses the existing local Codex login or
+the SDK's API-key mode, passes only an explicit environment allowlist, defaults to workspace-write
+with no network and no approvals, and requires explicit mappings for Claude model aliases.
+
+The in-memory journal implements sequential longest-prefix reuse and interrupted provider-session
+resume. It is intentionally non-durable and must not be shared by concurrent runs of the same
+workflow identity. A persistent journal belongs with the later MCP service/store, not in workflow
+JavaScript. Token budgets charge the explicit provider `totalTokens`; the Codex adapter defines this
+as input plus output tokens (cached input and reasoning are already reported as subsets). Default
+provider concurrency is four pending fan-out measurements; callers can configure it through
+`limits.concurrency`.
 
 ## Why the name
 
@@ -786,25 +832,25 @@ their adapters.
 
 ## Provider adapter
 
-The workflow engine should know only a provider-neutral interface:
+The workflow engine knows only the implemented provider-neutral interface:
 
 ```ts
 interface AgentProvider {
-  start(request: AgentRequest): Promise<AgentExecution>
-  resume?(reference: ProviderSessionReference): Promise<AgentExecution>
-}
-
-interface AgentExecution {
-  readonly sessionReference: ProviderSessionReference
-  events(): AsyncIterable<AgentEvent>
-  result(): Promise<AgentResult>
-  cancel(): Promise<void>
+  readonly name: string
+  execute(
+    request: AgentRequest,
+    context: {
+      signal: AbortSignal
+      emit(event: AgentProviderEvent): Promise<void>
+    },
+  ): Promise<AgentProviderResult>
 }
 ```
 
 Runtime scheduling, Claude-compatible cache identity, nested workflow behavior, and worktree
 lifecycle belong above this interface. Provider model mapping, provider events, authentication,
-and SDK lifecycle belong below it.
+and SDK lifecycle belong below it. Session resume is expressed on `AgentRequest.session`, so a
+provider does not need a second lifecycle API.
 
 ## Codex SDK findings
 
@@ -948,32 +994,38 @@ renderer workflow feature. None of those integrations belong in this initial res
 ```text
 workflow-mcp/
 ├── README.md
-├── SPEC.md
-├── SECURITY.md
+├── EXECUTION_PLAN.md
 ├── package.json
 ├── src/
-│   ├── spec/
-│   ├── discovery/
-│   ├── runtime/
-│   ├── runner/
-│   ├── providers/
-│   ├── events/
-│   ├── store/
-│   ├── mcp/
-│   └── cli.ts
-├── tests/
+│   ├── loadWorkflow.ts        # parse and validate one portable file
+│   ├── findWorkflows.ts       # Claude-compatible discovery/precedence
+│   ├── workflowWorker.ts      # credential-free restricted JS process
+│   ├── workerMessages.ts      # closed parent/worker protocol
+│   ├── runWorkflow.ts         # scheduler and execution coordinator
+│   ├── workflowEvents.ts      # provider-neutral event contract
+│   ├── workflowState.ts       # pure replay projection
+│   ├── workflowJournal.ts     # in-memory compatibility journal
+│   ├── agentProvider.ts       # provider boundary
+│   ├── fakeProvider.ts        # deterministic conformance provider
+│   ├── codexProvider.ts       # supported Codex SDK adapter
+│   ├── cli.ts
+│   └── index.ts
+├── test/
 │   ├── fixtures/
-│   ├── conformance/
-│   └── integration/
-└── references/
-    ├── README.md
-    └── raw/              # Ignored until provenance and sanitization review.
+│   └── *.test.ts
+└── references/                # ignored raw evidence until sanitization review
 ```
 
-Keep it one package initially. A monorepo, distributed scheduler, plugin marketplace, multiple
+The flat source tree is intentional: these files are one execution subsystem with clear boundaries,
+not independent packages. Split directories only when the MCP/store milestone creates multiple
+implementations of a boundary. A monorepo, distributed scheduler, plugin marketplace, multiple
 databases, and custom transport would add architecture before conformance exists.
 
 ## Implementation sequence
+
+Phases 0–3 now have an executable baseline on this branch. Worktree creation remains an injected
+host callback, journal storage remains in-memory, and the real Codex fan-out benchmark is opt-in
+work still to be measured. Phase 4 has deliberately not started.
 
 ### Phase 0: corpus and specification
 
