@@ -77,6 +77,7 @@ export class FakeAgentProvider implements AgentProvider {
   readonly calls: FakeProviderCall[] = []
   readonly completionOrder: number[] = []
   readonly providerName: string
+  readonly automaticReplaySafety = 'safe' as const
 
   #scripts: readonly FakeProviderScript[]
   #nextScript = 0

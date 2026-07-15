@@ -54,7 +54,7 @@ import type {
   WorkerWorkflowTarget,
   WorkflowWorkerLimits,
 } from './workerMessages.js'
-import { serializeWorkerError } from './workerMessages.js'
+import { serializeWorkerError, WORKFLOW_WORKER_HEARTBEAT_INTERVAL_MS } from './workerMessages.js'
 import { NodeWorkflowWorkerLauncher } from './nodeWorkflowWorkerLauncher.js'
 import type { WorkflowWorkerHandle, WorkflowWorkerLauncher } from './workerLauncher.js'
 import { WorkConservingScheduler } from './workConservingScheduler.js'
@@ -127,6 +127,11 @@ export type RunWorkflowOptions = {
   defaultEffort?: string
   sandbox?: Partial<AgentSandboxPolicy>
   eventSink?: WorkflowEventSink
+  /**
+   * Retain direct-API event replay for iterators attached after publication. Services with a
+   * durable eventSink should disable this to avoid holding a second unbounded activity history.
+   */
+  retainEventHistory?: boolean
   signal?: AbortSignal
   workerLauncher?: WorkflowWorkerLauncher
   workerFilePath?: string
@@ -137,6 +142,10 @@ export type WorkflowRun = {
   events: AsyncIterable<WorkflowEvent>
   result: Promise<unknown>
   cancel(reason?: string): Promise<void>
+  /** False while an adapter execution survived every cooperative and hard-stop deadline. */
+  ownershipReleaseSafe?(): boolean
+  /** Settles only after every already-quarantined adapter execution has actually stopped. */
+  waitForOwnershipRelease?(): Promise<void>
 }
 
 export class WorkflowCancelledError extends Error {
@@ -157,9 +166,12 @@ export class WorkflowExecutionError extends Error {
 }
 
 class UnconfirmedProviderTerminationError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  readonly execution: Promise<unknown>
+
+  constructor(message: string, execution: Promise<unknown>, options?: { cause?: unknown }) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
     this.name = 'UnconfirmedProviderTerminationError'
+    this.execution = execution
   }
 }
 
@@ -259,10 +271,16 @@ class WorkflowEventStream implements AsyncIterable<WorkflowEvent> {
     queue: WorkflowEvent[]
     wake: (() => void) | undefined
   }>()
+  readonly #history: WorkflowEvent[] | undefined
   #closed = false
+
+  constructor(retainHistory: boolean) {
+    this.#history = retainHistory ? [] : undefined
+  }
 
   publish(event: WorkflowEvent): void {
     if (this.#closed) return
+    this.#history?.push(event)
     for (const subscriber of this.#subscribers) {
       subscriber.queue.push(event)
       subscriber.wake?.()
@@ -279,14 +297,12 @@ class WorkflowEventStream implements AsyncIterable<WorkflowEvent> {
   }
 
   [Symbol.asyncIterator](): AsyncIterator<WorkflowEvent> {
-    // WHY events are queued per active iterator instead of retained globally: WorkflowService uses
-    // the durable eventSink and intentionally never consumes this convenience stream. The old
-    // replay array therefore held every activity for the lifetime of every app-owned run even
-    // though no reader could observe it. Direct runWorkflow/CLI callers attach synchronously (all
-    // publishing is serialized through a promise turn) and retain lossless live delivery, while an
-    // unused stream now costs constant memory.
+    // WHY replay is selectable rather than silently removed: direct runWorkflow consumers have
+    // historically been allowed to attach after awaiting result, while WorkflowService persists a
+    // canonical replay and never consumes this convenience stream. The service opts out below so
+    // FAT runs do not retain two full activity histories; standalone callers keep compatibility.
     const subscriber: { queue: WorkflowEvent[]; wake: (() => void) | undefined } = {
-      queue: [],
+      queue: [...(this.#history ?? [])],
       wake: undefined,
     }
     this.#subscribers.add(subscriber)
@@ -321,7 +337,7 @@ class WorkflowRuntime {
   readonly #options: RunWorkflowOptions
   readonly #limits: WorkflowLimits
   readonly #sandbox: AgentSandboxPolicy
-  readonly #stream = new WorkflowEventStream()
+  readonly #stream: WorkflowEventStream
   readonly #result = deferred<unknown>()
   readonly #controller = new AbortController()
   /** Global service capacity, or the run scheduler itself for standalone execution. */
@@ -343,6 +359,7 @@ class WorkflowRuntime {
   readonly #terminalAgents = new Set<string>()
   readonly #childCounts = new Map<string, number>()
   readonly #pendingWorkerRequests = new Map<WorkflowWorkerHandle, Set<string>>()
+  readonly #quarantinedExecutions = new Set<Promise<unknown>>()
   readonly #warnedModelAliases = new Set<string>()
   #warnedBudgetExceeded = false
   #eventSequence = 0
@@ -362,6 +379,7 @@ class WorkflowRuntime {
   constructor(options: RunWorkflowOptions) {
     this.id = options.runId ?? `run_${randomUUID()}`
     this.#options = options
+    this.#stream = new WorkflowEventStream(options.retainEventHistory ?? true)
     this.#limits = normalizeLimits(options.limits)
     // Large Claude workflows legitimately park more than Node's default ten cancellation
     // listeners on one run signal (semaphore waiters, providers, and timers). Bound the diagnostic
@@ -408,6 +426,17 @@ class WorkflowRuntime {
       events: this.#stream,
       result: this.#result.promise,
       cancel: (reason?: string) => this.cancel(reason),
+      ownershipReleaseSafe: () => (
+        this.#quarantinedExecutions.size === 0 && this.#tasks.size === 0
+      ),
+      waitForOwnershipRelease: async () => {
+        // Cancellation has already prevented new workflow admissions before the service calls this.
+        // A still-running supervisor can move its provider promise from #tasks into quarantine, so
+        // wait for stable emptiness rather than trusting one snapshot between those two states.
+        while (this.#tasks.size > 0 || this.#quarantinedExecutions.size > 0) {
+          await Promise.allSettled([...this.#tasks, ...this.#quarantinedExecutions])
+        }
+      },
     }
   }
 
@@ -797,6 +826,13 @@ class WorkflowRuntime {
               metadataPhases: input.depth === 0
                 ? (input.workflow.meta.phases ?? []).map((phase) => phase.title)
                 : [],
+              // Keep at least three theoretical ticks inside the parent deadline. The 5s constant
+              // remains the normal cadence, while deliberately short test/host policies receive a
+              // proportionally faster worker instead of a watchdog that is impossible to satisfy.
+              heartbeatIntervalMs: Math.max(10, Math.min(
+                WORKFLOW_WORKER_HEARTBEAT_INTERVAL_MS,
+                Math.floor(this.#reliability.workerHeartbeatTimeoutMs / 3),
+              )),
               limits: workerLimits(this.#limits),
             })
             return
@@ -1115,6 +1151,7 @@ class WorkflowRuntime {
   async #executeAgent(admission: AgentAdmission): Promise<void> {
     let prepared: PreparedWorkingDirectory | undefined
     let lastAttemptId: string | undefined
+    let lastAttemptOpen = false
     let providerSession = admission.journalMiss.providerSession?.provider === this.#options.provider.name
       ? admission.journalMiss.providerSession
       : undefined
@@ -1143,23 +1180,42 @@ class WorkflowRuntime {
           'Working-directory preparation timed out',
         )
         const preparationAbort = abortRejection(preparationController.signal)
+        let preparationSettled = false
+        const preparation = Promise.resolve().then(() => this.#options.prepareWorkingDirectory!({
+          baseDirectory: workingDirectory,
+          isolation: 'worktree',
+          runId: this.id,
+          agentId: admission.agentId,
+          workspaceId,
+          lineageId: this.#options.lineageId ?? this.id,
+          signal: preparationController.signal,
+        }))
+        const observedPreparation = preparation.then(
+          (value) => { preparationSettled = true; return value },
+          (error: unknown) => { preparationSettled = true; throw error },
+        )
         try {
           prepared = await Promise.race([
-            this.#options.prepareWorkingDirectory({
-              baseDirectory: workingDirectory,
-              isolation: 'worktree',
-              runId: this.id,
-              agentId: admission.agentId,
-              workspaceId,
-              lineageId: this.#options.lineageId ?? this.id,
-              signal: preparationController.signal,
-            }),
+            observedPreparation,
             preparationAbort.promise,
           ])
         } finally {
           preparationAbort.dispose()
           preparationController.dispose()
-          preparationLease.release()
+          if (preparationSettled) {
+            preparationLease.release()
+          } else {
+            // An abort signal is a request, not proof that git/worktree preparation stopped. Keep
+            // its concurrency lease and service ownership quarantined until the real promise
+            // settles. If it creates a workspace late, immediately reconcile it through cleanup so
+            // a timed-out preparation cannot leak a hidden checkout forever.
+            const lateDisposition = observedPreparation
+              .then(async (latePrepared) => {
+                if (latePrepared.cleanup) await this.#cleanupWorkingDirectory(latePrepared)
+              })
+              .finally(() => preparationLease.release())
+            this.#quarantineExecution(lateDisposition)
+          }
         }
         if (this.#controller.signal.aborted) throw new WorkflowCancelledError(abortReason(this.#controller.signal))
         workingDirectory = resolve(prepared.path)
@@ -1195,9 +1251,20 @@ class WorkflowRuntime {
         try {
           // Circuit wait owns no provider capacity. When the provider is globally unavailable,
           // queued work remains visible without nine backoff loops pinning all nine permits.
-          circuitLease = await this.#circuitBreaker.enter(this.#controller.signal)
-          providerLease = await this.#acquireProviderLease(this.#controller.signal)
-          this.#observeScheduler(this.#runScheduler.snapshot())
+          while (true) {
+            circuitLease = await this.#circuitBreaker.enter(this.#controller.signal)
+            providerLease = await this.#acquireProviderLease(this.#controller.signal)
+            this.#observeScheduler(this.#runScheduler.snapshot())
+            if (circuitLease.startAllowed()) break
+            // The circuit changed while this call waited behind already-running work. Relinquish
+            // capacity and re-enter the gate; launching from the stale lease is the thundering-herd
+            // bug the circuit is meant to prevent.
+            circuitLease.neutral()
+            circuitLease = undefined
+            providerLease.release()
+            providerLease = undefined
+            this.#observeScheduler(this.#runScheduler.snapshot())
+          }
           if (this.#controller.signal.aborted) {
             throw new WorkflowCancelledError(abortReason(this.#controller.signal))
           }
@@ -1220,6 +1287,7 @@ class WorkflowRuntime {
             },
           })
           lastAttemptId = attemptId
+          lastAttemptOpen = true
 
           const result = await this.#executeProviderAttempt({
             admission,
@@ -1264,6 +1332,7 @@ class WorkflowRuntime {
                   }),
             },
           })
+          lastAttemptOpen = false
           this.#completeWorkerRequest(admission.worker, admission.requestId, {
             type: 'agent.result',
             requestId: admission.requestId,
@@ -1274,12 +1343,19 @@ class WorkflowRuntime {
         } catch (error) {
           if (error instanceof UnconfirmedProviderTerminationError) {
             circuitLease?.infrastructureFailure()
-            // WHY this intentionally leaks (quarantines) the scheduler lease until process exit:
+            // WHY this quarantines the scheduler lease until the detached execution really settles:
             // the provider may still be consuming credentials or mutating state. Advertising that
             // slot as available would exceed the real process ceiling and permit overlapping
-            // attempts for one logical call. The run fails, health shows the occupied capacity,
-            // and a service restart is the final fence for an adapter with no lifecycle control.
+            // attempts for one logical call. If it eventually exits, the permit is released and
+            // service ownership becomes transferable without requiring a process restart.
+            const quarantinedLease = providerLease
             providerLease = undefined
+            if (quarantinedLease) {
+              void error.execution.finally(() => {
+                quarantinedLease.release()
+                this.#observeScheduler(this.#runScheduler.snapshot())
+              }).catch(() => undefined)
+            }
             throw error
           }
           if (error instanceof AgentProviderFailure && error.providerSession !== undefined) {
@@ -1298,7 +1374,7 @@ class WorkflowRuntime {
           if (error instanceof AgentProviderFailure) {
             if (error.retryable) circuitLease?.infrastructureFailure()
             else circuitLease?.neutral()
-            const retrying = this.#shouldRetry(admission, error, attemptNumber)
+            const retrying = this.#reserveRetry(admission, error, attemptNumber)
             await this.#emit({
               type: 'agent.failed',
               agentId: admission.agentId,
@@ -1306,6 +1382,7 @@ class WorkflowRuntime {
               ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
               payload: { error: errorReference(error), ...(retrying ? { retrying: true } : {}) },
             })
+            lastAttemptOpen = false
             if (!retrying) {
               admission.journalRun.recordResult(admission.journalMiss, null, { successful: false })
               await this.#emit({
@@ -1328,7 +1405,6 @@ class WorkflowRuntime {
             }
 
             const delayMs = retryDelayMs(this.#reliability, attemptNumber)
-            this.#retryAttemptsScheduled += 1
             const retryAt = new Date(Date.now() + delayMs).toISOString()
             await this.#emit({
               type: 'agent.retry_scheduled',
@@ -1360,6 +1436,10 @@ class WorkflowRuntime {
         }
       }
     } catch (error) {
+      // The adapter explicitly survived both cooperative and hard termination. Treating this as an
+      // ordinary agent error lets workflow JavaScript catch it and launch sibling/replacement work
+      // while the credentialed execution is still alive. Escalate to the run owner instead.
+      if (error instanceof UnconfirmedProviderTerminationError) throw error
       if (
         this.#controller.signal.aborted ||
         error instanceof WorkflowCancelledError ||
@@ -1368,7 +1448,7 @@ class WorkflowRuntime {
         await this.#emit({
           type: 'agent.cancelled',
           agentId: admission.agentId,
-          ...(lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
+          ...(!lastAttemptOpen || lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
           ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
           payload: { reason: abortReason(this.#controller.signal) },
         })
@@ -1385,28 +1465,9 @@ class WorkflowRuntime {
       }
     } finally {
       try {
-        let cleanup: void | { preservedPath: string } | undefined
-        if (prepared?.cleanup) {
-          // Cleanup is separately bounded and deliberately does not consume provider capacity.
-          // A cancelled run still needs this best-effort path, so it uses an independent signal.
-          const cleanupLease = await this.#cleanupScheduler.acquire(new AbortController().signal)
-          const cleanupController = linkedTimeoutController(
-            undefined,
-            this.#reliability.cleanupTimeoutMs,
-            'Working-directory cleanup timed out',
-          )
-          const cleanupAbort = abortRejection(cleanupController.signal)
-          try {
-            cleanup = await Promise.race([
-              prepared.cleanup({ signal: cleanupController.signal }),
-              cleanupAbort.promise,
-            ])
-          } finally {
-            cleanupAbort.dispose()
-            cleanupController.dispose()
-            cleanupLease.release()
-          }
-        }
+        const cleanup = prepared?.cleanup
+          ? await this.#cleanupWorkingDirectory(prepared)
+          : undefined
         if (cleanup?.preservedPath) {
           await this.#emit({
             type: 'warning',
@@ -1438,6 +1499,42 @@ class WorkflowRuntime {
         } catch {
           // A failed event sink must not turn cleanup into an unhandled background rejection.
         }
+      }
+    }
+  }
+
+  async #cleanupWorkingDirectory(
+    prepared: PreparedWorkingDirectory,
+  ): Promise<void | { preservedPath: string }> {
+    if (!prepared.cleanup) return
+    // Cleanup is separately bounded and deliberately does not consume provider capacity. A
+    // cancelled run still needs this best-effort path, so it uses an independent signal.
+    const cleanupLease = await this.#cleanupScheduler.acquire(new AbortController().signal)
+    const cleanupController = linkedTimeoutController(
+      undefined,
+      this.#reliability.cleanupTimeoutMs,
+      'Working-directory cleanup timed out',
+    )
+    const cleanupAbort = abortRejection(cleanupController.signal)
+    let cleanupSettled = false
+    const cleanup = Promise.resolve().then(() => prepared.cleanup!({ signal: cleanupController.signal }))
+    const observedCleanup = cleanup.then(
+      (value) => { cleanupSettled = true; return value },
+      (error: unknown) => { cleanupSettled = true; throw error },
+    )
+    try {
+      return await Promise.race([observedCleanup, cleanupAbort.promise])
+    } finally {
+      cleanupAbort.dispose()
+      cleanupController.dispose()
+      if (cleanupSettled) {
+        cleanupLease.release()
+      } else {
+        // Releasing on timeout let the next cleanup start while the old git process still held
+        // locks. Preserve both the real concurrency count and the cross-process ownership fence
+        // until the cleanup promise—not its AbortSignal—confirms settlement.
+        const lateCleanup = observedCleanup.finally(() => cleanupLease.release())
+        this.#quarantineExecution(lateCleanup)
       }
     }
   }
@@ -1500,14 +1597,15 @@ class WorkflowRuntime {
       return await Promise.race([execution, monitor.timeout, cancellation.promise])
     } catch (error) {
       if (this.#controller.signal.aborted) {
-        const stopped = await this.#confirmProviderTermination(execution, identity, {
+        const settlement = await this.#confirmProviderTermination(execution, identity, {
           code: 'cancellation',
           message: abortReason(this.#controller.signal),
         })
-        if (!stopped) {
+        if (!settlement) {
           await this.#emitUnconfirmedTermination(input.admission, input.attemptId)
           throw new UnconfirmedProviderTerminationError(
             'Cancelled provider attempt could not be confirmed stopped',
+            this.#quarantineExecution(execution),
             { cause: error },
           )
         }
@@ -1525,17 +1623,23 @@ class WorkflowRuntime {
           deadlineAt: error.deadlineAt,
         },
       })
-      const stopped = await this.#confirmProviderTermination(execution, identity, {
+      const settlement = await this.#confirmProviderTermination(execution, identity, {
         code: 'timeout',
         message: error.message,
       })
-      if (!stopped) {
+      if (!settlement) {
         await this.#emitUnconfirmedTermination(input.admission, input.attemptId)
         throw new UnconfirmedProviderTerminationError(
           'Timed-out provider attempt could not be confirmed stopped',
+          this.#quarantineExecution(execution),
           { cause: error },
         )
       }
+      // A completion can race the timeout and cooperative abort. Once the provider returned a
+      // successful result during the bounded grace period, discarding it and replaying the same
+      // tool-bearing turn is both wasteful and potentially duplicative. Rejections still retain
+      // the timeout classification because they commonly are the expected AbortSignal response.
+      if (settlement.status === 'fulfilled') return settlement.value
       throw error
     } finally {
       monitor.stop()
@@ -1544,20 +1648,27 @@ class WorkflowRuntime {
     }
   }
 
-  async #confirmProviderTermination(
-    execution: Promise<unknown>,
+  async #confirmProviderTermination<T>(
+    execution: Promise<T>,
     identity: AgentProviderAttemptIdentity,
     reason: { code: 'timeout' | 'cancellation' | 'shutdown'; message: string },
-  ): Promise<boolean> {
-    if (await settlesWithin(execution, this.#limits.cancellationGraceMs)) return true
+  ): Promise<PromiseSettlement<T> | undefined> {
+    const settlementProvesTermination =
+      this.#options.provider.terminationBoundary !== 'unconfirmed-descendants'
+    const cooperative = await settlementWithin(execution, this.#limits.cancellationGraceMs)
+    if (cooperative && settlementProvesTermination) return cooperative
     if (this.#options.provider.terminateAttempt) {
       // A buggy termination hook must itself be bounded. Its return is not proof of exit; only the
       // attempt result settling confirms that the adapter has reaped its execution boundary.
       const termination = Promise.resolve().then(() => this.#options.provider.terminateAttempt!(identity, reason))
       void termination.catch(() => undefined)
-      await settlesWithin(termination, this.#reliability.hardTerminationGraceMs)
+      await settlementWithin(termination, this.#reliability.hardTerminationGraceMs)
     }
-    return settlesWithin(execution, this.#reliability.hardTerminationGraceMs)
+    const hardSettlement = cooperative ?? await settlementWithin(
+      execution,
+      this.#reliability.hardTerminationGraceMs,
+    )
+    return settlementProvesTermination ? hardSettlement : undefined
   }
 
   async #emitUnconfirmedTermination(admission: AgentAdmission, attemptId: string): Promise<void> {
@@ -1573,25 +1684,52 @@ class WorkflowRuntime {
     })
   }
 
-  #shouldRetry(admission: AgentAdmission, error: AgentProviderFailure, attemptNumber: number): boolean {
+  #quarantineExecution(execution: Promise<unknown>): Promise<unknown> {
+    // An SDK which cannot identify descendants gives us no future in-process event that proves
+    // those tools exited. Keep the fence until process exit instead of pretending the already-
+    // settled wrapper promise is evidence. The replacement process can then reclaim the PID-bound
+    // store lease and recover from the durable interrupted boundary.
+    const quarantine = this.#options.provider.terminationBoundary === 'unconfirmed-descendants'
+      ? new Promise<never>(() => undefined)
+      : execution
+    this.#quarantinedExecutions.add(quarantine)
+    // WHY removal follows the original execution rather than a timer: only adapter settlement is
+    // evidence that the old credentialed process boundary has stopped. A timeout would recreate
+    // the same unsafe handoff this quarantine exists to prevent.
+    void quarantine.finally(() => this.#quarantinedExecutions.delete(quarantine)).catch(() => undefined)
+    return quarantine
+  }
+
+  #reserveRetry(admission: AgentAdmission, error: AgentProviderFailure, attemptNumber: number): boolean {
     if (!error.retryable || attemptNumber >= this.#reliability.maxAttempts) return false
     if (this.#retryAttemptsScheduled >= this.#reliability.maxRetryAttemptsPerRun) return false
     if (this.#reliability.automaticRetry === 'never') return false
+    // A local read-only sandbox says nothing about remote MCP side effects. Retrying an unknown
+    // provider after a lost response can duplicate an email, deployment, or database mutation, so
+    // automatic replay requires an affirmative provider capability instead of optimistic guessing.
+    if (this.#options.provider.automaticReplaySafety !== 'safe') return false
     // WHY workspace-write without isolation is excluded even when an adapter says "retryable": a
     // network failure can happen after a tool changed the user's checkout. Read-only calls cannot
     // mutate it, and a stable isolated worktree makes repeated local writes inspectable/reconcilable.
-    return this.#sandbox.mode === 'read-only' || admission.options.isolation === 'worktree'
+    if (this.#sandbox.mode !== 'read-only' && admission.options.isolation !== 'worktree') return false
+    // WHY reservation happens synchronously inside the predicate: several provider promises can
+    // reject in one turn. If callers merely inspect the counter and increment after awaiting the
+    // durable failure event, every concurrent failure can observe the same remaining final slot.
+    // JavaScript execution between awaits is serialized, so check-and-increment here is the run's
+    // linearization point.
+    this.#retryAttemptsScheduled += 1
+    return true
   }
 
   async #acquireProviderLease(signal: AbortSignal): Promise<SchedulerLease> {
-    const runLease = await this.#runScheduler.acquire(signal)
+    const runLease = await this.#runScheduler.acquire(signal, this.id)
     if (this.#runScheduler === this.#scheduler) return runLease
     try {
       // WHY both leases are required: the service scheduler prevents two runs from exceeding the
       // machine-wide provider budget, while this run-local lease preserves a workflow's explicit
       // lower concurrency limit. Using only the shared scheduler silently turned `concurrency: 2`
       // into nine as soon as WorkflowService began sharing admission across runs.
-      const serviceLease = await this.#scheduler.acquire(signal)
+      const serviceLease = await this.#scheduler.acquire(signal, this.id)
       let released = false
       return {
         release: () => {
@@ -1854,6 +1992,10 @@ class WorkflowRuntime {
     // tracked wrapper both owns background failures and removes itself from the cancellation set.
     const tracked = task
       .catch(async (error: unknown) => {
+        // WHY the failing wrapper leaves the set before entering #fail: #fail drains every tracked
+        // task as an ownership barrier. Including the promise currently awaiting #fail creates a
+        // self-dependency, forcing every background failure to consume the full escalation timeout.
+        this.#tasks.delete(tracked)
         try {
           await this.#fail(error)
         } catch {
@@ -2191,9 +2333,23 @@ function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void
   })
 }
 
-async function settlesWithin(promise: Promise<unknown>, milliseconds: number): Promise<boolean> {
-  const settled = promise.then(() => true, () => true)
-  return Promise.race([settled, delay(milliseconds).then(() => false)])
+type PromiseSettlement<T> =
+  | { status: 'fulfilled'; value: T }
+  | { status: 'rejected'; reason: unknown }
+
+async function settlementWithin<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+): Promise<PromiseSettlement<T> | undefined> {
+  const sentinel = { timeout: true } as const
+  const outcome = await Promise.race([
+    promise.then(
+      (value): PromiseSettlement<T> => ({ status: 'fulfilled', value }),
+      (reason: unknown): PromiseSettlement<T> => ({ status: 'rejected', reason }),
+    ),
+    delay(milliseconds).then(() => sentinel),
+  ])
+  return 'timeout' in outcome ? undefined : outcome
 }
 
 function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose(): void } {

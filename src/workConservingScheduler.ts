@@ -10,11 +10,13 @@ export type SchedulerLease = {
 }
 
 export interface AgentScheduler {
-  acquire(signal: AbortSignal): Promise<SchedulerLease>
+  /** Fairness key lets one shared scheduler rotate among runs instead of draining one burst first. */
+  acquire(signal: AbortSignal, fairnessKey?: string): Promise<SchedulerLease>
   snapshot(): SchedulerSnapshot
 }
 
 type Waiter = {
+  fairnessKey: string
   signal: AbortSignal
   resolve(lease: SchedulerLease): void
   reject(error: unknown): void
@@ -36,6 +38,7 @@ export class WorkConservingScheduler implements AgentScheduler {
   readonly #waiters: Waiter[] = []
   readonly #onStateChange: ((snapshot: SchedulerSnapshot) => void) | undefined
   #active = 0
+  #lastGrantedKey: string | undefined
 
   constructor(capacity: number, onStateChange?: (snapshot: SchedulerSnapshot) => void) {
     if (!Number.isSafeInteger(capacity) || capacity <= 0) {
@@ -45,16 +48,18 @@ export class WorkConservingScheduler implements AgentScheduler {
     this.#onStateChange = onStateChange
   }
 
-  acquire(signal: AbortSignal): Promise<SchedulerLease> {
+  acquire(signal: AbortSignal, fairnessKey = 'default'): Promise<SchedulerLease> {
     if (signal.aborted) return Promise.reject(abortError(signal.reason))
     if (this.#active < this.#capacity && this.#waiters.length === 0) {
       this.#active += 1
+      this.#lastGrantedKey = fairnessKey
       this.#changed()
       return Promise.resolve(this.#lease())
     }
 
     return new Promise((resolve, reject) => {
       const waiter: Waiter = {
+        fairnessKey,
         signal,
         resolve,
         reject,
@@ -96,7 +101,15 @@ export class WorkConservingScheduler implements AgentScheduler {
 
   #drain(): void {
     while (this.#active < this.#capacity && this.#waiters.length > 0) {
-      const waiter = this.#waiters.shift()
+      // WHY shared service capacity rotates by run: one workflow can enqueue hundreds of agents in
+      // a single JavaScript turn. Plain FIFO then leaves a later two-agent run waiting behind the
+      // entire burst even though both are equally runnable. Rotation applies only to queued work;
+      // it never preempts an active provider call or leaves a permit idle.
+      const alternateIndex = this.#lastGrantedKey === undefined
+        ? 0
+        : this.#waiters.findIndex((candidate) => candidate.fairnessKey !== this.#lastGrantedKey)
+      const index = alternateIndex < 0 ? 0 : alternateIndex
+      const [waiter] = this.#waiters.splice(index, 1)
       if (!waiter) break
       waiter.signal.removeEventListener('abort', waiter.onAbort)
       if (waiter.signal.aborted) {
@@ -107,6 +120,7 @@ export class WorkConservingScheduler implements AgentScheduler {
       // increment until the waiter wakes lets one release hand the same final permit to multiple
       // queued callers during a burst.
       this.#active += 1
+      this.#lastGrantedKey = waiter.fairnessKey
       waiter.resolve(this.#lease())
     }
   }

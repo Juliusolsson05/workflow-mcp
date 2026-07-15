@@ -49,7 +49,7 @@ export type WorkflowAttemptSnapshot = {
   provider: string
   status: WorkflowAttemptStatus
   startedAt: string
-  lastProgressAt: string
+  lastProgressAt?: string
   startupDeadlineAt?: string
   absoluteDeadlineAt?: string
   completedAt?: string
@@ -773,11 +773,14 @@ export function reduceWorkflowState(
           const index = attemptIndex(agent, event.attemptId, event.type)
           const attempt = attempts[index]
           if (!attempt) throw new Error(`Attempt index ${index} disappeared during agent.cancelled`)
-          attempts = attempts.slice()
-          attempts[index] = { ...attempt, status: 'cancelled', completedAt: event.timestamp }
+          if (attempt.status === 'running' || attempt.status === 'stalled') {
+            attempts = attempts.slice()
+            attempts[index] = { ...attempt, status: 'cancelled', completedAt: event.timestamp }
+          }
         }
+        const { retry: _retry, ...withoutRetry } = agent
         return {
-          ...agent,
+          ...withoutRetry,
           status: 'cancelled',
           completedAt: event.timestamp,
           attempts,

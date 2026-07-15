@@ -20,9 +20,11 @@ export type CreateWorkflowRunInput = {
   workflow: LoadedWorkflow
   args?: unknown
   idempotencyKey?: string
+  clientId?: string
   resumedFromRunId?: string
   lineageId?: string
   recoveryMode?: 'manual' | 'automatic'
+  automaticReplaySafe?: boolean
 }
 
 export type WorkflowStoreLease = {

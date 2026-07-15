@@ -7,7 +7,7 @@ import type {
   WorkerWorkflowTarget,
   WorkflowWorkerLimits,
 } from './workerMessages.js'
-import { serializeWorkerError } from './workerMessages.js'
+import { serializeWorkerError, WORKFLOW_WORKER_HEARTBEAT_INTERVAL_MS } from './workerMessages.js'
 
 type PendingRequest = {
   resolve(value: unknown): void
@@ -501,6 +501,17 @@ async function execute(message: Extract<ParentToWorkerMessage, { type: 'start' }
   limits = message.limits
   budgetTotal = message.budgetTotal
   budgetSpent = message.budgetSpent
+  // Start only after the parent provides its watchdog policy. A hard-coded 5s emitter paired with
+  // a valid 1s parent deadline deterministically killed a healthy evaluator before its first tick.
+  heartbeatTimer = setInterval(() => {
+    if (terminal) return
+    send({
+      type: 'heartbeat',
+      pendingRequests: pendingAgents.size + pendingWorkflows.size,
+      timers: timers.size,
+    })
+  }, message.heartbeatIntervalMs)
+  heartbeatTimer.unref?.()
 
   const sandbox = Object.create(null) as Record<string, unknown>
   sandbox.__workflowBridge = makeBridge(message.metadataPhases)
@@ -603,19 +614,6 @@ export function startWorkflowWorker(): void {
   process.on('uncaughtException', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
   process.on('unhandledRejection', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
   send({ type: 'ready' })
-  // WHY heartbeat state includes capability/timer counts: a live process alone is weak evidence.
-  // The parent needs to distinguish a healthy workflow awaiting nine supervised agents from a
-  // top-level promise that will never settle and has no remaining source of progress. This timer
-  // runs in the uncredentialed evaluator, so a blocked V8 loop also naturally stops heartbeats.
-  heartbeatTimer = setInterval(() => {
-    if (terminal) return
-    send({
-      type: 'heartbeat',
-      pendingRequests: pendingAgents.size + pendingWorkflows.size,
-      timers: timers.size,
-    })
-  }, 5_000)
-  heartbeatTimer.unref?.()
 }
 
 startWorkflowWorker()

@@ -46,6 +46,23 @@ function start(
 }
 
 describe('workflow realm', () => {
+  it('replays direct API events to an iterator attached after completion', async () => {
+    const run = runWorkflow({
+      workflow: workflow(`return 'late-reader'`),
+      cwd: process.cwd(),
+      provider: new FakeAgentProvider([]),
+    })
+    await expect(run.result).resolves.toBe('late-reader')
+    const events: WorkflowEvent[] = []
+    for await (const event of run.events) events.push(event)
+    expect(events.map((event) => event.type)).toEqual([
+      'run.started',
+      'phase.discovered',
+      'phase.discovered',
+      'run.completed',
+    ])
+  })
+
   it('supports args, top-level await/return, phases, logs, timers, and budget snapshots', async () => {
     const source = workflow(`
       phase('Find')

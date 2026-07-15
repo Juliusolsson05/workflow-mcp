@@ -120,6 +120,25 @@ export type AgentProviderTerminationReason = {
 export type AgentProvider = {
   /** Available before execution so queued/started events never need a guessed provider name. */
   readonly name: string
+  /**
+   * Whether an interrupted or timed-out request may be repeated automatically.
+   *
+   * WHY this is explicit instead of inferred from a read-only filesystem sandbox: MCP and other
+   * remote tools can send mail, mutate databases, or trigger deployments while the local checkout
+   * remains perfectly read-only. Unknown providers therefore fail closed. A host should advertise
+   * `safe` only when every reachable tool is read-only or independently idempotent; manual resume
+   * remains available when that cannot be proven.
+   */
+  readonly automaticReplaySafety?: 'safe' | 'unsafe-or-unknown'
+  /**
+   * What execution-promise settlement proves after cancellation.
+   *
+   * SDK wrappers which kill only their direct CLI child while that child may have spawned tools
+   * must use `unconfirmed-descendants`; the runtime then refuses a same-process ownership handoff.
+   * A process-owning adapter may use `process-tree` only when its termination hook reaps the whole
+   * group. Ordinary in-process/network adapters can rely on the default `settlement` boundary.
+   */
+  readonly terminationBoundary?: 'settlement' | 'process-tree' | 'unconfirmed-descendants'
   execute(request: AgentRequest, context: AgentProviderExecutionContext): Promise<AgentProviderResult>
   /**
    * Optional escalation after cooperative AbortSignal cancellation did not settle promptly.

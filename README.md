@@ -182,13 +182,17 @@ do not occupy provider permits.
 
 Every logical agent can have multiple supervised attempts. The default host policy distinguishes
 provider startup, idle progress, one active operation, total attempt lifetime, and cancellation
-termination deadlines. Retryable failures and stalls resume the same provider session and reuse the
-same stable workspace identity. Retries are bounded per agent and per run; repeated infrastructure
-failures open a shared circuit breaker so a provider outage cannot turn nine slots into an
-unbounded retry storm. `WorkflowReliabilityPolicy` is public for hosts that need measured overrides.
+termination deadlines. When the provider affirmatively declares automatic replay safe, retryable
+failures and stalls resume the same provider session and reuse the same stable workspace identity.
+Unknown providers fail closed because a read-only checkout does not make remote MCP effects safe to
+repeat. Retries are bounded per agent and per run; repeated infrastructure failures open a shared
+circuit breaker so a provider outage cannot turn nine slots into an unbounded retry storm.
+`WorkflowReliabilityPolicy` is public for hosts that need measured overrides.
 
-The service store is single-writer fenced. On restart, a read-only run which durably reached
-`run.started` is marked interrupted and continued as a new linked generation. Exact-source crash
+The service store is single-writer fenced. On restart, an untouched cursor-zero queue reservation is
+always safe to continue. A run which durably reached `run.started` is marked interrupted and is
+continued only when both its sandbox and persisted provider capability permit automatic replay.
+Exact-source crash
 recovery reuses completed parallel siblings sparsely—for example, if call five of nine was in flight
 but calls six through nine completed, only call five executes again. Manual resume retains Claude's
 longest-unchanged-prefix behavior because edited source cannot safely make that sparse assumption.

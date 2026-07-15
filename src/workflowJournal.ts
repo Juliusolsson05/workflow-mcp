@@ -247,6 +247,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
   #nextCallIndex = 0
   #canReusePrefix: boolean
   readonly #exactSourceSparse: boolean
+  readonly #retainSparseHistory: boolean
 
   constructor(
     identity: JournalIdentity,
@@ -254,6 +255,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     records: JournalRecord[],
     sessions: JournalSessionRecord[],
     reuseMode: JournalReuseMode,
+    retainSparseHistory = false,
   ) {
     this.#identity = identity
     // Claude resumes by the longest unchanged sequence of `(prompt, opts)` calls after the script
@@ -277,6 +279,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       reuseMode === 'exact-source-sparse' &&
       previous !== undefined &&
       previous.sourceHash === identity.sourceHash
+    this.#retainSparseHistory = retainSparseHistory
   }
 
   admit(call: JournalCall): JournalDecision {
@@ -297,6 +300,17 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       ? candidates.find((candidate) => candidate.providerSession !== undefined)
       : undefined
 
+    if (this.#retainSparseHistory) {
+      // Replace this visited key's inherited representation with the current generation's record,
+      // while leaving not-yet-visited parallel siblings intact. Without per-key compaction, copying
+      // the predecessor would preserve crash safety but grow the journal on every restart.
+      for (let index = this.#records.length - 1; index >= 0; index -= 1) {
+        if (this.#records[index]?.key === key) this.#records.splice(index, 1)
+      }
+      for (let index = this.#sessions.length - 1; index >= 0; index -= 1) {
+        if (this.#sessions[index]?.key === key) this.#sessions.splice(index, 1)
+      }
+    }
     this.#records.push({ type: 'started', key, agentId: call.agentId })
 
     if (historicalResult !== undefined) {
@@ -393,8 +407,20 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
     if (identity.sourceHash.length === 0) throw new TypeError('Journal sourceHash must not be empty')
 
     const previous = this.#snapshots.get(identity.workflowId)
-    const records: JournalRecord[] = []
-    const sessions: JournalSessionRecord[] = []
+    const retainSparseHistory =
+      options.reuseMode === 'exact-source-sparse' &&
+      previous !== undefined &&
+      previous.sourceHash === identity.sourceHash
+    // WHY sparse recovery starts with the complete predecessor: if this host crashes after
+    // re-admitting only the first sibling, an empty current generation would erase successful
+    // siblings later in the deterministic call order. InMemoryWorkflowJournalRun replaces visited
+    // keys in place, so the retained tail is durable without accumulating duplicate generations.
+    const records: JournalRecord[] = retainSparseHistory
+      ? previous.records.map((record) => ({ ...record }))
+      : []
+    const sessions: JournalSessionRecord[] = retainSparseHistory
+      ? (previous.sessions ?? []).map((record) => ({ ...record, session: { ...record.session } }))
+      : []
     // Install the new append-only record array immediately. If the process stops after admission but
     // before provider completion, getSnapshot() must expose the started-only record that forces respawn.
     const current: JournalSnapshot = { ...identity, records, sessions }
@@ -405,6 +431,7 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
       records,
       sessions,
       options.reuseMode ?? 'longest-prefix',
+      retainSparseHistory,
     )
   }
 

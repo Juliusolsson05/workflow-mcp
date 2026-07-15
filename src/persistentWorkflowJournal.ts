@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
@@ -148,14 +148,35 @@ class PersistentWorkflowJournalRun implements WorkflowJournalRun {
 }
 
 function persistAtomically(filePath: string, journal: StoredJournal): void {
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
+  const directory = dirname(filePath)
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
   const temporary = `${filePath}.tmp-${process.pid}-${randomUUID()}`
   try {
     // Results can contain source fragments or business data. 0600 is intentional even when a user's
     // umask is permissive; standalone resume state should have the same privacy posture as provider
     // transcripts, not ordinary checked-in project files.
-    writeFileSync(temporary, `${JSON.stringify(journal)}\n`, { encoding: 'utf8', mode: 0o600 })
+    const file = openSync(temporary, 'wx', 0o600)
+    try {
+      writeFileSync(file, `${JSON.stringify(journal)}\n`, { encoding: 'utf8' })
+      // WHY rename alone is not a durable checkpoint: an OS may acknowledge the replace while the
+      // new bytes remain only in page cache. Resume correctness depends on a reported tool result
+      // surviving sudden power loss, so flush the bytes before publishing the new name.
+      fsyncSync(file)
+    } finally {
+      closeSync(file)
+    }
     renameSync(temporary, filePath)
+    if (process.platform !== 'win32') {
+      // WHY the directory is flushed after rename: fsyncing the file protects its contents, but
+      // POSIX does not promise the new directory entry survives a crash until the directory itself
+      // is synced. Windows does not expose portable directory fsync through Node.
+      const parent = openSync(directory, 'r')
+      try {
+        fsyncSync(parent)
+      } finally {
+        closeSync(parent)
+      }
+    }
   } catch (cause) {
     rmSync(temporary, { force: true })
     throw new PersistentJournalError('write-failed', `Cannot persist workflow journal: ${filePath}`, {
