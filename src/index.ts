@@ -156,6 +156,7 @@ export type {
   WorkflowServiceListener,
   WorkflowServiceOptions,
   WorkflowServiceScope,
+  WorkflowProviderFactoryContext,
 } from './workflowService.js'
 
 export { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'

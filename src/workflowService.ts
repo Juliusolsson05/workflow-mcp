@@ -10,7 +10,7 @@ import type { FoundWorkflow } from './findWorkflows.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 import { runWorkflow } from './runWorkflow.js'
-import type { WorkflowLimits, WorkflowRun } from './runWorkflow.js'
+import type { RunWorkflowOptions, WorkflowLimits, WorkflowRun } from './runWorkflow.js'
 import {
   loadScopedWorkflowPath,
   persistInlineWorkflow,
@@ -43,7 +43,7 @@ export type WorkflowServiceScope = {
 
 export type WorkflowServiceOptions = {
   store: WorkflowStore
-  provider: AgentProvider | (() => AgentProvider)
+  provider: AgentProvider | ((context: WorkflowProviderFactoryContext) => AgentProvider)
   workerLauncher?: WorkflowWorkerLauncher
   workerFilePath?: string
   limits?: Partial<WorkflowLimits>
@@ -52,6 +52,15 @@ export type WorkflowServiceOptions = {
   modelAliases?: Readonly<Record<string, string | null>>
   defaultEffort?: string
   sandbox?: Partial<AgentSandboxPolicy>
+  resolveAgentType?(name: string): Promise<string | undefined>
+  prepareWorkingDirectory?: RunWorkflowOptions['prepareWorkingDirectory']
+}
+
+export type WorkflowProviderFactoryContext = {
+  runId: string
+  cwd: string
+  /** MCP client/session which requested this run, when the transport has one. */
+  clientId?: string
 }
 
 export type WorkflowRunStartResult = {
@@ -406,14 +415,19 @@ export class WorkflowService {
       this.#options.store.journalPath(runId),
       input.journalSnapshots,
     )
+    const cwd = resolve(scope.cwd)
     const provider = typeof this.#options.provider === 'function'
-      ? this.#options.provider()
+      ? this.#options.provider({
+          runId,
+          cwd,
+          ...(scope.clientId === undefined ? {} : { clientId: scope.clientId }),
+        })
       : this.#options.provider
     const run = runWorkflow({
       runId,
       workflow,
       ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
-      cwd: resolve(scope.cwd),
+      cwd,
       provider,
       journal,
       ...(this.#options.workerLauncher === undefined
@@ -431,6 +445,12 @@ export class WorkflowService {
       ...(this.#options.defaultEffort === undefined
         ? {}
         : { defaultEffort: this.#options.defaultEffort }),
+      ...(this.#options.resolveAgentType === undefined
+        ? {}
+        : { resolveAgentType: this.#options.resolveAgentType }),
+      ...(this.#options.prepareWorkingDirectory === undefined
+        ? {}
+        : { prepareWorkingDirectory: this.#options.prepareWorkingDirectory }),
       // Read-only is the service default even though the low-level executor remains backwards
       // compatible with its historical workspace-write CLI default. MCP input has no field that
       // can widen this host-owned policy.
