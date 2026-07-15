@@ -174,6 +174,22 @@ registerWorkflowMcpTools(mcpServer, service, { cwd: projectDirectory, clientId: 
 - **[docs/RELIABILITY_IMPLEMENTATION_PLAN.md](docs/RELIABILITY_IMPLEMENTATION_PLAN.md)** —
   the unattended-execution and failure-domain plan.
 
+## Built for Agent Code
+
+`workflow-mcp` was built as a feature of
+[**Agent Code**](https://github.com/Juliusolsson05/agent-code) — an open-source
+Electron IDE for driving the real Claude Code and Codex CLIs across a
+multi-agent workspace. Agent Code embeds this runtime through its existing MCP
+host and renders each run as a live, first-class feed card: phases and agents as
+vertical lists, with prompt, activity, and outcome expandable inline.
+
+That embedded path is the most polished way to use `workflow-mcp` today. The
+runtime was designed from the start to stand on its own — the CLI and the
+standalone stdio / loopback-HTTP MCP server already run workflows outside Agent
+Code — but **better support for standalone execution is on its way**: a
+supervised host so runs keep progressing across restarts without a desktop app
+present, smoother first-run setup, and more provider adapters beyond Codex.
+
 ## Status
 
 Early. The loader, execution runtime, durable service, MCP facade, standalone
