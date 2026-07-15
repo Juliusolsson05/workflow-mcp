@@ -153,6 +153,7 @@ export type {
 } from './workflowService.js'
 
 export { registerWorkflowMcpTools } from './workflowMcp.js'
+export type { WorkflowMcpRegistrationHooks } from './workflowMcp.js'
 export { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
 export type { WorkflowMcpHttpServer } from './standaloneServer.js'
 export type {

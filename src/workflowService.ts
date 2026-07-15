@@ -111,6 +111,7 @@ export class WorkflowService {
   readonly #active = new Map<string, WorkflowRun>()
   readonly #listeners = new Set<WorkflowServiceListener>()
   readonly #waiters = new Map<string, Set<() => void>>()
+  readonly #runVersions = new Map<string, number>()
   #initialized = false
   #stopped = false
 
@@ -207,10 +208,11 @@ export class WorkflowService {
     const limit = boundedInteger(input.limit ?? 200, 'limit', 1, MAX_EVENTS_PER_PAGE)
     const waitMs = boundedInteger(input.waitMs ?? 0, 'waitMs', 0, MAX_WAIT_MS)
     let manifest = await this.status(scope, input.runId)
+    const observedVersion = this.#runVersions.get(input.runId) ?? 0
     let page = await this.#options.store.readEvents(input.runId, after, limit)
     if (page.events.length > 0 || waitMs === 0 || TERMINAL_STATUSES.has(manifest.status)) return page
 
-    await this.#waitForEvent(input.runId, waitMs)
+    await this.#waitForEvent(input.runId, waitMs, observedVersion)
     manifest = await this.status(scope, input.runId)
     page = await this.#options.store.readEvents(input.runId, after, limit)
     return page
@@ -426,6 +428,7 @@ export class WorkflowService {
   }
 
   #publish(event: StoredWorkflowEvent): void {
+    this.#runVersions.set(event.runId, (this.#runVersions.get(event.runId) ?? 0) + 1)
     for (const listener of this.#listeners) listener(event)
     const waiters = this.#waiters.get(event.runId)
     if (!waiters) return
@@ -433,7 +436,7 @@ export class WorkflowService {
     for (const wake of waiters) wake()
   }
 
-  #waitForEvent(runId: string, waitMs: number): Promise<void> {
+  #waitForEvent(runId: string, waitMs: number, observedVersion: number): Promise<void> {
     return new Promise((resolveWait) => {
       let finished = false
       const finish = (): void => {
@@ -446,9 +449,17 @@ export class WorkflowService {
         resolveWait()
       }
       const timer = setTimeout(finish, waitMs)
+      if ((this.#runVersions.get(runId) ?? 0) !== observedVersion) {
+        finish()
+        return
+      }
       const waiters = this.#waiters.get(runId)
       if (waiters) waiters.add(finish)
       else this.#waiters.set(runId, new Set([finish]))
+      // Persist/publish can win between the version check and waiter insertion because both sides
+      // contain awaits before this point. Rechecking after insertion closes that lost-wakeup window;
+      // cursor replay remains the source of truth after either wake path.
+      if ((this.#runVersions.get(runId) ?? 0) !== observedVersion) finish()
     })
   }
 }
