@@ -12,6 +12,8 @@ import type { LoadedWorkflow } from './loadWorkflow.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 import { runWorkflow } from './runWorkflow.js'
 import type { RunWorkflowOptions, WorkflowLimits, WorkflowRun } from './runWorkflow.js'
+import { normalizeReliabilityPolicy, ProviderCircuitBreaker } from './executionReliability.js'
+import type { ProviderCircuitSnapshot, WorkflowReliabilityPolicy } from './executionReliability.js'
 import {
   loadScopedWorkflowPath,
   persistInlineWorkflow,
@@ -26,7 +28,10 @@ import type {
   WorkflowRunSnapshot,
   WorkflowRunStatus,
   WorkflowStore,
+  WorkflowStoreLease,
 } from './workflowStore.js'
+import { WorkConservingScheduler } from './workConservingScheduler.js'
+import type { AgentScheduler, SchedulerSnapshot } from './workConservingScheduler.js'
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   'completed',
@@ -48,6 +53,10 @@ export type WorkflowServiceOptions = {
   workerLauncher?: WorkflowWorkerLauncher
   workerFilePath?: string
   limits?: Partial<WorkflowLimits>
+  reliability?: Partial<WorkflowReliabilityPolicy>
+  /** Shared provider capacity across every run owned by this service. */
+  scheduler?: AgentScheduler
+  recovery?: Partial<WorkflowRecoveryPolicy>
   budgetTokens?: number | null
   defaultModel?: string
   modelAliases?: Readonly<Record<string, string | null>>
@@ -55,6 +64,18 @@ export type WorkflowServiceOptions = {
   sandbox?: Partial<AgentSandboxPolicy>
   resolveAgentType?(name: string, cwd: string): Promise<string | undefined>
   prepareWorkingDirectory?: RunWorkflowOptions['prepareWorkingDirectory']
+}
+
+export type WorkflowRecoveryPolicy = {
+  /** Recover only runs which durably reached run.started; never guess about an untouched queue row. */
+  autoResumeOnInitialize: boolean
+  /** Mutable shared checkouts can contain ambiguous side effects and are manual by default. */
+  allowMutableSandbox: boolean
+}
+
+const DEFAULT_RECOVERY_POLICY: Readonly<WorkflowRecoveryPolicy> = {
+  autoResumeOnInitialize: true,
+  allowMutableSandbox: false,
 }
 
 export type WorkflowProviderFactoryContext = {
@@ -79,6 +100,31 @@ export type WorkflowRunStartResult = {
   /** Directory containing Claude-shaped agent-<id>.jsonl transcript mirrors for this run. */
   transcriptDirectory: string
   resumedFromRunId?: string
+  lineageId: string
+  recoveryMode?: 'manual' | 'automatic'
+}
+
+export type WorkflowRunHealth = {
+  runId: string
+  status: WorkflowRunStatus
+  cursor: number
+  scheduler: SchedulerSnapshot
+  providerCircuit: ProviderCircuitSnapshot
+  agents: {
+    total: number
+    queued: number
+    running: number
+    stalled: number
+    retrying: number
+    completed: number
+    failed: number
+  }
+  lastProgressAt?: string
+  oldestRunningSince?: string
+  lineageId: string
+  recoveryMode?: 'manual' | 'automatic'
+  /** Newest linked continuation, allowing clients to follow an interrupted generation. */
+  successorRunId?: string
 }
 
 export type WorkflowServiceErrorCode =
@@ -134,49 +180,105 @@ export type WorkflowServiceListener = (event: StoredWorkflowEvent) => void
  */
 export class WorkflowService {
   readonly #options: WorkflowServiceOptions
+  readonly #scheduler: AgentScheduler
+  readonly #circuitBreaker: ProviderCircuitBreaker
+  readonly #recovery: WorkflowRecoveryPolicy
   readonly #active = new Map<string, WorkflowRun>()
   readonly #listeners = new Set<WorkflowServiceListener>()
   readonly #waiters = new Map<string, Set<() => void>>()
   readonly #runVersions = new Map<string, number>()
+  readonly #idempotentStarts = new Map<string, Promise<WorkflowRunStartResult>>()
+  #storeLease: WorkflowStoreLease | undefined
   #initialized = false
   #stopped = false
 
   constructor(options: WorkflowServiceOptions) {
     this.#options = options
+    this.#scheduler = options.scheduler ?? new WorkConservingScheduler(options.limits?.concurrency ?? 9)
+    this.#circuitBreaker = new ProviderCircuitBreaker(normalizeReliabilityPolicy(options.reliability))
+    this.#recovery = { ...DEFAULT_RECOVERY_POLICY, ...options.recovery }
   }
 
   async initialize(): Promise<void> {
     if (this.#initialized) return
-    await this.#options.store.initialize()
-    this.#initialized = true
-
-    for (const manifest of await this.#options.store.listManifests()) {
-      if (TERMINAL_STATUSES.has(manifest.status)) continue
-      const timestamp = new Date().toISOString()
-      const event: WorkflowEvent = {
-        schemaVersion: 1,
-        runId: manifest.runId,
-        sequence: manifest.cursor + 1,
-        eventId: `event_${randomUUID()}`,
-        timestamp,
-        type: 'run.interrupted',
-        payload: {
-          reason: 'Workflow host stopped before this run reached a durable terminal event',
-        },
+    try {
+      // Acquire before recovery scans: FileWorkflowStore.initialize() can repair an event tail and
+      // rewrite a manifest. Two hosts must not both perform that mutation before either announces
+      // ownership. Stores without a lease API retain their historical initialize-first behavior.
+      this.#storeLease = await this.#options.store.acquireLease?.(`workflow-service:${randomUUID()}`)
+      await this.#options.store.initialize()
+      this.#initialized = true
+      const recoverable: WorkflowRunManifest[] = []
+      for (const manifest of await this.#options.store.listManifests()) {
+        if (TERMINAL_STATUSES.has(manifest.status)) continue
+        const shouldRecover =
+          this.#recovery.autoResumeOnInitialize &&
+          manifest.status === 'running' &&
+          this.#automaticRecoveryIsSafe()
+        const timestamp = new Date().toISOString()
+        const event: WorkflowEvent = {
+          schemaVersion: 1,
+          runId: manifest.runId,
+          sequence: manifest.cursor + 1,
+          eventId: `event_${randomUUID()}`,
+          timestamp,
+          type: 'run.interrupted',
+          payload: {
+            reason: 'Workflow host stopped before this run reached a durable terminal event',
+          },
+        }
+        const stored = await this.#options.store.appendEvent(manifest.runId, event)
+        this.#publish(stored)
+        if (shouldRecover) recoverable.push({ ...manifest, status: 'interrupted' })
       }
-      const stored = await this.#options.store.appendEvent(manifest.runId, event)
-      this.#publish(stored)
+
+      for (const manifest of recoverable) {
+        try {
+          // WHY recovery creates a linked run instead of mutating the interrupted history: the old
+          // event stream is immutable evidence of where the process died. Reusing its run ID would
+          // allow two physical executions to publish the same sequence and make crash forensics
+          // indistinguishable from duplicate provider events.
+          await this.#resumeStored(
+            { cwd: manifest.cwd },
+            {
+              runId: manifest.runId,
+              idempotencyKey: `automatic-recovery:${manifest.runId}`,
+            },
+            undefined,
+            'automatic',
+          )
+        } catch (error) {
+          // Initialization must still expose the interrupted run when recovery cannot be constructed
+          // (for example a corrupt journal). A cleanly logged manual recovery requirement is better
+          // than making the entire MCP service unavailable for every unrelated project run.
+          console.error(`[workflow-mcp] Automatic recovery failed for ${manifest.runId}:`, error)
+        }
+      }
+    } catch (error) {
+      // WHY partial initialization relinquishes ownership: keeping #initialized true or retaining
+      // the lock after a store scan failure creates a service that refuses requests yet blocks the
+      // next healthy process from recovering. Recovery is retriable only from a clean ownership
+      // boundary.
+      this.#initialized = false
+      await this.#storeLease?.release().catch(() => undefined)
+      this.#storeLease = undefined
+      throw error
     }
   }
 
   async stop(reason = 'Workflow service is stopping'): Promise<void> {
     if (this.#stopped) return
     this.#stopped = true
-    const runs = [...this.#active.values()]
-    await Promise.allSettled(runs.map((run) => run.cancel(reason)))
-    this.#active.clear()
-    for (const waiters of this.#waiters.values()) for (const wake of waiters) wake()
-    this.#waiters.clear()
+    try {
+      const runs = [...this.#active.values()]
+      await Promise.allSettled(runs.map((run) => run.cancel(reason)))
+      this.#active.clear()
+      for (const waiters of this.#waiters.values()) for (const wake of waiters) wake()
+      this.#waiters.clear()
+    } finally {
+      await this.#storeLease?.release()
+      this.#storeLease = undefined
+    }
   }
 
   async list(scope: WorkflowServiceScope) {
@@ -199,6 +301,10 @@ export class WorkflowService {
   async start(scope: WorkflowServiceScope, input: WorkflowStartInput): Promise<WorkflowRunStartResult> {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
+    return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => this.#startOnce(scope, input))
+  }
+
+  async #startOnce(scope: WorkflowServiceScope, input: WorkflowStartInput): Promise<WorkflowRunStartResult> {
     const existing = input.idempotencyKey === undefined
       ? undefined
       : await this.#options.store.findByIdempotencyKey(resolve(scope.cwd), input.idempotencyKey)
@@ -226,6 +332,44 @@ export class WorkflowService {
     const manifest = await this.#requiredManifest(runId)
     this.#assertScope(scope, manifest)
     return manifest
+  }
+
+  async health(scope: WorkflowServiceScope, runId: string): Promise<WorkflowRunHealth> {
+    const snapshot = await this.snapshot(scope, runId)
+    const successor = (await this.#options.store.listManifests())
+      .filter((manifest) => manifest.resumedFromRunId === runId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .at(-1)
+    const attempts = snapshot.state.agents.flatMap((agent) => agent.attempts)
+    const progressTimes = attempts.map((attempt) => attempt.lastProgressAt).filter(Boolean)
+    const runningStarts = attempts
+      .filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+      .map((attempt) => attempt.startedAt)
+    const lastProgressAt = progressTimes.sort().at(-1)
+    const oldestRunningSince = runningStarts.sort()[0]
+    return {
+      runId,
+      status: snapshot.manifest.status,
+      cursor: snapshot.cursor,
+      scheduler: this.#scheduler.snapshot(),
+      providerCircuit: this.#circuitBreaker.snapshot(),
+      agents: {
+        total: snapshot.state.counts.total,
+        queued: snapshot.state.counts.queued,
+        running: snapshot.state.counts.running,
+        stalled: attempts.filter((attempt) => attempt.status === 'stalled').length,
+        retrying: snapshot.state.agents.filter((agent) => agent.retry !== undefined && agent.status === 'queued').length,
+        completed: snapshot.state.counts.completed,
+        failed: snapshot.state.counts.failed,
+      },
+      ...(lastProgressAt === undefined ? {} : { lastProgressAt }),
+      ...(oldestRunningSince === undefined ? {} : { oldestRunningSince }),
+      lineageId: snapshot.manifest.lineageId ?? snapshot.manifest.runId,
+      ...(snapshot.manifest.recoveryMode === undefined
+        ? {}
+        : { recoveryMode: snapshot.manifest.recoveryMode }),
+      ...(successor === undefined ? {} : { successorRunId: successor.runId }),
+    }
   }
 
   async snapshot(scope: WorkflowServiceScope, runId: string): Promise<WorkflowRunSnapshot> {
@@ -273,14 +417,16 @@ export class WorkflowService {
   async resume(scope: WorkflowServiceScope, input: WorkflowResumeInput): Promise<WorkflowRunStartResult> {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
-    if ('claudeRunPath' in input) return this.#resumeClaude(scope, input)
-    return this.#resumeStored(scope, input)
+    return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => (
+      'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeStored(scope, input)
+    ))
   }
 
   async #resumeStored(
     scope: WorkflowServiceScope,
     input: Extract<WorkflowResumeInput, { runId: string }>,
     overrides?: WorkflowStartInput,
+    recoveryMode: 'manual' | 'automatic' = 'manual',
   ): Promise<WorkflowRunStartResult> {
     const original = await this.status(scope, input.runId)
     if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
@@ -316,6 +462,8 @@ export class WorkflowService {
       ...(args.provided ? { args: args.value } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       resumedFromRunId: input.runId,
+      lineageId: original.lineageId ?? original.runId,
+      recoveryMode,
       ...(priorSnapshot === undefined ? {} : { journalSnapshots: [priorSnapshot] }),
     })
   }
@@ -386,6 +534,8 @@ export class WorkflowService {
     return this.#startLoaded(scope, imported.workflow, {
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       resumedFromRunId: imported.metadata.runId,
+      lineageId: imported.metadata.runId,
+      recoveryMode: 'manual',
       ...(journalSnapshot === undefined ? {} : { journalSnapshots: [journalSnapshot] }),
     })
   }
@@ -402,6 +552,8 @@ export class WorkflowService {
       args?: unknown
       idempotencyKey?: string
       resumedFromRunId?: string
+      lineageId?: string
+      recoveryMode?: 'manual' | 'automatic'
       journalSnapshots?: Parameters<typeof PersistentWorkflowJournal.open>[1]
     },
   ): Promise<WorkflowRunStartResult> {
@@ -413,6 +565,8 @@ export class WorkflowService {
       ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       ...(input.resumedFromRunId === undefined ? {} : { resumedFromRunId: input.resumedFromRunId }),
+      lineageId: input.lineageId ?? runId,
+      ...(input.recoveryMode === undefined ? {} : { recoveryMode: input.recoveryMode }),
     })
     const journal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(runId),
@@ -433,6 +587,12 @@ export class WorkflowService {
       cwd,
       provider,
       journal,
+      journalReuseMode: input.recoveryMode === 'automatic'
+        ? 'exact-source-sparse'
+        : 'longest-prefix',
+      scheduler: this.#scheduler,
+      circuitBreaker: this.#circuitBreaker,
+      lineageId: input.lineageId ?? runId,
       ...(this.#options.workerLauncher === undefined
         ? {}
         : { workerLauncher: this.#options.workerLauncher }),
@@ -440,6 +600,7 @@ export class WorkflowService {
         ? {}
         : { workerFilePath: this.#options.workerFilePath }),
       ...(this.#options.limits === undefined ? {} : { limits: this.#options.limits }),
+      ...(this.#options.reliability === undefined ? {} : { reliability: this.#options.reliability }),
       ...(this.#options.budgetTokens === undefined
         ? {}
         : { budgetTokens: this.#options.budgetTokens }),
@@ -525,6 +686,33 @@ export class WorkflowService {
     }
   }
 
+  #automaticRecoveryIsSafe(): boolean {
+    const mode = this.#options.sandbox?.mode ?? 'read-only'
+    return mode === 'read-only' || this.#recovery.allowMutableSandbox
+  }
+
+  async #serializeIdempotentStart(
+    scope: WorkflowServiceScope,
+    key: string | undefined,
+    start: () => Promise<WorkflowRunStartResult>,
+  ): Promise<WorkflowRunStartResult> {
+    if (key === undefined) return start()
+    const identity = `${resolve(scope.cwd)}\0${key}`
+    const existing = this.#idempotentStarts.get(identity)
+    if (existing) return existing
+    // WHY the in-flight promise covers lookup plus create: the durable store has a single fenced
+    // service owner, but two MCP requests can still interleave `findByIdempotencyKey()` before
+    // either creates its manifest. Serializing only creation is too late and produces duplicate
+    // provider executions for one client retry.
+    const pending = start()
+    this.#idempotentStarts.set(identity, pending)
+    try {
+      return await pending
+    } finally {
+      if (this.#idempotentStarts.get(identity) === pending) this.#idempotentStarts.delete(identity)
+    }
+  }
+
   #publish(event: StoredWorkflowEvent): void {
     this.#runVersions.set(event.runId, (this.#runVersions.get(event.runId) ?? 0) + 1)
     for (const listener of this.#listeners) listener(event)
@@ -576,10 +764,12 @@ function startResult(
     },
     cursor: manifest.cursor,
     transcriptDirectory: store.transcriptDirectory(manifest.runId),
+    lineageId: manifest.lineageId ?? manifest.runId,
     ...(manifest.workflow.filePath === undefined ? {} : { scriptPath: manifest.workflow.filePath }),
     ...(manifest.resumedFromRunId === undefined
       ? {}
       : { resumedFromRunId: manifest.resumedFromRunId }),
+    ...(manifest.recoveryMode === undefined ? {} : { recoveryMode: manifest.recoveryMode }),
   }
 }
 

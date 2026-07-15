@@ -38,7 +38,14 @@ describe('workflow MCP facade', () => {
       'workflow_validate',
     ])
     const listed = await client.callTool({ name: 'workflow_list', arguments: {} })
-    expect(listed.structuredContent).toMatchObject({ ok: true, workflows: [] })
+    expect(listed.structuredContent).toMatchObject({ ok: true })
+    expect((listed.structuredContent as { workflows: unknown[] }).workflows).toEqual(expect.any(Array))
+
+    // WHY this test deliberately does not assert an empty list: user-level workflows are valid
+    // inputs to discovery even when the project fixture is empty. Depending on the developer's
+    // real ~/.claude directory made this protocol-surface test fail on healthy machines and hid
+    // actual regressions behind local-state pollution. Discovery precedence has dedicated tests;
+    // this assertion only proves that the stable tool can be invoked and returns its typed shape.
 
     await client.close()
     await server.close()
@@ -122,6 +129,13 @@ describe('workflow MCP facade', () => {
     expect(resumedStatus.structuredContent).toMatchObject({
       ok: true,
       run: { status: 'completed', resumedFromRunId: runId },
+      health: {
+        status: 'completed',
+        scheduler: { capacity: 9, active: 0 },
+        providerCircuit: { state: 'closed' },
+        lineageId: runId,
+        recoveryMode: 'manual',
+      },
     })
 
     await client.close()

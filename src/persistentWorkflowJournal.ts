@@ -11,6 +11,7 @@ import {
   type JournalIdentity,
   type JournalMiss,
   type JournalRecord,
+  type JournalReuseMode,
   type JournalSessionRecord,
   type JournalSnapshot,
   type WorkflowJournal,
@@ -82,8 +83,8 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
     return new PersistentWorkflowJournal(filePath, snapshots)
   }
 
-  beginRun(identity: JournalIdentity): WorkflowJournalRun {
-    const run = this.#inner.beginRun(identity)
+  beginRun(identity: JournalIdentity, options: { reuseMode?: JournalReuseMode } = {}): WorkflowJournalRun {
+    const run = this.#inner.beginRun(identity, options)
     // Do not replace a complete durable prefix with an empty current run. `admit()` is the first
     // actual mutation and persists immediately; if the process dies between beginRun and admit,
     // retaining the previous snapshot is the only state that can still resume useful work.
@@ -136,8 +137,8 @@ class PersistentWorkflowJournalRun implements WorkflowJournalRun {
     this.#persist()
   }
 
-  recordResult(decision: JournalMiss, result: unknown): void {
-    this.#inner.recordResult(decision, result)
+  recordResult(decision: JournalMiss, result: unknown, options: { successful?: boolean } = {}): void {
+    this.#inner.recordResult(decision, result, options)
     this.#persist()
   }
 
@@ -246,7 +247,19 @@ function parseRecord(value: unknown, filePath: string, index: number): JournalRe
       `Workflow journal result ${index + 1} has no value: ${filePath}`,
     )
   }
-  return { type: 'result', key: value.key, agentId: value.agentId, result: value.result }
+  if (value.successful !== undefined && typeof value.successful !== 'boolean') {
+    throw new PersistentJournalError(
+      'invalid-record',
+      `Workflow journal result ${index + 1} has an invalid success marker: ${filePath}`,
+    )
+  }
+  return {
+    type: 'result',
+    key: value.key,
+    agentId: value.agentId,
+    result: value.result,
+    ...(value.successful === undefined ? {} : { successful: value.successful }),
+  }
 }
 
 function parseSessions(value: unknown, filePath: string): JournalSessionRecord[] {

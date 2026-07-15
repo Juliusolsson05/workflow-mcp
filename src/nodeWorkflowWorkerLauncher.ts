@@ -21,7 +21,13 @@ class NodeWorkflowWorkerHandle implements WorkflowWorkerHandle {
   postMessage(message: ParentToWorkerMessage): void {
     if (!this.#child.connected) return
     try {
-      this.#child.send(message)
+      this.#child.send(message, (error) => {
+        if (!error) return
+        // WHY a callback is required even though send() is wrapped in try/catch: Node reports an
+        // IPC pipe that closes between the connected check and the actual write asynchronously.
+        // Without a callback that EPIPE becomes an uncaught `error` after cancellation has already
+        // completed, occasionally crashing the otherwise healthy workflow host.
+      })
     } catch {
       // WHY the lifecycle listener remains authoritative: send-after-exit is a symptom of the
       // process exit already being reported. Surfacing it as a second scheduler failure creates a

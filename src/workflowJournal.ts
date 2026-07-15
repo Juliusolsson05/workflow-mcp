@@ -41,6 +41,8 @@ export type JournalResultRecord = {
   key: string
   agentId: string
   result: unknown
+  /** Private recovery evidence; absent legacy/Claude null remains conservatively non-reusable. */
+  successful?: boolean
 }
 
 export type JournalSessionRecord = {
@@ -81,12 +83,14 @@ export type JournalDecision = JournalMiss | JournalHit
 export interface WorkflowJournalRun {
   admit(call: JournalCall): JournalDecision
   recordProviderSession(decision: JournalMiss, session: ProviderSessionReference): void
-  recordResult(decision: JournalMiss, result: unknown): void
+  recordResult(decision: JournalMiss, result: unknown, options?: { successful?: boolean }): void
   snapshot(): JournalSnapshot
 }
 
+export type JournalReuseMode = 'longest-prefix' | 'exact-source-sparse'
+
 export interface WorkflowJournal {
-  beginRun(identity: JournalIdentity): WorkflowJournalRun
+  beginRun(identity: JournalIdentity, options?: { reuseMode?: JournalReuseMode }): WorkflowJournalRun
   getSnapshot(workflowId: string): JournalSnapshot | undefined
 }
 
@@ -184,6 +188,7 @@ type HistoricalCall = {
   key: string
   agentId: string
   hasResult: boolean
+  reusable: boolean
   result?: unknown
   providerSession?: ProviderSessionReference
 }
@@ -199,6 +204,7 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
         key: record.key,
         agentId: record.agentId,
         hasResult: false,
+        reusable: false,
       }
       calls.push(call)
       const matches = pending.get(recordId)
@@ -215,6 +221,9 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
     if (!call) continue
     call.hasResult = true
     call.result = record.result
+    // Claude and version-1 sidecars cannot distinguish a successful null from the historical
+    // "provider failed => null" sentinel, so absence of the bit preserves conservative behavior.
+    call.reusable = record.successful ?? record.result !== null
     if (matches?.length === 0) pending.delete(recordId)
   }
 
@@ -237,12 +246,14 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
   #previousKey: string
   #nextCallIndex = 0
   #canReusePrefix: boolean
+  readonly #exactSourceSparse: boolean
 
   constructor(
     identity: JournalIdentity,
     previous: JournalSnapshot | undefined,
     records: JournalRecord[],
     sessions: JournalSessionRecord[],
+    reuseMode: JournalReuseMode,
   ) {
     this.#identity = identity
     // Claude resumes by the longest unchanged sequence of `(prompt, opts)` calls after the script
@@ -262,6 +273,10 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     this.#sessions = sessions
     this.#previousKey = ''
     this.#canReusePrefix = previous !== undefined
+    this.#exactSourceSparse =
+      reuseMode === 'exact-source-sparse' &&
+      previous !== undefined &&
+      previous.sourceHash === identity.sourceHash
   }
 
   admit(call: JournalCall): JournalDecision {
@@ -274,17 +289,24 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     // The chained v2 key already commits to every preceding call, so key lookup is both sufficient
     // and the only ordering rule that survives a saturated or retried parallel phase.
     const candidates = this.#previous.get(key) ?? []
-    const historicalResult = this.#canReusePrefix
-      ? candidates.find((candidate) => candidate.hasResult && candidate.result !== null)
+    const mayReuse = this.#canReusePrefix || this.#exactSourceSparse
+    const historicalResult = mayReuse
+      ? candidates.find((candidate) => candidate.hasResult && candidate.reusable)
       : undefined
-    const historicalSession = this.#canReusePrefix
+    const historicalSession = mayReuse
       ? candidates.find((candidate) => candidate.providerSession !== undefined)
       : undefined
 
     this.#records.push({ type: 'started', key, agentId: call.agentId })
 
     if (historicalResult !== undefined) {
-      this.#records.push({ type: 'result', key, agentId: call.agentId, result: historicalResult.result })
+      this.#records.push({
+        type: 'result',
+        key,
+        agentId: call.agentId,
+        result: historicalResult.result,
+        successful: true,
+      })
       return {
         callIndex,
         key,
@@ -298,7 +320,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     // Prefix invalidation is stateful rather than a per-key lookup. Even if a later call happens to
     // produce a historical key (a null/missing result is the common case), everything after the first
     // miss must run live because earlier outputs may have influenced its prompt or side effects.
-    this.#canReusePrefix = false
+    if (!this.#exactSourceSparse) this.#canReusePrefix = false
     const decision: JournalMiss = {
       callIndex,
       key,
@@ -327,7 +349,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     this.#sessions.push({ key: pending.key, agentId: pending.agentId, session: { ...session } })
   }
 
-  recordResult(decision: JournalMiss, result: unknown): void {
+  recordResult(decision: JournalMiss, result: unknown, options: { successful?: boolean } = {}): void {
     const pending = this.#pending.get(decision.callIndex)
     if (
       !pending ||
@@ -344,6 +366,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       key: pending.key,
       agentId: pending.agentId,
       result,
+      successful: options.successful ?? result !== null,
     })
   }
 
@@ -365,7 +388,7 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
     for (const snapshot of snapshots) this.#snapshots.set(snapshot.workflowId, copySnapshot(snapshot))
   }
 
-  beginRun(identity: JournalIdentity): WorkflowJournalRun {
+  beginRun(identity: JournalIdentity, options: { reuseMode?: JournalReuseMode } = {}): WorkflowJournalRun {
     if (identity.workflowId.length === 0) throw new TypeError('Journal workflowId must not be empty')
     if (identity.sourceHash.length === 0) throw new TypeError('Journal sourceHash must not be empty')
 
@@ -376,7 +399,13 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
     // before provider completion, getSnapshot() must expose the started-only record that forces respawn.
     const current: JournalSnapshot = { ...identity, records, sessions }
     this.#snapshots.set(identity.workflowId, current)
-    return new InMemoryWorkflowJournalRun(identity, previous, records, sessions)
+    return new InMemoryWorkflowJournalRun(
+      identity,
+      previous,
+      records,
+      sessions,
+      options.reuseMode ?? 'longest-prefix',
+    )
   }
 
   getSnapshot(workflowId: string): JournalSnapshot | undefined {

@@ -59,6 +59,11 @@ export type ParentToWorkerMessage =
 
 export type WorkerToParentMessage =
   | { type: 'ready' }
+  | {
+      type: 'heartbeat'
+      pendingRequests: number
+      timers: number
+    }
   | { type: 'phase'; title: string; firstSeen: boolean }
   | { type: 'log'; level: 'log' | 'info' | 'warn' | 'error'; text: string }
   | {

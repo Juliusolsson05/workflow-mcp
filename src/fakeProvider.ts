@@ -49,6 +49,8 @@ export type FakeProviderScript = {
   expect?: FakeProviderExpectedRequest
   /** Defaults to the resumed ID, or a deterministic `fake-session-N` for a new call. */
   sessionId?: string
+  /** False simulates a provider wedged before it establishes a resumable session. */
+  emitSession?: boolean
   events?: readonly FakeProviderEmission[]
   /** Delay after all activities and before the terminal outcome. */
   delayMs?: number
@@ -141,7 +143,9 @@ export class FakeAgentProvider implements AgentProvider {
     this.#maxConcurrentExecutions = Math.max(this.#maxConcurrentExecutions, this.#activeExecutions)
 
     try {
-      await this.#emit(call, context, { type: 'session.started', session: providerSession })
+      if (script.emitSession !== false) {
+        await this.#emit(call, context, { type: 'session.started', session: providerSession })
+      }
       for (const emission of script.events ?? []) {
         await abortableDelay(emission.delayMs ?? 0, context.signal)
         await this.#emit(call, context, emission.event)
@@ -243,6 +247,9 @@ function validateScript(script: FakeProviderScript, index: number): void {
   validateDelay(script.delayMs, `${prefix} delayMs`)
   if (script.sessionId !== undefined && script.sessionId.length === 0) {
     throw new FakeProviderSetupError(`${prefix} sessionId must not be empty`)
+  }
+  if (script.emitSession !== undefined && typeof script.emitSession !== 'boolean') {
+    throw new FakeProviderSetupError(`${prefix} emitSession must be boolean`)
   }
   if (!script.outcome || typeof script.outcome !== 'object') {
     throw new FakeProviderSetupError(`${prefix} must have an outcome`)

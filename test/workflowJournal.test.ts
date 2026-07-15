@@ -114,9 +114,15 @@ describe('InMemoryWorkflowJournal', () => {
     expect(second).toMatchObject({ reused: true, result: 'second', sourceAgentId: 'agent-1' })
     expect(resumed.snapshot().records).toEqual([
       { type: 'started', key: first.key, agentId: 'current-1' },
-      { type: 'result', key: first.key, agentId: 'current-1', result: { value: 1 } },
+      {
+        type: 'result',
+        key: first.key,
+        agentId: 'current-1',
+        result: { value: 1 },
+        successful: true,
+      },
       { type: 'started', key: second.key, agentId: 'current-2' },
-      { type: 'result', key: second.key, agentId: 'current-2', result: 'second' },
+      { type: 'result', key: second.key, agentId: 'current-2', result: 'second', successful: true },
     ])
 
     const third = journal.beginRun(identity)
@@ -163,6 +169,45 @@ describe('InMemoryWorkflowJournal', () => {
     const resumed = journal.beginRun(identity)
     expect(resumed.admit({ agentId: 'new-1', prompt: 'one' }).reused).toBe(false)
     expect(resumed.admit({ agentId: 'new-2', prompt: 'two' }).reused).toBe(false)
+  })
+
+  it('reuses exact-source completed siblings beyond one interrupted call only in sparse recovery', () => {
+    const original = new InMemoryWorkflowJournal()
+    const interrupted = original.beginRun(identity)
+    const decisions = Array.from({ length: 9 }, (_, index) => (
+      interrupted.admit({ agentId: `old-${index}`, prompt: `call-${index}` }) as JournalMiss
+    ))
+    decisions.forEach((decision, index) => {
+      if (index !== 4) interrupted.recordResult(decision, `result-${index}`)
+    })
+    const snapshot = interrupted.snapshot()
+
+    const prefix = new InMemoryWorkflowJournal([snapshot]).beginRun(identity)
+    const prefixHits = Array.from({ length: 9 }, (_, index) => (
+      prefix.admit({ agentId: `prefix-${index}`, prompt: `call-${index}` }).reused
+    ))
+    expect(prefixHits).toEqual([true, true, true, true, false, false, false, false, false])
+
+    const sparse = new InMemoryWorkflowJournal([snapshot]).beginRun(identity, {
+      reuseMode: 'exact-source-sparse',
+    })
+    const sparseHits = Array.from({ length: 9 }, (_, index) => (
+      sparse.admit({ agentId: `sparse-${index}`, prompt: `call-${index}` }).reused
+    ))
+    expect(sparseHits).toEqual([true, true, true, true, false, true, true, true, true])
+  })
+
+  it('distinguishes a successful null from the legacy provider-failure null sentinel', () => {
+    const original = new InMemoryWorkflowJournal()
+    const run = original.beginRun(identity)
+    const decision = run.admit({ agentId: 'old', prompt: 'valid null' }) as JournalMiss
+    run.recordResult(decision, null, { successful: true })
+
+    const resumed = new InMemoryWorkflowJournal([run.snapshot()]).beginRun(identity)
+    expect(resumed.admit({ agentId: 'new', prompt: 'valid null' })).toMatchObject({
+      reused: true,
+      result: null,
+    })
   })
 
   it('does not invalidate for label, phase, or unknown-option changes', () => {

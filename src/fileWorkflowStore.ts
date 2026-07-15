@@ -27,6 +27,7 @@ import type {
   WorkflowRunSnapshot,
   WorkflowRunStatus,
   WorkflowStore,
+  WorkflowStoreLease,
 } from './workflowStore.js'
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
@@ -45,7 +46,7 @@ const MAX_EVENT_FILE_BYTES = 512 * 1024 * 1024
 const EVENT_INDEX_STRIDE = 256
 
 export class WorkflowStoreError extends Error {
-  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'io-error'
+  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'io-error' | 'owner-conflict'
 
   constructor(code: WorkflowStoreError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
@@ -67,6 +68,9 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly runsDirectory: string
   readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
   readonly #eventOffsets = new Map<string, Map<number, number>>()
+  readonly #appendTails = new Map<string, Promise<void>>()
+  #leaseToken: string | undefined
+  #leaseWasAcquired = false
 
   constructor(rootDirectory: string) {
     this.rootDirectory = resolve(rootDirectory)
@@ -74,6 +78,10 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async initialize(): Promise<void> {
+    // initialize() is not read-only: crash-tail recovery can rewrite manifests. A convenience
+    // store handle which never acquired the owner lease must therefore be fenced just like append
+    // and create, or a second process can race recovery before WorkflowService sees it.
+    await this.#assertLease()
     await mkdir(this.runsDirectory, { recursive: true, mode: 0o700 })
     await chmod(this.rootDirectory, 0o700).catch(() => undefined)
     await chmod(this.runsDirectory, 0o700)
@@ -85,7 +93,66 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  async acquireLease(ownerId: string): Promise<WorkflowStoreLease> {
+    if (ownerId.length === 0) throw new TypeError('Workflow store ownerId must not be empty')
+    await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 })
+    const path = join(this.rootDirectory, 'service-owner.json')
+    const token = randomUUID()
+    const generation = (Date.now() * 1_000) + Math.floor(Math.random() * 1_000)
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const handle = await open(path, 'wx', 0o600)
+        try {
+          await handle.writeFile(`${JSON.stringify({ ownerId, token, generation, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`)
+          await handle.sync()
+        } finally {
+          await handle.close()
+        }
+        this.#leaseToken = token
+        this.#leaseWasAcquired = true
+        let released = false
+        return {
+          ownerId,
+          generation,
+          release: async () => {
+            if (released) return
+            released = true
+            try {
+              try {
+                const current = JSON.parse(await readFile(path, 'utf8')) as { token?: unknown }
+                // WHY release checks the random fencing token instead of blindly unlinking: a stale
+                // owner can resume after another process reclaimed its dead PID lock. It must never
+                // delete the new owner's lease and reopen the store to concurrent writers.
+                if (current.token === token) await rm(path, { force: true })
+              } catch (error) {
+                if (!isMissing(error)) throw error
+              }
+            } finally {
+              if (this.#leaseToken === token) this.#leaseToken = undefined
+            }
+          },
+        }
+      } catch (error) {
+        if (!isAlreadyExists(error)) {
+          throw new WorkflowStoreError('io-error', `Cannot acquire workflow store ownership: ${path}`, { cause: error })
+        }
+        const existing = await readOwner(path)
+        if (existing !== undefined && processIsAlive(existing.pid)) {
+          throw new WorkflowStoreError(
+            'owner-conflict',
+            `Workflow store is already owned by ${existing.ownerId} (pid ${existing.pid})`,
+          )
+        }
+        // The exclusive file outlives a hard crash. Reclaim only after proving its PID is absent;
+        // malformed files are also stale because no valid owner can use them for fencing.
+        await rm(path, { force: true })
+      }
+    }
+    throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership changed while acquiring it')
+  }
+
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest> {
+    await this.#assertLease()
     const directory = this.#runDirectory(input.runId)
     try {
       await mkdir(directory, { mode: 0o700 })
@@ -116,6 +183,8 @@ export class FileWorkflowStore implements WorkflowStore {
       ...(input.resumedFromRunId === undefined
         ? {}
         : { resumedFromRunId: input.resumedFromRunId }),
+      lineageId: input.lineageId ?? input.runId,
+      ...(input.recoveryMode === undefined ? {} : { recoveryMode: input.recoveryMode }),
     }
 
     try {
@@ -170,6 +239,21 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async appendEvent(runId: string, event: WorkflowEvent): Promise<StoredWorkflowEvent> {
+    const previous = this.#appendTails.get(runId) ?? Promise.resolve()
+    let releaseTail!: () => void
+    const owned = new Promise<void>((resolveOwned) => { releaseTail = resolveOwned })
+    this.#appendTails.set(runId, owned)
+    await previous.catch(() => undefined)
+    try {
+      return await this.#appendEvent(runId, event)
+    } finally {
+      releaseTail()
+      if (this.#appendTails.get(runId) === owned) this.#appendTails.delete(runId)
+    }
+  }
+
+  async #appendEvent(runId: string, event: WorkflowEvent): Promise<StoredWorkflowEvent> {
+    await this.#assertLease()
     const manifest = await this.#requiredManifest(runId)
     if (event.runId !== runId) {
       throw new WorkflowStoreError(
@@ -364,6 +448,13 @@ export class FileWorkflowStore implements WorkflowStore {
       cursor += 1
       if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
       const event = parseStoredEvent(value, runId, cursor, path)
+      // WHY the upper-bound check must happen before yield: append fsyncs events.jsonl before it
+      // advances manifest.cursor. A concurrent health/snapshot read can therefore see one durable
+      // record beyond its manifest. Yielding that future record under the old cursor poisons the
+      // projection cache, then the writer applies the same event a second time and fails the run
+      // with a false duplicate-sequence error. The manifest is the published commit boundary even
+      // though the append-only file intentionally reaches disk first for crash recovery.
+      if (cursor > throughCursor) break
       yield event
       startOffset += Buffer.byteLength(line, 'utf8') + 1
       if (cursor >= throughCursor) break
@@ -467,6 +558,45 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  async #assertLease(): Promise<void> {
+    const path = join(this.rootDirectory, 'service-owner.json')
+    if (!this.#leaseWasAcquired) {
+      try {
+        await readFile(path, 'utf8')
+      } catch (error) {
+        if (isMissing(error)) return
+        throw new WorkflowStoreError('io-error', 'Cannot inspect workflow store ownership', { cause: error })
+      }
+      // WHY even a malformed/stale-looking owner file fences an unleased handle: only
+      // acquireLease() is allowed to prove a PID dead and reclaim it atomically. Letting ordinary
+      // mutations make that judgment would recreate two ownership protocols and eventually let a
+      // convenience writer race the real service.
+      throw new WorkflowStoreError(
+        'owner-conflict',
+        'Workflow store has a service owner; acquire its lease before mutating it',
+      )
+    }
+    if (this.#leaseToken === undefined) {
+      throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership has been released')
+    }
+    try {
+      const current = JSON.parse(await readFile(path, 'utf8')) as { token?: unknown }
+      // WHY every externally initiated mutation rechecks the token: PID-only locks prevent two
+      // normal starts, but they do not fence an old asynchronous owner after its lock was reclaimed
+      // or replaced. A stale service must fail before appending, even if its JavaScript stack wakes
+      // much later with a previously valid store object.
+      if (current.token !== this.#leaseToken) {
+        throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership was fenced by another service')
+      }
+    } catch (error) {
+      if (error instanceof WorkflowStoreError) throw error
+      if (isMissing(error)) {
+        throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership file disappeared')
+      }
+      throw new WorkflowStoreError('io-error', 'Cannot verify workflow store ownership', { cause: error })
+    }
+  }
+
   #runDirectory(runId: string): string {
     if (!/^run_[A-Za-z0-9_-]+$/.test(runId)) {
       throw new TypeError(`Invalid workflow run ID: ${JSON.stringify(runId)}`)
@@ -480,6 +610,31 @@ export class FileWorkflowStore implements WorkflowStore {
 
   #eventsPath(runId: string): string {
     return join(this.#runDirectory(runId), 'events.jsonl')
+  }
+}
+
+async function readOwner(path: string): Promise<{ ownerId: string; pid: number } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path, 'utf8')) as unknown
+    if (
+      !isObject(value) ||
+      typeof value.ownerId !== 'string' ||
+      !Number.isSafeInteger(value.pid) ||
+      (value.pid as number) <= 0
+    ) return undefined
+    return { ownerId: value.ownerId, pid: value.pid as number }
+  } catch (error) {
+    if (isMissing(error) || error instanceof SyntaxError) return undefined
+    throw error
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return !(isObject(error) && error.code === 'ESRCH')
   }
 }
 

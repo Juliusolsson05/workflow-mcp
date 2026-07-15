@@ -38,6 +38,7 @@ let timerSequence = 0
 const pendingAgents = new Map<string, PendingRequest>()
 const pendingWorkflows = new Map<string, PendingRequest>()
 const timers = new Map<number, NodeJS.Timeout>()
+let heartbeatTimer: NodeJS.Timeout | undefined
 
 type ElectronParentPort = {
   postMessage(message: WorkerToParentMessage): void
@@ -108,6 +109,8 @@ function pendingRealmRequest(resolveRealm: RealmResolve, rejectRealm: RealmRejec
 function finish(message: Extract<WorkerToParentMessage, { type: 'complete' | 'failed' }>): void {
   if (terminal) return
   terminal = true
+  if (heartbeatTimer) clearInterval(heartbeatTimer)
+  heartbeatTimer = undefined
   clearTimers()
   rejectPending(new Error('Workflow ended before a pending request completed'))
 
@@ -600,6 +603,19 @@ export function startWorkflowWorker(): void {
   process.on('uncaughtException', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
   process.on('unhandledRejection', (error) => finish({ type: 'failed', error: serializeWorkerError(error) }))
   send({ type: 'ready' })
+  // WHY heartbeat state includes capability/timer counts: a live process alone is weak evidence.
+  // The parent needs to distinguish a healthy workflow awaiting nine supervised agents from a
+  // top-level promise that will never settle and has no remaining source of progress. This timer
+  // runs in the uncredentialed evaluator, so a blocked V8 loop also naturally stops heartbeats.
+  heartbeatTimer = setInterval(() => {
+    if (terminal) return
+    send({
+      type: 'heartbeat',
+      pendingRequests: pendingAgents.size + pendingWorkflows.size,
+      timers: timers.size,
+    })
+  }, 5_000)
+  heartbeatTimer.unref?.()
 }
 
 startWorkflowWorker()
