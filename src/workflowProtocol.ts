@@ -22,6 +22,9 @@ export type WorkflowRunManifest = {
   updatedAt: string
   idempotencyKey?: string
   resumedFromRunId?: string
+  /** Root run shared by manual and automatic recovery descendants. */
+  lineageId?: string
+  recoveryMode?: 'manual' | 'automatic'
   cancellationReason?: string
   error?: string
 }

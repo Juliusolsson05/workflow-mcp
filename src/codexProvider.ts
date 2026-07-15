@@ -158,6 +158,9 @@ export class CodexAgentProvider implements AgentProvider {
           case 'error':
             throw new AgentProviderFailure(event.message, {
               code: 'codex-stream-error',
+              // A broken stream says nothing about whether the thread itself survived. The
+              // supervisor can safely resume that exact thread in a read-only/worktree policy.
+              retryable: true,
               ...(providerSession === undefined ? {} : { providerSession }),
             })
 
@@ -174,6 +177,7 @@ export class CodexAgentProvider implements AgentProvider {
         `Codex SDK execution failed: ${error instanceof Error ? error.message : String(error)}`,
         {
           code: 'codex-sdk-failed',
+          retryable: true,
           ...(providerSession === undefined ? {} : { providerSession }),
           cause: error,
         },
@@ -190,6 +194,7 @@ export class CodexAgentProvider implements AgentProvider {
     if (finalResponse === undefined) {
       throw new AgentProviderFailure('Codex completed without a final agent message', {
         code: 'codex-missing-response',
+        retryable: true,
         ...(providerSession === undefined ? {} : { providerSession }),
       })
     }

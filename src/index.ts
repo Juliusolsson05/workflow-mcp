@@ -33,6 +33,28 @@ export {
 export type { ClaudeWorkflowResume, ClaudeWorkflowRunMetadata } from './claudeResume.js'
 
 export { PersistentJournalError, PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
+export {
+  AgentAttemptTimeoutError,
+  AttemptLivenessMonitor,
+  DEFAULT_WORKFLOW_RELIABILITY_POLICY,
+  normalizeReliabilityPolicy,
+  ProviderCircuitBreaker,
+  retryDelayMs,
+} from './executionReliability.js'
+export type {
+  AttemptLivenessSnapshot,
+  AttemptTimeoutKind,
+  AutomaticRetryMode,
+  ProviderCircuitLease,
+  ProviderCircuitSnapshot,
+  WorkflowReliabilityPolicy,
+} from './executionReliability.js'
+export { WorkConservingScheduler } from './workConservingScheduler.js'
+export type {
+  AgentScheduler,
+  SchedulerLease,
+  SchedulerSnapshot,
+} from './workConservingScheduler.js'
 
 export {
   AgentProviderAbortError,
@@ -44,10 +66,12 @@ export type {
   AgentApprovalPolicy,
   AgentProvider,
   AgentProviderActivity,
+  AgentProviderAttemptIdentity,
   AgentProviderEvent,
   AgentProviderExecutionContext,
   AgentProviderOutput,
   AgentProviderResult,
+  AgentProviderTerminationReason,
   AgentProviderFailureOptions,
   AgentRequest,
   AgentSandboxMode,
@@ -146,17 +170,20 @@ export type {
   WorkflowRunManifest,
   WorkflowRunSnapshot,
   WorkflowStore,
+  WorkflowStoreLease,
 } from './workflowStore.js'
 
 export { WorkflowService, WorkflowServiceError } from './workflowService.js'
 export type {
   WorkflowRunStartResult,
+  WorkflowRunHealth,
   WorkflowStartInput,
   WorkflowResumeInput,
   WorkflowServiceErrorCode,
   WorkflowServiceListener,
   WorkflowServiceOptions,
   WorkflowServiceScope,
+  WorkflowRecoveryPolicy,
   WorkflowProviderFactoryContext,
 } from './workflowService.js'
 
@@ -172,6 +199,7 @@ export type {
   JournalIdentity,
   JournalMiss,
   JournalRecord,
+  JournalReuseMode,
   JournalResultRecord,
   JournalSessionRecord,
   JournalSnapshot,

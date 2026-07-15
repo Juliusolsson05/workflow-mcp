@@ -88,6 +88,9 @@ export type AgentAttemptStarted = {
   source: 'live' | 'provider-resume'
   provider: string
   providerSession?: ProviderSessionReference
+  startupDeadlineAt?: string
+  absoluteDeadlineAt?: string
+  workspaceId?: string
 }
 
 type EventEnvelope<Type extends string, Payload> = {
@@ -183,6 +186,15 @@ export type AgentAdmittedEvent = AgentEvent<'agent.admitted', AgentAdmitted>
 export type AgentQueuedEvent = AgentEvent<'agent.queued', { reason?: string }>
 export type AgentReusedEvent = AgentEvent<'agent.reused', AgentOutcome>
 export type AgentStartedEvent = AttemptEvent<'agent.started', AgentAttemptStarted>
+export type AgentWorkspacePreparedEvent = AgentEvent<
+  'agent.workspace.prepared',
+  {
+    workspaceId: string
+    path: string
+    reused: boolean
+    leaseId?: string
+  }
+>
 export type AgentSessionStartedEvent = AttemptEvent<
   'agent.session.started',
   { session: ProviderSessionReference }
@@ -211,12 +223,30 @@ export type AgentActivityCompletedEvent = AttemptEvent<
   }
 >
 export type AgentCompletedEvent = AgentEvent<'agent.completed', AgentOutcome>
+export type AgentStalledEvent = AttemptEvent<
+  'agent.stalled',
+  {
+    kind: 'startup' | 'idle' | 'active-operation' | 'absolute'
+    lastProgressAt: string
+    deadlineAt: string
+  }
+>
 export type AgentFailedEvent = AgentEvent<
   'agent.failed',
   {
     error: WorkflowErrorReference
     /** A failed attempt may be followed by another attempt for the same logical agent. */
     retrying?: boolean
+  }
+>
+export type AgentRetryScheduledEvent = AgentEvent<
+  'agent.retry_scheduled',
+  {
+    completedAttemptNumber: number
+    nextAttemptNumber: number
+    delayMs: number
+    retryAt: string
+    reason: WorkflowErrorReference
   }
 >
 export type AgentSkippedEvent = AgentEvent<'agent.skipped', { reason?: string }>
@@ -280,12 +310,15 @@ export type WorkflowEvent =
   | AgentQueuedEvent
   | AgentReusedEvent
   | AgentStartedEvent
+  | AgentWorkspacePreparedEvent
   | AgentSessionStartedEvent
   | AgentActivityStartedEvent
   | AgentActivityUpdatedEvent
   | AgentActivityCompletedEvent
   | AgentCompletedEvent
+  | AgentStalledEvent
   | AgentFailedEvent
+  | AgentRetryScheduledEvent
   | AgentSkippedEvent
   | AgentCancelledEvent
   | LogEvent

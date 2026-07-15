@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
@@ -14,16 +14,27 @@ import {
 import type {
   AgentProvider,
   AgentProviderActivity,
+  AgentProviderAttemptIdentity,
   AgentProviderEvent,
   AgentProviderResult,
   AgentSandboxPolicy,
   ProviderSessionReference,
 } from './agentProvider.js'
+import {
+  AgentAttemptTimeoutError,
+  AttemptLivenessMonitor,
+  ProviderCircuitBreaker,
+  normalizeReliabilityPolicy,
+  retryDelayMs,
+} from './executionReliability.js'
+import type { WorkflowReliabilityPolicy } from './executionReliability.js'
+import type { ProviderCircuitLease } from './executionReliability.js'
 import { findWorkflows } from './findWorkflows.js'
 import { loadWorkflowFile } from './loadWorkflow.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import { InMemoryWorkflowJournal } from './workflowJournal.js'
 import type {
+  JournalReuseMode,
   JournalMiss,
   WorkflowJournal,
   WorkflowJournalRun,
@@ -46,6 +57,8 @@ import type {
 import { serializeWorkerError } from './workerMessages.js'
 import { NodeWorkflowWorkerLauncher } from './nodeWorkflowWorkerLauncher.js'
 import type { WorkflowWorkerHandle, WorkflowWorkerLauncher } from './workerLauncher.js'
+import { WorkConservingScheduler } from './workConservingScheduler.js'
+import type { AgentScheduler, SchedulerLease, SchedulerSnapshot } from './workConservingScheduler.js'
 
 export type WorkflowLimits = {
   concurrency: number
@@ -66,7 +79,11 @@ export type WorkflowResolver = (
 
 export type PreparedWorkingDirectory = {
   path: string
-  cleanup?(): Promise<void | { preservedPath: string }>
+  /** Stable host-owned lease identity, when the workspace manager persists leases. */
+  leaseId?: string
+  /** True when this logical workspace survived an earlier attempt or process. */
+  reused?: boolean
+  cleanup?(input?: { signal: AbortSignal }): Promise<void | { preservedPath: string }>
 }
 
 export type WorkingDirectoryPreparer = (input: {
@@ -74,6 +91,12 @@ export type WorkingDirectoryPreparer = (input: {
   isolation: string
   runId: string
   agentId: string
+  /** Stable across attempts and resumed runs for the same logical journal call. */
+  workspaceId: string
+  /** Root run identity shared by every automatic/manual recovery descendant. */
+  lineageId: string
+  /** Git/process work must honor this signal so preparation cannot strand an unattended run. */
+  signal: AbortSignal
 }) => Promise<PreparedWorkingDirectory>
 
 export type RunWorkflowOptions = {
@@ -86,9 +109,18 @@ export type RunWorkflowOptions = {
   limits?: Partial<WorkflowLimits>
   budgetTokens?: number | null
   journal?: WorkflowJournal
+  /** Automatic exact-source recovery may reuse completed siblings beyond one interrupted call. */
+  journalReuseMode?: JournalReuseMode
   resolveWorkflow?: WorkflowResolver
   resolveAgentType?(name: string): Promise<string | undefined>
   prepareWorkingDirectory?: WorkingDirectoryPreparer
+  /** Shared service scheduler. Omit for a run-local scheduler at limits.concurrency. */
+  scheduler?: AgentScheduler
+  /** Shared provider-outage gate. Omit for a run-local circuit breaker. */
+  circuitBreaker?: ProviderCircuitBreaker
+  reliability?: Partial<WorkflowReliabilityPolicy>
+  /** Stable recovery lineage; defaults to this run ID. */
+  lineageId?: string
   defaultModel?: string
   /** Host-owned portable-name mapping; null selects the provider's configured default model. */
   modelAliases?: Readonly<Record<string, string | null>>
@@ -121,6 +153,13 @@ export class WorkflowExecutionError extends Error {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
     this.name = 'WorkflowExecutionError'
     this.code = code
+  }
+}
+
+class UnconfirmedProviderTerminationError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause })
+    this.name = 'UnconfirmedProviderTerminationError'
   }
 }
 
@@ -188,7 +227,6 @@ type AgentAdmission = {
   worker: WorkflowWorkerHandle
   agentId: string
   phaseId?: string
-  attemptId: string
   prompt: string
   options: WorkerAgentOptions
   normalizedOptions: NormalizedAgentOptions
@@ -278,65 +316,6 @@ class WorkflowEventStream implements AsyncIterable<WorkflowEvent> {
   }
 }
 
-type SemaphoreWaiter = {
-  resolve(release: () => void): void
-  reject(error: unknown): void
-  signal: AbortSignal
-  onAbort(): void
-}
-
-class Semaphore {
-  readonly #limit: number
-  readonly #waiters: SemaphoreWaiter[] = []
-  #active = 0
-
-  constructor(limit: number) {
-    this.#limit = limit
-  }
-
-  acquire(signal: AbortSignal): Promise<() => void> {
-    if (signal.aborted) return Promise.reject(new WorkflowCancelledError(abortReason(signal)))
-    if (this.#active < this.#limit) {
-      this.#active += 1
-      return Promise.resolve(this.#releaseOnce())
-    }
-
-    return new Promise((resolveAcquire, reject) => {
-      const waiter: SemaphoreWaiter = {
-        resolve: resolveAcquire,
-        reject,
-        signal,
-        onAbort: () => {
-          const index = this.#waiters.indexOf(waiter)
-          if (index !== -1) this.#waiters.splice(index, 1)
-          reject(new WorkflowCancelledError(abortReason(signal)))
-        },
-      }
-      signal.addEventListener('abort', waiter.onAbort, { once: true })
-      this.#waiters.push(waiter)
-    })
-  }
-
-  #releaseOnce(): () => void {
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      this.#release()
-    }
-  }
-
-  #release(): void {
-    const waiter = this.#waiters.shift()
-    if (!waiter) {
-      this.#active -= 1
-      return
-    }
-    waiter.signal.removeEventListener('abort', waiter.onAbort)
-    waiter.resolve(this.#releaseOnce())
-  }
-}
-
 class WorkflowRuntime {
   readonly id: string
   readonly #options: RunWorkflowOptions
@@ -345,7 +324,14 @@ class WorkflowRuntime {
   readonly #stream = new WorkflowEventStream()
   readonly #result = deferred<unknown>()
   readonly #controller = new AbortController()
-  readonly #scheduler: Semaphore
+  /** Global service capacity, or the run scheduler itself for standalone execution. */
+  readonly #scheduler: AgentScheduler
+  /** Per-run ceiling; a shared service scheduler must never erase a smaller workflow limit. */
+  readonly #runScheduler: AgentScheduler
+  readonly #preparationScheduler: AgentScheduler
+  readonly #cleanupScheduler: AgentScheduler
+  readonly #reliability: WorkflowReliabilityPolicy
+  readonly #circuitBreaker: ProviderCircuitBreaker
   readonly #journal: WorkflowJournal
   readonly #journalRun: WorkflowJournalRun
   readonly #ajv = new Ajv({ allErrors: true, strict: false })
@@ -369,6 +355,9 @@ class WorkflowRuntime {
   #emitTail: Promise<void> = Promise.resolve()
   #cancelPromise: Promise<void> | undefined
   #wallClockTimer: NodeJS.Timeout | undefined
+  #underutilizationTimer: NodeJS.Timeout | undefined
+  #lastUnderutilizationSignature: string | undefined
+  #retryAttemptsScheduled = 0
 
   constructor(options: RunWorkflowOptions) {
     this.id = options.runId ?? `run_${randomUUID()}`
@@ -381,13 +370,23 @@ class WorkflowRuntime {
     setMaxListeners(this.#limits.maxAgentCalls + 10, this.#controller.signal)
     validateBudget(options.budgetTokens)
     this.#sandbox = normalizeSandbox(options.sandbox)
-    this.#scheduler = new Semaphore(this.#limits.concurrency)
+    this.#reliability = normalizeReliabilityPolicy(options.reliability)
+    this.#circuitBreaker = options.circuitBreaker ?? new ProviderCircuitBreaker(this.#reliability)
+    this.#scheduler = options.scheduler ?? new WorkConservingScheduler(this.#limits.concurrency)
+    this.#runScheduler = options.scheduler === undefined
+      ? this.#scheduler
+      : new WorkConservingScheduler(
+          this.#limits.concurrency,
+          (snapshot) => this.#observeScheduler(snapshot),
+        )
+    this.#preparationScheduler = new WorkConservingScheduler(this.#reliability.preparationConcurrency)
+    this.#cleanupScheduler = new WorkConservingScheduler(this.#reliability.cleanupConcurrency)
     const journal = options.journal ?? new InMemoryWorkflowJournal()
     this.#journal = journal
     this.#journalRun = journal.beginRun({
       workflowId: workflowIdentity(options.workflow),
       sourceHash: options.workflow.sourceHash,
-    })
+    }, { reuseMode: options.journalReuseMode ?? 'longest-prefix' })
 
     const externalSignal = options.signal
     if (externalSignal) {
@@ -523,6 +522,20 @@ class WorkflowRuntime {
     ])
     await this.#killWorkers()
 
+    // WHY shutdown waits for the supervisor's complete escalation budget after killing the
+    // evaluator: run.cancel() is also the service's ownership handoff barrier. Releasing the store
+    // lease while an ignored provider abort can still publish an agent event allows a replacement
+    // service to recover the same run concurrently. The bound includes hard termination and
+    // cleanup, so shutdown remains finite even for a hostile adapter or Git hook.
+    await Promise.race([
+      Promise.allSettled([...this.#tasks]),
+      delay(
+        (2 * this.#reliability.hardTerminationGraceMs) +
+        this.#reliability.cleanupTimeoutMs +
+        100,
+      ),
+    ])
+
     await this.#failOpenPhases(new WorkflowCancelledError(reason))
 
     try {
@@ -555,6 +568,19 @@ class WorkflowRuntime {
       delay(this.#limits.cancellationGraceMs),
     ])
     await this.#killWorkers()
+    // Failure can originate in the evaluator while provider attempts are still live. The first
+    // grace only gives cooperative abort a chance; it is not long enough for the attempt-addressed
+    // termination hook and worktree cleanup. Publishing run.failed before that escalation finishes
+    // would let callers start replacement work while an old process may still be mutating the same
+    // workspace. This mirrors cancellation's bounded ownership-handoff barrier.
+    await Promise.race([
+      Promise.allSettled([...this.#tasks]),
+      delay(
+        (2 * this.#reliability.hardTerminationGraceMs) +
+        this.#reliability.cleanupTimeoutMs +
+        100,
+      ),
+    ])
     const reference = errorReference(error)
 
     await this.#failOpenPhases(error)
@@ -573,9 +599,11 @@ class WorkflowRuntime {
   }
 
   #clearWallClockTimer(): void {
-    if (!this.#wallClockTimer) return
-    clearTimeout(this.#wallClockTimer)
+    if (this.#wallClockTimer) clearTimeout(this.#wallClockTimer)
     this.#wallClockTimer = undefined
+    if (this.#underutilizationTimer) clearTimeout(this.#underutilizationTimer)
+    this.#underutilizationTimer = undefined
+    this.#lastUnderutilizationSignature = undefined
   }
 
   #claimTerminal(owner: 'completion' | 'failure' | 'cancellation'): boolean {
@@ -610,7 +638,7 @@ class WorkflowRuntime {
       if (
         draft.type === 'agent.reused' ||
         draft.type === 'agent.completed' ||
-        draft.type === 'agent.failed' ||
+        (draft.type === 'agent.failed' && draft.payload.retrying !== true) ||
         draft.type === 'agent.skipped' ||
         draft.type === 'agent.cancelled'
       ) {
@@ -690,6 +718,9 @@ class WorkflowRuntime {
     let stderr = ''
     let settled = false
     let ready = false
+    const launchedAt = Date.now()
+    let lastHeartbeatAt = launchedAt
+    let idleSince: number | undefined
     let messageTail: Promise<void> = Promise.resolve()
     const outcome = deferred<unknown>()
 
@@ -710,7 +741,45 @@ class WorkflowRuntime {
       outcome.reject(error)
     }
 
+    const watchdogIntervalMs = Math.max(10, Math.min(
+      1_000,
+      Math.floor(Math.min(
+        this.#reliability.workerStartupTimeoutMs,
+        this.#reliability.workerHeartbeatTimeoutMs,
+        this.#reliability.workerIdleTimeoutMs,
+      ) / 4),
+    ))
+    const watchdog = setInterval(() => {
+      if (settled) return
+      const now = Date.now()
+      if (!ready && now - launchedAt >= this.#reliability.workerStartupTimeoutMs) {
+        settleReject(new WorkflowExecutionError(
+          'workflow-worker-startup-timeout',
+          'Workflow evaluator did not become ready before its startup deadline',
+        ))
+        return
+      }
+      if (ready && now - lastHeartbeatAt >= this.#reliability.workerHeartbeatTimeoutMs) {
+        settleReject(new WorkflowExecutionError(
+          'workflow-worker-heartbeat-timeout',
+          'Workflow evaluator stopped reporting health before its heartbeat deadline',
+        ))
+        return
+      }
+      if (idleSince !== undefined && now - idleSince >= this.#reliability.workerIdleTimeoutMs) {
+        settleReject(new WorkflowExecutionError(
+          'workflow-worker-idle',
+          'Workflow evaluator is unresolved but has no pending capability call or timer',
+        ))
+      }
+    }, watchdogIntervalMs)
+    watchdog.unref?.()
+
     const removeMessageListener = worker.onMessage((raw: WorkerToParentMessage) => {
+      // Message receipt is recorded before ordered async processing. A slow durable event sink must
+      // not make a responsive evaluator look dead merely because its earlier log is awaiting disk.
+      lastHeartbeatAt = Date.now()
+      if (raw.type !== 'heartbeat') idleSince = undefined
       messageTail = messageTail
         .then(async () => {
           if (raw.type === 'ready') {
@@ -730,6 +799,13 @@ class WorkflowRuntime {
                 : [],
               limits: workerLimits(this.#limits),
             })
+            return
+          }
+
+          if (raw.type === 'heartbeat') {
+            if (!ready) throw new WorkflowExecutionError('worker-protocol', 'Worker heartbeat arrived before ready')
+            if (raw.pendingRequests === 0 && raw.timers === 0) idleSince ??= Date.now()
+            else idleSince = undefined
             return
           }
 
@@ -839,6 +915,7 @@ class WorkflowRuntime {
     try {
       return await outcome.promise
     } finally {
+      clearInterval(watchdog)
       removeMessageListener()
       removeErrorListener()
       removeExitListener()
@@ -898,7 +975,6 @@ class WorkflowRuntime {
 
     this.#agentSequence += 1
     const agentId = `agent_${this.#agentSequence}`
-    const attemptId = `${agentId}_attempt_1`
     let phaseId = input.forcedPhaseId
     if (phaseId === undefined && input.request.options.phase !== undefined) {
       phaseId = await this.#ensurePhase(input.request.options.phase, 'runtime')
@@ -1024,7 +1100,6 @@ class WorkflowRuntime {
       worker: input.worker,
       agentId,
       ...(phaseId === undefined ? {} : { phaseId }),
-      attemptId,
       prompt: input.request.prompt,
       options: input.request.options,
       normalizedOptions,
@@ -1038,19 +1113,17 @@ class WorkflowRuntime {
   }
 
   async #executeAgent(admission: AgentAdmission): Promise<void> {
-    let release: (() => void) | undefined
     let prepared: PreparedWorkingDirectory | undefined
-    let providerSession: ProviderSessionReference | undefined
-    let attemptStarted = false
-    const activityIds = new Set<string>()
-    const resumeSession = admission.journalMiss.providerSession?.provider === this.#options.provider.name
+    let lastAttemptId: string | undefined
+    let providerSession = admission.journalMiss.providerSession?.provider === this.#options.provider.name
       ? admission.journalMiss.providerSession
       : undefined
+    const workspaceId = stableWorkspaceId(
+      workflowIdentity(this.#options.workflow),
+      admission.journalMiss.key,
+    )
 
     try {
-      release = await this.#scheduler.acquire(this.#controller.signal)
-      if (this.#controller.signal.aborted) throw new WorkflowCancelledError(abortReason(this.#controller.signal))
-
       let workingDirectory = resolve(this.#options.cwd)
       if (admission.options.isolation === 'worktree') {
         if (!this.#options.prepareWorkingDirectory) {
@@ -1059,14 +1132,48 @@ class WorkflowRuntime {
             'This workflow requests worktree isolation but no worktree preparer is configured',
           )
         }
-        prepared = await this.#options.prepareWorkingDirectory({
-          baseDirectory: workingDirectory,
-          isolation: 'worktree',
-          runId: this.id,
-          agentId: admission.agentId,
-        })
+        // WHY preparation has a separate bounded pool and happens before provider admission: git
+        // worktree creation can be slow on a large repository, but it consumes no scarce model
+        // turn. Holding one of nine provider permits while preparing disk state is the exact kind
+        // of hidden capacity leak that makes a nominal nine-way workflow run at two or three.
+        const preparationLease = await this.#preparationScheduler.acquire(this.#controller.signal)
+        const preparationController = linkedTimeoutController(
+          this.#controller.signal,
+          this.#reliability.preparationTimeoutMs,
+          'Working-directory preparation timed out',
+        )
+        const preparationAbort = abortRejection(preparationController.signal)
+        try {
+          prepared = await Promise.race([
+            this.#options.prepareWorkingDirectory({
+              baseDirectory: workingDirectory,
+              isolation: 'worktree',
+              runId: this.id,
+              agentId: admission.agentId,
+              workspaceId,
+              lineageId: this.#options.lineageId ?? this.id,
+              signal: preparationController.signal,
+            }),
+            preparationAbort.promise,
+          ])
+        } finally {
+          preparationAbort.dispose()
+          preparationController.dispose()
+          preparationLease.release()
+        }
         if (this.#controller.signal.aborted) throw new WorkflowCancelledError(abortReason(this.#controller.signal))
         workingDirectory = resolve(prepared.path)
+        await this.#emit({
+          type: 'agent.workspace.prepared',
+          agentId: admission.agentId,
+          ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+          payload: {
+            workspaceId,
+            path: workingDirectory,
+            reused: prepared.reused ?? false,
+            ...(prepared.leaseId === undefined ? {} : { leaseId: prepared.leaseId }),
+          },
+        })
       }
 
       let instructions: string | undefined
@@ -1081,115 +1188,179 @@ class WorkflowRuntime {
         }
       }
 
-      await this.#emit({
-        type: 'agent.started',
-        agentId: admission.agentId,
-        attemptId: admission.attemptId,
-        ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
-        payload: {
-          attemptNumber: 1,
-          source: resumeSession === undefined ? 'live' : 'provider-resume',
-          provider: this.#options.provider.name,
-          ...(resumeSession === undefined ? {} : { providerSession: resumeSession }),
-        },
-      })
-      attemptStarted = true
+      for (let attemptNumber = 1; attemptNumber <= this.#reliability.maxAttempts; attemptNumber += 1) {
+        const attemptId = `${admission.agentId}_attempt_${attemptNumber}`
+        let providerLease: SchedulerLease | undefined
+        let circuitLease: ProviderCircuitLease | undefined
+        try {
+          // Circuit wait owns no provider capacity. When the provider is globally unavailable,
+          // queued work remains visible without nine backoff loops pinning all nine permits.
+          circuitLease = await this.#circuitBreaker.enter(this.#controller.signal)
+          providerLease = await this.#acquireProviderLease(this.#controller.signal)
+          this.#observeScheduler(this.#runScheduler.snapshot())
+          if (this.#controller.signal.aborted) {
+            throw new WorkflowCancelledError(abortReason(this.#controller.signal))
+          }
 
-      const result = await this.#options.provider.execute(
-        {
-          prompt: admission.prompt,
-          ...(admission.normalizedOptions.schema === undefined
-            ? {}
-            : { schema: admission.normalizedOptions.schema }),
-          ...(admission.normalizedOptions.model === undefined
-            ? {}
-            : { model: admission.normalizedOptions.model }),
-          ...(admission.normalizedOptions.effort === undefined
-            ? {}
-            : { effort: admission.normalizedOptions.effort }),
-          workingDirectory,
-          sandbox: this.#sandbox,
-          ...(instructions === undefined ? {} : { instructions }),
-          ...(resumeSession === undefined ? {} : { session: resumeSession }),
-        },
-        {
-          signal: this.#controller.signal,
-          emit: async (event) => {
-            if (event.type === 'session.started') providerSession = event.session
-            await this.#emitProviderEvent(admission, event, activityIds)
-          },
-        },
-      )
-      if (this.#controller.signal.aborted || this.#terminal) {
-        throw new WorkflowCancelledError(abortReason(this.#controller.signal))
+          const resumeSession = providerSession
+          const startedAt = Date.now()
+          await this.#emit({
+            type: 'agent.started',
+            agentId: admission.agentId,
+            attemptId,
+            ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+            payload: {
+              attemptNumber,
+              source: resumeSession === undefined ? 'live' : 'provider-resume',
+              provider: this.#options.provider.name,
+              startupDeadlineAt: new Date(startedAt + this.#reliability.startupTimeoutMs).toISOString(),
+              absoluteDeadlineAt: new Date(startedAt + this.#reliability.attemptTimeoutMs).toISOString(),
+              ...(admission.options.isolation === 'worktree' ? { workspaceId } : {}),
+              ...(resumeSession === undefined ? {} : { providerSession: resumeSession }),
+            },
+          })
+          lastAttemptId = attemptId
+
+          const result = await this.#executeProviderAttempt({
+            admission,
+            attemptId,
+            attemptNumber,
+            workingDirectory,
+            ...(instructions === undefined ? {} : { instructions }),
+            ...(resumeSession === undefined ? {} : { resumeSession }),
+            onSession: (session) => { providerSession = session },
+          })
+          circuitLease.success()
+          if (this.#controller.signal.aborted || this.#terminal) {
+            throw new WorkflowCancelledError(abortReason(this.#controller.signal))
+          }
+
+          const value = this.#providerValue(result, admission.validateOutput)
+          // Claude's budget pool counts generated output only. Input/context tokens may dwarf the
+          // actual requested work on resumed threads; charging totalTokens caused identical
+          // workflows to stop at different points depending on provider cache state.
+          if (result.usage?.outputTokens !== undefined) this.#budgetSpent += result.usage.outputTokens
+          admission.journalRun.recordResult(admission.journalMiss, value, { successful: true })
+          const completedSession = result.providerSession ?? providerSession
+
+          await this.#emit({
+            type: 'agent.completed',
+            agentId: admission.agentId,
+            attemptId,
+            ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+            payload: {
+              source: resumeSession === undefined ? 'live' : 'provider-resume',
+              result: contentReference(value, this.#limits),
+              structured: result.output.type === 'structured',
+              ...(result.usage === undefined ? {} : { usage: result.usage }),
+              ...(completedSession === undefined ? {} : { providerSession: completedSession }),
+              ...(result.diagnostics === undefined
+                ? {}
+                : {
+                    diagnostics: cloneBoundaryValue(
+                      result.diagnostics,
+                      this.#limits,
+                    ) as Readonly<Record<string, unknown>>,
+                  }),
+            },
+          })
+          this.#completeWorkerRequest(admission.worker, admission.requestId, {
+            type: 'agent.result',
+            requestId: admission.requestId,
+            result: { type: 'success', value },
+            budgetSpent: this.#budgetSpent,
+          })
+          return
+        } catch (error) {
+          if (error instanceof UnconfirmedProviderTerminationError) {
+            circuitLease?.infrastructureFailure()
+            // WHY this intentionally leaks (quarantines) the scheduler lease until process exit:
+            // the provider may still be consuming credentials or mutating state. Advertising that
+            // slot as available would exceed the real process ceiling and permit overlapping
+            // attempts for one logical call. The run fails, health shows the occupied capacity,
+            // and a service restart is the final fence for an adapter with no lifecycle control.
+            providerLease = undefined
+            throw error
+          }
+          if (error instanceof AgentProviderFailure && error.providerSession !== undefined) {
+            providerSession = error.providerSession
+            admission.journalRun.recordProviderSession(admission.journalMiss, error.providerSession)
+          }
+          if (
+            this.#controller.signal.aborted ||
+            error instanceof WorkflowCancelledError ||
+            (error instanceof AgentProviderAbortError && !(error.reason instanceof AgentAttemptTimeoutError))
+          ) {
+            circuitLease?.neutral()
+            throw error
+          }
+
+          if (error instanceof AgentProviderFailure) {
+            if (error.retryable) circuitLease?.infrastructureFailure()
+            else circuitLease?.neutral()
+            const retrying = this.#shouldRetry(admission, error, attemptNumber)
+            await this.#emit({
+              type: 'agent.failed',
+              agentId: admission.agentId,
+              attemptId,
+              ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+              payload: { error: errorReference(error), ...(retrying ? { retrying: true } : {}) },
+            })
+            if (!retrying) {
+              admission.journalRun.recordResult(admission.journalMiss, null, { successful: false })
+              await this.#emit({
+                type: 'warning',
+                agentId: admission.agentId,
+                attemptId,
+                ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+                payload: {
+                  message: error.message,
+                  ...(error.code === undefined ? {} : { code: error.code }),
+                },
+              })
+              this.#completeWorkerRequest(admission.worker, admission.requestId, {
+                type: 'agent.result',
+                requestId: admission.requestId,
+                result: { type: 'success', value: null },
+                budgetSpent: this.#budgetSpent,
+              })
+              return
+            }
+
+            const delayMs = retryDelayMs(this.#reliability, attemptNumber)
+            this.#retryAttemptsScheduled += 1
+            const retryAt = new Date(Date.now() + delayMs).toISOString()
+            await this.#emit({
+              type: 'agent.retry_scheduled',
+              agentId: admission.agentId,
+              attemptId,
+              ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+              payload: {
+                completedAttemptNumber: attemptNumber,
+                nextAttemptNumber: attemptNumber + 1,
+                delayMs,
+                retryAt,
+                reason: errorReference(error),
+              },
+            })
+            // Provider capacity is released in finally before backoff. Sleeping while holding a
+            // permit made one transient 30-second retry pause reduce a nine-agent pool to eight.
+            providerLease?.release()
+            providerLease = undefined
+            this.#observeScheduler(this.#runScheduler.snapshot())
+            await abortableDelay(delayMs, this.#controller.signal)
+            continue
+          }
+          circuitLease?.neutral()
+          throw error
+        } finally {
+          circuitLease?.neutral()
+          providerLease?.release()
+          this.#observeScheduler(this.#runScheduler.snapshot())
+        }
       }
-
-      const value = this.#providerValue(result, admission.validateOutput)
-      // Claude's budget pool counts generated output only. Input/context tokens may dwarf the
-      // actual requested work on resumed threads; charging totalTokens caused identical workflows
-      // to stop at wildly different points depending on provider cache state.
-      if (result.usage?.outputTokens !== undefined) this.#budgetSpent += result.usage.outputTokens
-      admission.journalRun.recordResult(admission.journalMiss, value)
-      const completedSession = result.providerSession ?? providerSession
-
-      await this.#emit({
-        type: 'agent.completed',
-        agentId: admission.agentId,
-        attemptId: admission.attemptId,
-        ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
-        payload: {
-          source: resumeSession === undefined ? 'live' : 'provider-resume',
-          result: contentReference(value, this.#limits),
-          structured: result.output.type === 'structured',
-          ...(result.usage === undefined ? {} : { usage: result.usage }),
-          ...(completedSession === undefined ? {} : { providerSession: completedSession }),
-          ...(result.diagnostics === undefined
-            ? {}
-            : {
-                diagnostics: cloneBoundaryValue(
-                  result.diagnostics,
-                  this.#limits,
-                ) as Readonly<Record<string, unknown>>,
-              }),
-        },
-      })
-      this.#completeWorkerRequest(admission.worker, admission.requestId, {
-        type: 'agent.result',
-        requestId: admission.requestId,
-        result: { type: 'success', value },
-        budgetSpent: this.#budgetSpent,
-      })
     } catch (error) {
-      // A queued call has a logical agent identity but no provider attempt yet. Attaching the
-      // planned attempt ID before agent.started makes the pure projector reference an attempt
-      // that never existed, which is especially easy to trigger by cancelling a saturated run.
-      const attemptIdentity = attemptStarted ? { attemptId: admission.attemptId } : {}
-      if (error instanceof AgentProviderFailure) {
-        admission.journalRun.recordResult(admission.journalMiss, null)
-        await this.#emit({
-          type: 'agent.failed',
-          agentId: admission.agentId,
-          ...attemptIdentity,
-          ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
-          payload: { error: errorReference(error) },
-        })
-        await this.#emit({
-          type: 'warning',
-          agentId: admission.agentId,
-          ...attemptIdentity,
-          ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
-          payload: {
-            message: error.message,
-            ...(error.code === undefined ? {} : { code: error.code }),
-          },
-        })
-        this.#completeWorkerRequest(admission.worker, admission.requestId, {
-          type: 'agent.result',
-          requestId: admission.requestId,
-          result: { type: 'success', value: null },
-          budgetSpent: this.#budgetSpent,
-        })
-      } else if (
+      if (
         this.#controller.signal.aborted ||
         error instanceof WorkflowCancelledError ||
         error instanceof AgentProviderAbortError
@@ -1197,7 +1368,7 @@ class WorkflowRuntime {
         await this.#emit({
           type: 'agent.cancelled',
           agentId: admission.agentId,
-          ...attemptIdentity,
+          ...(lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
           ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
           payload: { reason: abortReason(this.#controller.signal) },
         })
@@ -1206,7 +1377,7 @@ class WorkflowRuntime {
         await this.#emit({
           type: 'agent.failed',
           agentId: admission.agentId,
-          ...attemptIdentity,
+          ...(lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
           ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
           payload: { error: errorReference(error) },
         })
@@ -1214,12 +1385,33 @@ class WorkflowRuntime {
       }
     } finally {
       try {
-        const cleanup = await prepared?.cleanup?.()
+        let cleanup: void | { preservedPath: string } | undefined
+        if (prepared?.cleanup) {
+          // Cleanup is separately bounded and deliberately does not consume provider capacity.
+          // A cancelled run still needs this best-effort path, so it uses an independent signal.
+          const cleanupLease = await this.#cleanupScheduler.acquire(new AbortController().signal)
+          const cleanupController = linkedTimeoutController(
+            undefined,
+            this.#reliability.cleanupTimeoutMs,
+            'Working-directory cleanup timed out',
+          )
+          const cleanupAbort = abortRejection(cleanupController.signal)
+          try {
+            cleanup = await Promise.race([
+              prepared.cleanup({ signal: cleanupController.signal }),
+              cleanupAbort.promise,
+            ])
+          } finally {
+            cleanupAbort.dispose()
+            cleanupController.dispose()
+            cleanupLease.release()
+          }
+        }
         if (cleanup?.preservedPath) {
           await this.#emit({
             type: 'warning',
             agentId: admission.agentId,
-            ...(attemptStarted ? { attemptId: admission.attemptId } : {}),
+            ...(lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
             ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
             payload: {
               code: 'working-directory-preserved',
@@ -1236,7 +1428,7 @@ class WorkflowRuntime {
           await this.#emit({
             type: 'warning',
             agentId: admission.agentId,
-            ...(attemptStarted ? { attemptId: admission.attemptId } : {}),
+            ...(lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
             ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
             payload: {
               code: 'working-directory-cleanup-failed',
@@ -1246,9 +1438,172 @@ class WorkflowRuntime {
         } catch {
           // A failed event sink must not turn cleanup into an unhandled background rejection.
         }
-      } finally {
-        release?.()
       }
+    }
+  }
+
+  async #executeProviderAttempt(input: {
+    admission: AgentAdmission
+    attemptId: string
+    attemptNumber: number
+    workingDirectory: string
+    instructions?: string
+    resumeSession?: ProviderSessionReference
+    onSession(session: ProviderSessionReference): void
+  }): Promise<AgentProviderResult> {
+    const attemptController = new AbortController()
+    const onRunAbort = (): void => attemptController.abort(this.#controller.signal.reason)
+    this.#controller.signal.addEventListener('abort', onRunAbort, { once: true })
+    const monitor = new AttemptLivenessMonitor(attemptController, this.#reliability)
+    const activityIds = new Set<string>()
+    const identity: AgentProviderAttemptIdentity = {
+      runId: this.id,
+      agentId: input.admission.agentId,
+      attemptId: input.attemptId,
+      attemptNumber: input.attemptNumber,
+    }
+
+    const execution = this.#options.provider.execute(
+      {
+        prompt: input.admission.prompt,
+        ...(input.admission.normalizedOptions.schema === undefined
+          ? {}
+          : { schema: input.admission.normalizedOptions.schema }),
+        ...(input.admission.normalizedOptions.model === undefined
+          ? {}
+          : { model: input.admission.normalizedOptions.model }),
+        ...(input.admission.normalizedOptions.effort === undefined
+          ? {}
+          : { effort: input.admission.normalizedOptions.effort }),
+        workingDirectory: input.workingDirectory,
+        sandbox: this.#sandbox,
+        ...(input.instructions === undefined ? {} : { instructions: input.instructions }),
+        ...(input.resumeSession === undefined ? {} : { session: input.resumeSession }),
+      },
+      {
+        signal: attemptController.signal,
+        attempt: identity,
+        emit: async (event) => {
+          monitor.progress(event)
+          if (event.type === 'session.started') input.onSession(event.session)
+          await this.#emitProviderEvent(input.admission, input.attemptId, event, activityIds)
+        },
+      },
+    )
+    // A timeout wins Promise.race even if a broken adapter ignores AbortSignal forever. The
+    // rejection handler prevents that detached adapter promise from becoming an unhandled process
+    // rejection if it eventually settles after the logical attempt has moved on.
+    void execution.catch(() => undefined)
+    const cancellation = abortRejection(this.#controller.signal)
+
+    try {
+      return await Promise.race([execution, monitor.timeout, cancellation.promise])
+    } catch (error) {
+      if (this.#controller.signal.aborted) {
+        const stopped = await this.#confirmProviderTermination(execution, identity, {
+          code: 'cancellation',
+          message: abortReason(this.#controller.signal),
+        })
+        if (!stopped) {
+          await this.#emitUnconfirmedTermination(input.admission, input.attemptId)
+          throw new UnconfirmedProviderTerminationError(
+            'Cancelled provider attempt could not be confirmed stopped',
+            { cause: error },
+          )
+        }
+        throw new WorkflowCancelledError(abortReason(this.#controller.signal))
+      }
+      if (!(error instanceof AgentAttemptTimeoutError)) throw error
+      await this.#emit({
+        type: 'agent.stalled',
+        agentId: input.admission.agentId,
+        attemptId: input.attemptId,
+        ...(input.admission.phaseId === undefined ? {} : { phaseId: input.admission.phaseId }),
+        payload: {
+          kind: error.kind,
+          lastProgressAt: error.lastProgressAt,
+          deadlineAt: error.deadlineAt,
+        },
+      })
+      const stopped = await this.#confirmProviderTermination(execution, identity, {
+        code: 'timeout',
+        message: error.message,
+      })
+      if (!stopped) {
+        await this.#emitUnconfirmedTermination(input.admission, input.attemptId)
+        throw new UnconfirmedProviderTerminationError(
+          'Timed-out provider attempt could not be confirmed stopped',
+          { cause: error },
+        )
+      }
+      throw error
+    } finally {
+      monitor.stop()
+      cancellation.dispose()
+      this.#controller.signal.removeEventListener('abort', onRunAbort)
+    }
+  }
+
+  async #confirmProviderTermination(
+    execution: Promise<unknown>,
+    identity: AgentProviderAttemptIdentity,
+    reason: { code: 'timeout' | 'cancellation' | 'shutdown'; message: string },
+  ): Promise<boolean> {
+    if (await settlesWithin(execution, this.#limits.cancellationGraceMs)) return true
+    if (this.#options.provider.terminateAttempt) {
+      // A buggy termination hook must itself be bounded. Its return is not proof of exit; only the
+      // attempt result settling confirms that the adapter has reaped its execution boundary.
+      const termination = Promise.resolve().then(() => this.#options.provider.terminateAttempt!(identity, reason))
+      void termination.catch(() => undefined)
+      await settlesWithin(termination, this.#reliability.hardTerminationGraceMs)
+    }
+    return settlesWithin(execution, this.#reliability.hardTerminationGraceMs)
+  }
+
+  async #emitUnconfirmedTermination(admission: AgentAdmission, attemptId: string): Promise<void> {
+    await this.#emit({
+      type: 'warning',
+      agentId: admission.agentId,
+      attemptId,
+      ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+      payload: {
+        code: 'provider-termination-unconfirmed',
+        message: 'Provider ignored cancellation and no confirmed hard termination was observed; capacity is quarantined and automatic retry is suppressed',
+      },
+    })
+  }
+
+  #shouldRetry(admission: AgentAdmission, error: AgentProviderFailure, attemptNumber: number): boolean {
+    if (!error.retryable || attemptNumber >= this.#reliability.maxAttempts) return false
+    if (this.#retryAttemptsScheduled >= this.#reliability.maxRetryAttemptsPerRun) return false
+    if (this.#reliability.automaticRetry === 'never') return false
+    // WHY workspace-write without isolation is excluded even when an adapter says "retryable": a
+    // network failure can happen after a tool changed the user's checkout. Read-only calls cannot
+    // mutate it, and a stable isolated worktree makes repeated local writes inspectable/reconcilable.
+    return this.#sandbox.mode === 'read-only' || admission.options.isolation === 'worktree'
+  }
+
+  async #acquireProviderLease(signal: AbortSignal): Promise<SchedulerLease> {
+    const runLease = await this.#runScheduler.acquire(signal)
+    if (this.#runScheduler === this.#scheduler) return runLease
+    try {
+      // WHY both leases are required: the service scheduler prevents two runs from exceeding the
+      // machine-wide provider budget, while this run-local lease preserves a workflow's explicit
+      // lower concurrency limit. Using only the shared scheduler silently turned `concurrency: 2`
+      // into nine as soon as WorkflowService began sharing admission across runs.
+      const serviceLease = await this.#scheduler.acquire(signal)
+      let released = false
+      return {
+        release: () => {
+          if (released) return
+          released = true
+          serviceLease.release()
+          runLease.release()
+        },
+      }
+    } catch (error) {
+      runLease.release()
+      throw error
     }
   }
 
@@ -1268,12 +1623,13 @@ class WorkflowRuntime {
 
   async #emitProviderEvent(
     admission: AgentAdmission,
+    attemptId: string,
     event: AgentProviderEvent,
     activityIds: Set<string>,
   ): Promise<void> {
     const identity = {
       agentId: admission.agentId,
-      attemptId: admission.attemptId,
+      attemptId,
       ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
     }
 
@@ -1394,7 +1750,7 @@ class WorkflowRuntime {
     const childJournalRun = this.#journal.beginRun({
       workflowId: `${workflowIdentity(this.#options.workflow)}::${workflowIdentity(workflow)}#${count}`,
       sourceHash: workflow.sourceHash,
-    })
+    }, { reuseMode: this.#options.journalReuseMode ?? 'longest-prefix' })
     const result = await this.#executeWorker({
       workflow,
       ...(request.args === undefined ? {} : { args: request.args }),
@@ -1508,6 +1864,55 @@ class WorkflowRuntime {
       .finally(() => this.#tasks.delete(tracked))
     this.#tasks.add(tracked)
   }
+
+  #observeScheduler(snapshot: SchedulerSnapshot): void {
+    const underfilled =
+      !this.#terminal &&
+      snapshot.active > 0 &&
+      snapshot.active < snapshot.capacity &&
+      snapshot.queued === 0 &&
+      this.#agentSequence >= snapshot.capacity
+    if (!underfilled) {
+      if (this.#underutilizationTimer) clearTimeout(this.#underutilizationTimer)
+      this.#underutilizationTimer = undefined
+      this.#lastUnderutilizationSignature = undefined
+      return
+    }
+
+    const signature = `${snapshot.active}/${snapshot.capacity}/${this.#agentSequence}`
+    if (this.#underutilizationTimer && this.#lastUnderutilizationSignature === signature) return
+    if (this.#underutilizationTimer) clearTimeout(this.#underutilizationTimer)
+    this.#lastUnderutilizationSignature = signature
+    this.#underutilizationTimer = setTimeout(() => {
+      this.#underutilizationTimer = undefined
+      const current = this.#runScheduler.snapshot()
+      if (
+        this.#terminal ||
+        current.active === 0 ||
+        current.active >= current.capacity ||
+        current.queued > 0
+      ) return
+      // WHY this warning does not claim there is a scheduler bug: at this point the scheduler has
+      // spare permits and no queued requests. The usual cause is workflow-authored chunking such as
+      // awaiting Promise.all(batchOfNine) before creating the next batch. Runtime JavaScript cannot
+      // safely execute code past that await, but it can make the hidden barrier explicit instead of
+      // leaving operators wondering why only two of nine slots are occupied.
+      void this.#emit({
+        type: 'warning',
+        payload: {
+          code: 'workflow-capacity-unfilled-no-runnable-work',
+          message: `Provider capacity is ${current.active}/${current.capacity} with no admitted work waiting; a workflow batch barrier may be hiding later tasks`,
+          details: {
+            active: current.active,
+            capacity: current.capacity,
+            queued: current.queued,
+            admittedAgents: this.#agentSequence,
+          },
+        },
+      }).catch(() => undefined)
+    }, this.#reliability.underutilizationWarningMs)
+    this.#underutilizationTimer.unref?.()
+  }
 }
 
 export function runWorkflow(options: RunWorkflowOptions): WorkflowRun {
@@ -1542,6 +1947,13 @@ function normalizeLimits(overrides: Partial<WorkflowLimits> | undefined): Workfl
 
 function workflowIdentity(workflow: LoadedWorkflow): string {
   return workflow.filePath ?? workflow.meta.name
+}
+
+function stableWorkspaceId(workflowId: string, journalKey: string): string {
+  // The chained journal key is stable across retry and longest-prefix resume. Hashing the workflow
+  // namespace alongside it avoids leaking absolute paths into directory names while preventing two
+  // unrelated workflows with the same first prompt from claiming one durable worktree lease.
+  return `workspace_${createHash('sha256').update(`${workflowId}\0${journalKey}`).digest('hex').slice(0, 24)}`
 }
 
 function validateBudget(value: number | null | undefined): void {
@@ -1762,4 +2174,66 @@ function abortReason(signal: AbortSignal): string {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds))
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new WorkflowCancelledError(abortReason(signal)))
+  return new Promise((resolveDelay, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolveDelay()
+    }, milliseconds)
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(new WorkflowCancelledError(abortReason(signal)))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function settlesWithin(promise: Promise<unknown>, milliseconds: number): Promise<boolean> {
+  const settled = promise.then(() => true, () => true)
+  return Promise.race([settled, delay(milliseconds).then(() => false)])
+}
+
+function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose(): void } {
+  let rejectAbort!: (error: unknown) => void
+  const promise = new Promise<never>((_resolve, reject) => { rejectAbort = reject })
+  const onAbort = (): void => rejectAbort(
+    signal.reason instanceof Error
+      ? signal.reason
+      : new WorkflowCancelledError(abortReason(signal)),
+  )
+  if (signal.aborted) onAbort()
+  else signal.addEventListener('abort', onAbort, { once: true })
+  // Promise.race observes this rejection during normal execution. The explicit handler also makes
+  // disposal safe when the provider wins and a much later run cancellation fires after the race's
+  // caller has already returned.
+  void promise.catch(() => undefined)
+  return {
+    promise,
+    dispose: () => signal.removeEventListener('abort', onAbort),
+  }
+}
+
+function linkedTimeoutController(
+  parent: AbortSignal | undefined,
+  milliseconds: number,
+  message: string,
+): { signal: AbortSignal; dispose(): void } {
+  const controller = new AbortController()
+  const onParentAbort = (): void => controller.abort(parent?.reason)
+  if (parent?.aborted) onParentAbort()
+  else parent?.addEventListener('abort', onParentAbort, { once: true })
+  const timer = setTimeout(() => {
+    controller.abort(new WorkflowExecutionError('operation-timeout', message))
+  }, milliseconds)
+  timer.unref?.()
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer)
+      parent?.removeEventListener('abort', onParentAbort)
+    },
+  }
 }

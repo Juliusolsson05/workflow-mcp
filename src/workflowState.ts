@@ -30,7 +30,7 @@ export type WorkflowAgentStatus =
   | 'skipped'
   | 'cancelled'
 
-export type WorkflowAttemptStatus = 'running' | 'completed' | 'failed' | 'cancelled'
+export type WorkflowAttemptStatus = 'running' | 'stalled' | 'completed' | 'failed' | 'cancelled'
 export type WorkflowActivityStatus = 'running' | 'completed' | 'failed'
 
 export type WorkflowActivitySnapshot = WorkflowActivityDetails & {
@@ -49,10 +49,18 @@ export type WorkflowAttemptSnapshot = {
   provider: string
   status: WorkflowAttemptStatus
   startedAt: string
+  lastProgressAt: string
+  startupDeadlineAt?: string
+  absoluteDeadlineAt?: string
   completedAt?: string
   providerSession?: ProviderSessionReference
   usage?: AgentUsage
   error?: WorkflowErrorReference
+  stall?: {
+    kind: 'startup' | 'idle' | 'active-operation' | 'absolute'
+    lastProgressAt: string
+    deadlineAt: string
+  }
   activities: WorkflowActivitySnapshot[]
 }
 
@@ -73,6 +81,18 @@ export type WorkflowAgentSnapshot = {
   error?: WorkflowErrorReference
   skippedReason?: string
   cancelledReason?: string
+  workspace?: {
+    workspaceId: string
+    path: string
+    reused: boolean
+    leaseId?: string
+  }
+  retry?: {
+    completedAttemptNumber: number
+    nextAttemptNumber: number
+    retryAt: string
+    reason: WorkflowErrorReference
+  }
   attempts: WorkflowAttemptSnapshot[]
 }
 
@@ -568,13 +588,21 @@ export function reduceWorkflowState(
           provider: event.payload.provider,
           status: 'running',
           startedAt: event.timestamp,
+          lastProgressAt: event.timestamp,
           activities: [],
+          ...(event.payload.startupDeadlineAt === undefined
+            ? {}
+            : { startupDeadlineAt: event.payload.startupDeadlineAt }),
+          ...(event.payload.absoluteDeadlineAt === undefined
+            ? {}
+            : { absoluteDeadlineAt: event.payload.absoluteDeadlineAt }),
           ...(event.payload.providerSession === undefined
             ? {}
             : { providerSession: event.payload.providerSession }),
         }
+        const { retry: _scheduledRetry, ...agentWithoutRetry } = agent
         return {
-          ...agent,
+          ...agentWithoutRetry,
           status: 'running',
           startedAt: agent.startedAt ?? event.timestamp,
           attempts: [...agent.attempts, attempt].sort((left, right) => left.number - right.number),
@@ -585,7 +613,20 @@ export function reduceWorkflowState(
     case 'agent.session.started':
       next = updateAttempt(next, event.agentId, event.attemptId, event.type, (attempt) => ({
         ...attempt,
+        lastProgressAt: event.timestamp,
         providerSession: event.payload.session,
+      }))
+      break
+
+    case 'agent.workspace.prepared':
+      next = updateAgent(next, event.agentId, event.type, (agent) => ({
+        ...agent,
+        workspace: {
+          workspaceId: event.payload.workspaceId,
+          path: event.payload.path,
+          reused: event.payload.reused,
+          ...(event.payload.leaseId === undefined ? {} : { leaseId: event.payload.leaseId }),
+        },
       }))
       break
 
@@ -602,6 +643,7 @@ export function reduceWorkflowState(
         }
         return {
           ...attempt,
+          lastProgressAt: event.timestamp,
           activities: [
             ...attempt.activities,
             {
@@ -645,7 +687,7 @@ export function reduceWorkflowState(
               }
             : {}),
         }
-        return { ...attempt, activities }
+        return { ...attempt, lastProgressAt: event.timestamp, activities }
       })
       break
 
@@ -658,6 +700,15 @@ export function reduceWorkflowState(
         event.timestamp,
         event.type,
       )
+      break
+
+    case 'agent.stalled':
+      next = updateAttempt(next, event.agentId, event.attemptId, event.type, (attempt) => ({
+        ...attempt,
+        status: 'stalled',
+        lastProgressAt: event.payload.lastProgressAt,
+        stall: { ...event.payload },
+      }))
       break
 
     case 'agent.failed':
@@ -699,6 +750,19 @@ export function reduceWorkflowState(
         status: 'skipped',
         completedAt: event.timestamp,
         ...(event.payload.reason === undefined ? {} : { skippedReason: event.payload.reason }),
+      }))
+      break
+
+    case 'agent.retry_scheduled':
+      next = updateAgent(next, event.agentId, event.type, (agent) => ({
+        ...agent,
+        status: 'queued',
+        retry: {
+          completedAttemptNumber: event.payload.completedAttemptNumber,
+          nextAttemptNumber: event.payload.nextAttemptNumber,
+          retryAt: event.payload.retryAt,
+          reason: event.payload.reason,
+        },
       }))
       break
 

@@ -14,7 +14,9 @@ To run an existing workflow, call workflow_list, optionally workflow_describe, t
 
 Inline source is saved under the current Git project's .claude/workflows and the run result returns scriptPath. That path is the editable Claude-visible definition. Iterate by editing it and calling workflow_run with scriptPath; existing definitions are never overwritten implicitly. Each execution also keeps a private immutable source snapshot for recovery and returns transcriptDirectory, containing journal.jsonl plus agent-<id>.jsonl mirrors for investigation.
 
-workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId creates a new run linked to a failed, cancelled, or interrupted run; workflow_resume remains a compatibility alias. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status. Continue until completed, failed, cancelled, or interrupted. Do not invent run IDs or source paths.`
+workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId creates a new run linked to a failed, cancelled, or interrupted run; workflow_resume remains a compatibility alias. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status and health. Continue until completed, failed, cancelled, or interrupted. A retryable read-only or worktree-isolated agent failure is retried beneath the same logical agent and provider session; agent.retry_scheduled and agent.stalled events explain that recovery. A safe run interrupted by a host crash is automatically continued as a new run in the same lineage.
+
+The service has a shared provider capacity of nine by default. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed batches of nine: when only two slow agents remain in such a batch, JavaScript has not admitted the next batch and the scheduler cannot fill the other seven slots. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`
 
 export type WorkflowMcpRegistrationHooks = {
   /** Called after a durable run exists, before its MCP result is returned. */
@@ -107,11 +109,15 @@ export function registerWorkflowMcpTools(
     'workflow_run_status',
     {
       title: 'Workflow run status',
-      description: 'Read durable status, timestamps, workflow source identity, and latest event cursor. Terminal statuses are completed, failed, cancelled, and interrupted.',
+      description: 'Read durable status plus scheduler/agent health, retry/stall counts, timestamps, recovery lineage, and latest event cursor. Terminal statuses are completed, failed, cancelled, and interrupted.',
       inputSchema: { runId: z.string().min(1) },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async ({ runId }) => result({ ok: true, run: await service.status(scope, runId) }),
+    async ({ runId }) => result({
+      ok: true,
+      run: await service.status(scope, runId),
+      health: await service.health(scope, runId),
+    }),
   )
 
   server.registerTool(

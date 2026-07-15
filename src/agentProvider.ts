@@ -93,16 +93,45 @@ export type AgentProviderEvent =
 export type AgentProviderExecutionContext = {
   signal: AbortSignal
   /**
+   * Durable runtime identity for one physical attempt. Providers which launch child processes use
+   * this key to terminate only the wedged attempt instead of killing healthy siblings sharing the
+   * same adapter instance.
+   */
+  attempt?: AgentProviderAttemptIdentity
+  /**
    * Emission is awaited so the parent remains the single ordering authority. Fire-and-forget
    * callbacks can reorder an activity completion ahead of its update under concurrent load.
    */
   emit(event: AgentProviderEvent): Promise<void>
 }
 
+export type AgentProviderAttemptIdentity = {
+  runId: string
+  agentId: string
+  attemptId: string
+  attemptNumber: number
+}
+
+export type AgentProviderTerminationReason = {
+  code: 'timeout' | 'cancellation' | 'shutdown'
+  message: string
+}
+
 export type AgentProvider = {
   /** Available before execution so queued/started events never need a guessed provider name. */
   readonly name: string
   execute(request: AgentRequest, context: AgentProviderExecutionContext): Promise<AgentProviderResult>
+  /**
+   * Optional escalation after cooperative AbortSignal cancellation did not settle promptly.
+   *
+   * WHY this is attempt-addressed and optional: SDK-only adapters may not expose a child PID, while
+   * process-owning adapters can and must kill the complete descendant tree. Making a global
+   * `terminate()` method would let one stalled turn destroy unrelated concurrent agents.
+   */
+  terminateAttempt?(
+    attempt: AgentProviderAttemptIdentity,
+    reason: AgentProviderTerminationReason,
+  ): Promise<void>
 }
 
 export type AgentProviderFailureOptions = {
