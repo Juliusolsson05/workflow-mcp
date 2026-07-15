@@ -10,7 +10,12 @@ import type { FoundWorkflow } from './findWorkflows.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 import { runWorkflow } from './runWorkflow.js'
-import type { WorkflowLimits, WorkflowRun } from './runWorkflow.js'
+import type { RunWorkflowOptions, WorkflowLimits, WorkflowRun } from './runWorkflow.js'
+import {
+  loadScopedWorkflowPath,
+  persistInlineWorkflow,
+  WorkflowAuthoringError,
+} from './workflowAuthoring.js'
 import type { WorkflowEvent } from './workflowEvents.js'
 import type { WorkflowWorkerLauncher } from './workerLauncher.js'
 import type {
@@ -38,7 +43,7 @@ export type WorkflowServiceScope = {
 
 export type WorkflowServiceOptions = {
   store: WorkflowStore
-  provider: AgentProvider | (() => AgentProvider)
+  provider: AgentProvider | ((context: WorkflowProviderFactoryContext) => AgentProvider)
   workerLauncher?: WorkflowWorkerLauncher
   workerFilePath?: string
   limits?: Partial<WorkflowLimits>
@@ -47,6 +52,15 @@ export type WorkflowServiceOptions = {
   modelAliases?: Readonly<Record<string, string | null>>
   defaultEffort?: string
   sandbox?: Partial<AgentSandboxPolicy>
+  resolveAgentType?(name: string, cwd: string): Promise<string | undefined>
+  prepareWorkingDirectory?: RunWorkflowOptions['prepareWorkingDirectory']
+}
+
+export type WorkflowProviderFactoryContext = {
+  runId: string
+  cwd: string
+  /** MCP client/session which requested this run, when the transport has one. */
+  clientId?: string
 }
 
 export type WorkflowRunStartResult = {
@@ -59,6 +73,10 @@ export type WorkflowRunStartResult = {
     description: string
   }
   cursor: number
+  /** Editable Claude-visible definition. The private run store separately snapshots these bytes. */
+  scriptPath?: string
+  /** Directory containing Claude-shaped agent-<id>.jsonl transcript mirrors for this run. */
+  transcriptDirectory: string
   resumedFromRunId?: string
 }
 
@@ -80,9 +98,16 @@ export class WorkflowServiceError extends Error {
   }
 }
 
-type StartInput = {
-  name: string
+export type WorkflowStartInput = {
+  /** Lowest-precedence source selector, matching Claude's Workflow tool. */
+  name?: string
+  /** Inline Claude-compatible workflow source; persisted before execution. */
+  script?: string
+  /** Highest-precedence source selector, scoped to visible .claude/workflows directories. */
+  scriptPath?: string
   args?: unknown
+  /** Claude-shaped resume alias; creates a new durable run and preserves the lineage. */
+  resumeFromRunId?: string
   idempotencyKey?: string
 }
 
@@ -170,7 +195,7 @@ export class WorkflowService {
     return { valid: true, workflow: await this.describe(scope, input) }
   }
 
-  async start(scope: WorkflowServiceScope, input: StartInput): Promise<WorkflowRunStartResult> {
+  async start(scope: WorkflowServiceScope, input: WorkflowStartInput): Promise<WorkflowRunStartResult> {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
     const existing = input.idempotencyKey === undefined
@@ -178,9 +203,17 @@ export class WorkflowService {
       : await this.#options.store.findByIdempotencyKey(resolve(scope.cwd), input.idempotencyKey)
     if (existing) {
       this.#assertScope(scope, existing)
-      return startResult(existing)
+      return startResult(existing, this.#options.store)
     }
-    const workflow = await this.#resolveVisibleWorkflow(scope, input.name)
+
+    if (input.resumeFromRunId !== undefined) {
+      return this.#resumeStored(scope, {
+        runId: input.resumeFromRunId,
+        ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+      }, input)
+    }
+
+    const workflow = await this.#resolveStartWorkflow(scope, input)
     return this.#startLoaded(scope, workflow, {
       ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
@@ -240,6 +273,14 @@ export class WorkflowService {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
     if ('claudeRunPath' in input) return this.#resumeClaude(scope, input)
+    return this.#resumeStored(scope, input)
+  }
+
+  async #resumeStored(
+    scope: WorkflowServiceScope,
+    input: Extract<WorkflowResumeInput, { runId: string }>,
+    overrides?: WorkflowStartInput,
+  ): Promise<WorkflowRunStartResult> {
     const original = await this.status(scope, input.runId)
     if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
       throw new WorkflowServiceError(
@@ -249,15 +290,26 @@ export class WorkflowService {
     }
     if (input.idempotencyKey !== undefined) {
       const existing = await this.#options.store.findByIdempotencyKey(resolve(scope.cwd), input.idempotencyKey)
-      if (existing) return startResult(existing)
+      if (existing) return startResult(existing, this.#options.store)
     }
 
-    const workflow = await this.#options.store.loadWorkflow(input.runId)
-    const args = await this.#options.store.loadArgs(input.runId)
+    const originalWorkflow = await this.#options.store.loadWorkflow(input.runId)
+    const hasSourceOverride = overrides?.scriptPath !== undefined || overrides?.script !== undefined || overrides?.name !== undefined
+    const workflow = hasSourceOverride
+      ? await this.#resolveStartWorkflow(scope, overrides ?? {})
+      : originalWorkflow
+    const originalArgs = await this.#options.store.loadArgs(input.runId)
+    const args = overrides !== undefined && Object.prototype.hasOwnProperty.call(overrides, 'args')
+      ? { provided: true, value: overrides.args }
+      : originalArgs
     const priorJournal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(input.runId),
     )
-    const workflowId = workflow.filePath ?? workflow.meta.name
+    // WHY the old identity is used to retrieve the snapshot: `scriptPath` may point at edited
+    // bytes, but its stable path is precisely what allows beginRun to compare the prior source hash
+    // and invalidate only when the source actually changed. Looking up with a newly selected name
+    // would silently discard resumable history before the journal can make that decision.
+    const workflowId = originalWorkflow.filePath ?? originalWorkflow.meta.name
     const priorSnapshot = priorJournal.getSnapshot(workflowId)
     return this.#startLoaded(scope, workflow, {
       ...(args.provided ? { args: args.value } : {}),
@@ -265,6 +317,31 @@ export class WorkflowService {
       resumedFromRunId: input.runId,
       ...(priorSnapshot === undefined ? {} : { journalSnapshots: [priorSnapshot] }),
     })
+  }
+
+  async #resolveStartWorkflow(
+    scope: WorkflowServiceScope,
+    input: Pick<WorkflowStartInput, 'name' | 'script' | 'scriptPath'>,
+  ): Promise<LoadedWorkflow> {
+    const cwd = resolve(scope.cwd)
+    try {
+      // Claude's precedence is intentional: authoring clients commonly keep `name` in a reusable
+      // payload while adding script/scriptPath during iteration. Rejecting that combination would
+      // make a harmless stale selector override the bytes the user explicitly asked to test.
+      if (input.scriptPath !== undefined) return await loadScopedWorkflowPath(cwd, input.scriptPath)
+      if (input.script !== undefined) return await persistInlineWorkflow(cwd, input.script)
+      if (input.name !== undefined) return await this.#resolveVisibleWorkflow(scope, input.name)
+    } catch (cause) {
+      if (cause instanceof WorkflowAuthoringError) {
+        const code = cause.code === 'path-forbidden' ? 'scope-forbidden' : 'invalid-request'
+        throw new WorkflowServiceError(code, cause.message, { cause })
+      }
+      throw cause
+    }
+    throw new WorkflowServiceError(
+      'invalid-request',
+      'workflow_run requires one source selector: scriptPath, script, or name',
+    )
   }
 
   async #resumeClaude(
@@ -298,7 +375,7 @@ export class WorkflowService {
 
     if (input.idempotencyKey !== undefined) {
       const existing = await this.#options.store.findByIdempotencyKey(cwd, input.idempotencyKey)
-      if (existing) return startResult(existing)
+      if (existing) return startResult(existing, this.#options.store)
     }
     const imported = await loadClaudeWorkflowResume(metadataPath, {
       ...(workflowPath === undefined ? {} : { workflowPath }),
@@ -340,14 +417,19 @@ export class WorkflowService {
       this.#options.store.journalPath(runId),
       input.journalSnapshots,
     )
+    const cwd = resolve(scope.cwd)
     const provider = typeof this.#options.provider === 'function'
-      ? this.#options.provider()
+      ? this.#options.provider({
+          runId,
+          cwd,
+          ...(scope.clientId === undefined ? {} : { clientId: scope.clientId }),
+        })
       : this.#options.provider
     const run = runWorkflow({
       runId,
       workflow,
       ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
-      cwd: resolve(scope.cwd),
+      cwd,
       provider,
       journal,
       ...(this.#options.workerLauncher === undefined
@@ -365,6 +447,12 @@ export class WorkflowService {
       ...(this.#options.defaultEffort === undefined
         ? {}
         : { defaultEffort: this.#options.defaultEffort }),
+      ...(this.#options.resolveAgentType === undefined
+        ? {}
+        : { resolveAgentType: (name: string) => this.#options.resolveAgentType!(name, cwd) }),
+      ...(this.#options.prepareWorkingDirectory === undefined
+        ? {}
+        : { prepareWorkingDirectory: this.#options.prepareWorkingDirectory }),
       // Read-only is the service default even though the low-level executor remains backwards
       // compatible with its historical workspace-write CLI default. MCP input has no field that
       // can widen this host-owned policy.
@@ -387,7 +475,7 @@ export class WorkflowService {
     // First event persistence is asynchronous by design; returning queued immediately is what lets
     // an MCP client render a card before the evaluator or provider has completed any work.
     manifest = await this.#options.store.getManifest(runId) ?? manifest
-    return startResult(manifest)
+    return startResult(manifest, this.#options.store)
   }
 
   async #resolveVisibleWorkflow(scope: WorkflowServiceScope, name: string): Promise<FoundWorkflow> {
@@ -464,7 +552,10 @@ export class WorkflowService {
   }
 }
 
-function startResult(manifest: WorkflowRunManifest): WorkflowRunStartResult {
+function startResult(
+  manifest: WorkflowRunManifest,
+  store: WorkflowStore,
+): WorkflowRunStartResult {
   return {
     runId: manifest.runId,
     status: manifest.status,
@@ -474,6 +565,8 @@ function startResult(manifest: WorkflowRunManifest): WorkflowRunStartResult {
       ...(manifest.workflow.title === undefined ? {} : { title: manifest.workflow.title }),
     },
     cursor: manifest.cursor,
+    transcriptDirectory: store.transcriptDirectory(manifest.runId),
+    ...(manifest.workflow.filePath === undefined ? {} : { scriptPath: manifest.workflow.filePath }),
     ...(manifest.resumedFromRunId === undefined
       ? {}
       : { resumedFromRunId: manifest.resumedFromRunId }),

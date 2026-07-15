@@ -36,6 +36,7 @@ describe('standalone Streamable HTTP server', () => {
     expect(hostileOrigin.status).toBe(403)
 
     const first = await httpClient(server.url, server.token, 'first-http-client')
+    expect(first.client.getInstructions()).toContain('scriptPath overrides script, which overrides name')
     const started = await first.client.callTool({
       name: 'workflow_run',
       arguments: { name: 'http-fixture' },

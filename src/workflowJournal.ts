@@ -245,7 +245,12 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     sessions: JournalSessionRecord[],
   ) {
     this.#identity = identity
-    const historical = previous?.sourceHash === identity.sourceHash ? historicalCalls(previous) : []
+    // Claude resumes by the longest unchanged sequence of `(prompt, opts)` calls after the script
+    // is edited. The source hash is retained for audit/diagnostics, but it cannot be a reuse gate:
+    // making it one invalidates the entire journal on the exact edit-and-resume path the Workflow
+    // tool is designed around. Workflow identity still selects the namespace, and the chained keys
+    // invalidate the suffix after the first behaviorally changed call.
+    const historical = previous === undefined ? [] : historicalCalls(previous)
     const byKey = new Map<string, HistoricalCall[]>()
     for (const call of historical) {
       const matches = byKey.get(call.key)
@@ -256,7 +261,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     this.#records = records
     this.#sessions = sessions
     this.#previousKey = ''
-    this.#canReusePrefix = previous?.sourceHash === identity.sourceHash
+    this.#canReusePrefix = previous !== undefined
   }
 
   admit(call: JournalCall): JournalDecision {

@@ -7,9 +7,18 @@ machine-specific paths, private prompts, provider transcripts, or credentials.
 
 ```text
 references/
-├── README.md       # This policy and corpus index; safe to commit.
-└── raw/            # Exact source evidence; deliberately gitignored.
+├── README.md                              # This policy and corpus index; safe to commit.
+├── claude-code-workflow-tool-context.md   # The Workflow tool contract as the model sees it in-context; safe to commit.
+├── claude-harness-workflow-tool.md        # A SPEC/OBSERVED/INFERENCE cross-check of the same live contract.
+└── raw/                                   # Exact source evidence; deliberately gitignored.
 ```
+
+The two committed Claude captures were written by the model from inside a live Claude Code
+session (2026-07-15). `claude-code-workflow-tool-context.md` preserves the full in-context
+Workflow definition with reconstructed contract text separated from commentary;
+`claude-harness-workflow-tool.md` independently labels claims as SPEC, OBSERVED, or INFERENCE.
+Together they document the *contract* side of compatibility; the raw corpus below documents the
+*observed-behavior* side. Where they disagree, the corpus wins.
 
 `raw/` is ignored as a whole. That is intentional: a workflow can be executable code, and
 persisted run records can contain prompts and model output. Keeping the evidence beside the

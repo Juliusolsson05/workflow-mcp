@@ -37,6 +37,31 @@ phase('Verify')
 return await agent('verify it', { label: 'verifier' })`
 
 describe('WorkflowService', () => {
+  it('persists inline source in project .claude/workflows and returns its editable path', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-inline-project-'))
+    await mkdir(join(cwd, '.git'))
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(cwd, 'state')),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+
+    const source = `export const meta = { name: 'inline review', description: 'Inline fixture' }
+      return args`
+    const run = await service.start({ cwd }, { script: source, args: { target: 'src' } })
+    expect(run.scriptPath).toBe(join(cwd, '.claude', 'workflows', 'inline-review.js'))
+    expect(await service.describe({ cwd }, { name: 'inline review' })).toMatchObject({
+      filePath: run.scriptPath,
+      source,
+      location: 'project',
+    })
+    await expect(service.start({ cwd }, {
+      script: source.replace('return args', 'return null'),
+    })).rejects.toMatchObject({ code: 'invalid-request' } satisfies Partial<WorkflowServiceError>)
+    await terminal(service, cwd, run.runId)
+    await service.stop()
+  })
+
   it('returns immediately, persists events, closes phases honestly, and enforces cwd scope', async () => {
     const fixture = await project(twoPhaseSource)
     const provider = new FakeAgentProvider([
@@ -90,7 +115,9 @@ describe('WorkflowService', () => {
     })
     await first.initialize()
     const original = await first.start({ cwd: fixture.cwd }, { name: 'resume-me' })
-    while ((await first.status({ cwd: fixture.cwd }, original.runId)).cursor < 4) {
+    // session.started is the durable resume boundary; agent.started alone only proves the provider
+    // call was dispatched and may still lack a thread ID if the host stops immediately afterward.
+    while ((await first.status({ cwd: fixture.cwd }, original.runId)).cursor < 5) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 5))
     }
     await first.stop('test restart')

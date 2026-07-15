@@ -35,4 +35,5 @@ export interface WorkflowStore {
   loadWorkflow(runId: string): Promise<LoadedWorkflow>
   loadArgs(runId: string): Promise<{ provided: boolean; value?: unknown }>
   journalPath(runId: string): string
+  transcriptDirectory(runId: string): string
 }

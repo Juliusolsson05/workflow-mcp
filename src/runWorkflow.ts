@@ -66,7 +66,7 @@ export type WorkflowResolver = (
 
 export type PreparedWorkingDirectory = {
   path: string
-  cleanup?(): Promise<void>
+  cleanup?(): Promise<void | { preservedPath: string }>
 }
 
 export type WorkingDirectoryPreparer = (input: {
@@ -148,7 +148,10 @@ const DEFAULT_SANDBOX: AgentSandboxPolicy = {
   network: false,
 }
 
-const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh'])
+// `max` is part of Claude's public Workflow source language. `minimal` remains accepted as a
+// provider-portability extension because older workflow-mcp definitions already used it; rejecting
+// those files would add incompatibility without making a Claude-authored file any safer.
+const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const BLOCKED_VALUE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 type WorkflowEventDraft = WorkflowEvent extends infer Event
@@ -197,35 +200,61 @@ function deferred<Value>(): Deferred<Value> {
 }
 
 class WorkflowEventStream implements AsyncIterable<WorkflowEvent> {
-  readonly #events: WorkflowEvent[] = []
-  readonly #waiters = new Set<() => void>()
+  readonly #subscribers = new Set<{
+    queue: WorkflowEvent[]
+    wake: (() => void) | undefined
+  }>()
   #closed = false
 
   publish(event: WorkflowEvent): void {
     if (this.#closed) return
-    this.#events.push(event)
-    for (const wake of this.#waiters) wake()
-    this.#waiters.clear()
+    for (const subscriber of this.#subscribers) {
+      subscriber.queue.push(event)
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
   }
 
   close(): void {
     this.#closed = true
-    for (const wake of this.#waiters) wake()
-    this.#waiters.clear()
+    for (const subscriber of this.#subscribers) {
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
   }
 
   [Symbol.asyncIterator](): AsyncIterator<WorkflowEvent> {
-    let cursor = 0
+    // WHY events are queued per active iterator instead of retained globally: WorkflowService uses
+    // the durable eventSink and intentionally never consumes this convenience stream. The old
+    // replay array therefore held every activity for the lifetime of every app-owned run even
+    // though no reader could observe it. Direct runWorkflow/CLI callers attach synchronously (all
+    // publishing is serialized through a promise turn) and retain lossless live delivery, while an
+    // unused stream now costs constant memory.
+    const subscriber: { queue: WorkflowEvent[]; wake: (() => void) | undefined } = {
+      queue: [],
+      wake: undefined,
+    }
+    this.#subscribers.add(subscriber)
+    const remove = (): void => {
+      this.#subscribers.delete(subscriber)
+      subscriber.queue.length = 0
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
     return {
       next: async (): Promise<IteratorResult<WorkflowEvent>> => {
-        while (cursor >= this.#events.length && !this.#closed) {
-          await new Promise<void>((resolveWait) => this.#waiters.add(resolveWait))
+        while (subscriber.queue.length === 0 && !this.#closed) {
+          await new Promise<void>((resolveWait) => { subscriber.wake = resolveWait })
         }
-        const event = this.#events[cursor]
+        const event = subscriber.queue.shift()
         if (event !== undefined) {
-          cursor += 1
           return { done: false, value: event }
         }
+        remove()
+        return { done: true, value: undefined }
+      },
+      return: async (): Promise<IteratorResult<WorkflowEvent>> => {
+        remove()
         return { done: true, value: undefined }
       },
     }
@@ -946,20 +975,20 @@ class WorkflowRuntime {
       this.#options.budgetTokens !== null &&
       this.#budgetSpent >= this.#options.budgetTokens
     ) {
-      const reason = 'Workflow token budget is exhausted'
-      input.journalRun.recordResult(decision, null)
+      // Claude exposes this pool as a hard output-token ceiling. Returning null here used to make a
+      // sequential workflow silently continue with missing data, which is materially different
+      // from Claude's catchable throw and made `budget.remaining()` guards impossible to trust.
+      const budgetError = new WorkflowExecutionError(
+        'budget-exhausted',
+        `Workflow output-token budget is exhausted (${this.#budgetSpent}/${this.#options.budgetTokens})`,
+      )
       await this.#emit({
-        type: 'agent.skipped',
+        type: 'agent.failed',
         agentId,
         ...(phaseId === undefined ? {} : { phaseId }),
-        payload: { reason },
+        payload: { error: errorReference(budgetError) },
       })
-      this.#send(input.worker, {
-        type: 'agent.result',
-        requestId: input.request.requestId,
-        result: { type: 'success', value: null },
-        budgetSpent: this.#budgetSpent,
-      })
+      this.#replyAgentError(input.worker, input.request.requestId, budgetError)
       return
     }
 
@@ -1076,7 +1105,10 @@ class WorkflowRuntime {
       }
 
       const value = this.#providerValue(result, admission.validateOutput)
-      if (result.usage?.totalTokens !== undefined) this.#budgetSpent += result.usage.totalTokens
+      // Claude's budget pool counts generated output only. Input/context tokens may dwarf the
+      // actual requested work on resumed threads; charging totalTokens caused identical workflows
+      // to stop at wildly different points depending on provider cache state.
+      if (result.usage?.outputTokens !== undefined) this.#budgetSpent += result.usage.outputTokens
       admission.journalRun.recordResult(admission.journalMiss, value)
       const completedSession = result.providerSession ?? providerSession
 
@@ -1162,7 +1194,20 @@ class WorkflowRuntime {
       }
     } finally {
       try {
-        await prepared?.cleanup?.()
+        const cleanup = await prepared?.cleanup?.()
+        if (cleanup?.preservedPath) {
+          await this.#emit({
+            type: 'warning',
+            agentId: admission.agentId,
+            ...(attemptStarted ? { attemptId: admission.attemptId } : {}),
+            ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+            payload: {
+              code: 'working-directory-preserved',
+              message: `Isolated worktree contains changes and was preserved at ${cleanup.preservedPath}`,
+              details: { path: cleanup.preservedPath },
+            },
+          })
+        }
       } catch (error) {
         // Cleanup happens after the provider outcome is already authoritative. Turning a failed
         // best-effort worktree removal into a second agent failure would contradict the event

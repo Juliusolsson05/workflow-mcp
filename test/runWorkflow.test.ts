@@ -251,7 +251,7 @@ describe('agent scheduling and helpers', () => {
     expect(projectWorkflowState(second.run.id, await second.events).status).toBe('failed')
   })
 
-  it('shares budget admission and skips calls reached after completed usage exhausts it', async () => {
+  it('counts output tokens and throws when a later call reaches the hard shared ceiling', async () => {
     const source = workflow(`
       const first = await agent('first')
       const second = await agent('second')
@@ -262,14 +262,14 @@ describe('agent scheduling and helpers', () => {
         outcome: {
           type: 'result',
           output: { type: 'text', text: 'one' },
-          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          usage: { inputTokens: 99, outputTokens: 2, totalTokens: 101 },
         },
       },
     ], { budgetTokens: 2 })
 
-    await expect(run.result).resolves.toEqual(['one', null, 2, 0])
+    await expect(run.result).rejects.toThrow(/output-token budget is exhausted/i)
     const snapshot = projectWorkflowState(run.id, await events)
-    expect(snapshot.counts).toMatchObject({ total: 2, completed: 1, skipped: 1 })
+    expect(snapshot.counts).toMatchObject({ total: 2, completed: 1, failed: 1 })
     expect(provider.calls).toHaveLength(1)
   })
 
@@ -504,7 +504,7 @@ describe('cancellation, journal, and composition', () => {
     expect(projectWorkflowState(recursive.run.id, await recursive.events).status).toBe('failed')
   })
 
-  it('invalidates nested journal reuse when only the child source changes', async () => {
+  it('reuses a nested workflow prefix when edited child source keeps the same call', async () => {
     const parent = workflow(`return await workflow('child')`, 'journal-parent')
     const childOne = workflow(`return await agent('same child prompt')`, 'child')
     const childTwo = workflow(`log('changed source'); return await agent('same child prompt')`, 'child')
@@ -515,12 +515,10 @@ describe('cancellation, journal, and composition', () => {
     await expect(first.run.result).resolves.toBe('old')
     await first.events
 
-    const second = start(parent, [
-      { outcome: { type: 'result', output: { type: 'text', text: 'new' } } },
-    ], { journal, resolveWorkflow: async () => childTwo })
-    await expect(second.run.result).resolves.toBe('new')
+    const second = start(parent, [], { journal, resolveWorkflow: async () => childTwo })
+    await expect(second.run.result).resolves.toBe('old')
     await second.events
-    expect(second.provider.calls).toHaveLength(1)
+    expect(second.provider.calls).toHaveLength(0)
   })
 
   it('resolves agent types and delegates worktree lifecycle above the provider', async () => {

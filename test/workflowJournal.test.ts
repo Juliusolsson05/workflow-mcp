@@ -198,16 +198,14 @@ describe('InMemoryWorkflowJournal', () => {
     },
   )
 
-  it('keeps workflow identity and source identity as separate invalidation boundaries', () => {
+  it('uses workflow identity as the namespace while edited source reuses unchanged call prefixes', () => {
     const journal = new InMemoryWorkflowJournal()
     const original = complete(journal, [{ prompt: 'same', result: 'cached' }])
 
     const differentSource = journal.beginRun({ ...identity, sourceHash: 'source-b' })
-    const sourceMiss = differentSource.admit({ agentId: 'new-source', prompt: 'same' })
-    expect(sourceMiss.reused).toBe(false)
-    // Source is a compatibility boundary outside the digest. It prevents reuse while preserving
-    // Claude's exact call-key bytes for tools that already understand v2 journals.
-    expect(sourceMiss.key).toBe(original.records[0]?.key)
+    const sourceHit = differentSource.admit({ agentId: 'new-source', prompt: 'same' })
+    expect(sourceHit.reused).toBe(true)
+    expect(sourceHit.key).toBe(original.records[0]?.key)
 
     const otherWorkflow = journal.beginRun({ workflowId: 'project:other', sourceHash: 'source-a' })
     const workflowMiss = otherWorkflow.admit({ agentId: 'new-workflow', prompt: 'same' })
