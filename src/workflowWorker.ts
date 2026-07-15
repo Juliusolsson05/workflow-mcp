@@ -381,17 +381,29 @@ const INITIALIZE_REALM = `
         throw new TypeError('parallel() entries must be functions')
       }
     }
-    return Promise.all(thunks.map((thunk) => {
+    // Budget-exceeded slots are matched by error NAME because that is Claude's own realm contract:
+    // its parallel/pipeline catch WorkflowBudgetExceededError specifically and report one aggregate
+    // "slots dropped" line instead of a per-slot failure log. Everything else still logs per entry.
+    let droppedForBudget = 0
+    const settleFailure = (error) => {
+      if (error && error.name === 'WorkflowBudgetExceededError') {
+        droppedForBudget += 1
+        return null
+      }
+      bridge.console('warn', renderLog(['parallel() entry failed:', error?.message ?? String(error)]))
+      return null
+    }
+    const results = await Promise.all(thunks.map((thunk) => {
       try {
-        return Promise.resolve(thunk()).catch((error) => {
-          bridge.console('warn', renderLog(['parallel() entry failed:', error?.message ?? String(error)]))
-          return null
-        })
+        return Promise.resolve(thunk()).catch(settleFailure)
       } catch (error) {
-        bridge.console('warn', renderLog(['parallel() entry failed:', error?.message ?? String(error)]))
-        return Promise.resolve(null)
+        return Promise.resolve(settleFailure(error))
       }
     }))
+    if (droppedForBudget > 0) {
+      bridge.console('warn', 'parallel: ' + droppedForBudget + ' slot' + (droppedForBudget === 1 ? '' : 's') + ' dropped — token budget exceeded')
+    }
+    return results
   }
 
   const pipeline = async (items, ...stages) => {
@@ -403,7 +415,8 @@ const INITIALIZE_REALM = `
       if (typeof stage !== 'function') throw new TypeError('pipeline() stages must be functions')
     }
 
-    return Promise.all(items.map(async (original, index) => {
+    let droppedForBudget = 0
+    const results = await Promise.all(items.map(async (original, index) => {
       let current = original
       try {
         for (const stage of stages) {
@@ -412,10 +425,18 @@ const INITIALIZE_REALM = `
         }
         return current
       } catch (error) {
+        if (error && error.name === 'WorkflowBudgetExceededError') {
+          droppedForBudget += 1
+          return null
+        }
         bridge.console('warn', renderLog(['pipeline() item failed:', error?.message ?? String(error)]))
         return null
       }
     }))
+    if (droppedForBudget > 0) {
+      bridge.console('warn', 'pipeline: ' + droppedForBudget + ' slot' + (droppedForBudget === 1 ? '' : 's') + ' dropped — token budget exceeded')
+    }
+    return results
   }
 
   const workflowConsole = Object.freeze({

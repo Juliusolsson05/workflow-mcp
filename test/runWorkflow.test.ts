@@ -251,11 +251,15 @@ describe('agent scheduling and helpers', () => {
     expect(projectWorkflowState(second.run.id, await second.events).status).toBe('failed')
   })
 
-  it('counts output tokens and throws when a later call reaches the hard shared ceiling', async () => {
+  it('counts output tokens and throws the Claude-named budget error before allocating identity', async () => {
     const source = workflow(`
-      const first = await agent('first')
-      const second = await agent('second')
-      return [first, second, budget.spent(), budget.remaining()]
+      try {
+        const first = await agent('first')
+        await agent('second')
+      } catch (error) {
+        return [error.name, error.message, budget.spent(), budget.remaining()]
+      }
+      return 'unreachable'
     `)
     const { provider, run, events } = start(source, [
       {
@@ -267,9 +271,42 @@ describe('agent scheduling and helpers', () => {
       },
     ], { budgetTokens: 2 })
 
-    await expect(run.result).rejects.toThrow(/output-token budget is exhausted/i)
+    // The name and catchability are Claude's realm contract: a portable workflow may branch on
+    // `error.name === 'WorkflowBudgetExceededError'`, and the refused call must leave no agent
+    // record because Claude refuses before computing a call index or journal key.
+    await expect(run.result).resolves.toEqual([
+      'WorkflowBudgetExceededError',
+      expect.stringMatching(/token budget exceeded \(2 \/ 2 output tokens\)/i),
+      2,
+      0,
+    ])
     const snapshot = projectWorkflowState(run.id, await events)
-    expect(snapshot.counts).toMatchObject({ total: 2, completed: 1, failed: 1 })
+    expect(snapshot.counts).toMatchObject({ total: 1, completed: 1, failed: 0 })
+    expect(snapshot.warnings.some((warning) => warning.code === 'workflow-budget-exceeded')).toBe(true)
+    expect(provider.calls).toHaveLength(1)
+  })
+
+  it('drops budget-exceeded parallel slots to null with one aggregate log line', async () => {
+    const source = workflow(`
+      const first = await agent('first')
+      const slots = await parallel([() => agent('second'), () => agent('third')])
+      return [first, ...slots]
+    `)
+    const { provider, run, events } = start(source, [
+      {
+        outcome: {
+          type: 'result',
+          output: { type: 'text', text: 'one' },
+          usage: { inputTokens: 1, outputTokens: 5 },
+        },
+      },
+    ], { budgetTokens: 5 })
+
+    await expect(run.result).resolves.toEqual(['one', null, null])
+    const snapshot = projectWorkflowState(run.id, await events)
+    expect(snapshot.logs.some((log) =>
+      log.message.preview.includes('parallel: 2 slots dropped'),
+    )).toBe(true)
     expect(provider.calls).toHaveLength(1)
   })
 

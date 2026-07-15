@@ -71,6 +71,7 @@ export type {
 
 export {
   WorkflowCancelledError,
+  WorkflowBudgetExceededError,
   WorkflowExecutionError,
   runWorkflow,
 } from './runWorkflow.js'
