@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { COPYFILE_EXCL } from 'node:constants'
+import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
 import {
   chmod,
@@ -15,6 +16,7 @@ import {
 } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
+import { promisify } from 'node:util'
 
 import { parseWorkflowSource } from './loadWorkflow.js'
 import type { WorkflowEvent } from './workflowEvents.js'
@@ -27,6 +29,7 @@ import type {
   WorkflowRunSnapshot,
   WorkflowRunStatus,
   WorkflowStore,
+  WorkflowStoreLease,
 } from './workflowStore.js'
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
@@ -43,9 +46,13 @@ const RUN_STATUSES = new Set<WorkflowRunStatus>([
 ])
 const MAX_EVENT_FILE_BYTES = 512 * 1024 * 1024
 const EVENT_INDEX_STRIDE = 256
+const OWNER_LOCK_DIRECTORY = 'service-owner.lock'
+const OWNER_METADATA_FILE = 'owner.json'
+const OWNER_ACQUIRE_ATTEMPTS = 16
+const execFileAsync = promisify(execFile)
 
 export class WorkflowStoreError extends Error {
-  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'io-error'
+  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'io-error' | 'owner-conflict'
 
   constructor(code: WorkflowStoreError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
@@ -67,6 +74,9 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly runsDirectory: string
   readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
   readonly #eventOffsets = new Map<string, Map<number, number>>()
+  readonly #appendTails = new Map<string, Promise<void>>()
+  #leaseToken: string | undefined
+  #leaseWasAcquired = false
 
   constructor(rootDirectory: string) {
     this.rootDirectory = resolve(rootDirectory)
@@ -74,6 +84,10 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async initialize(): Promise<void> {
+    // initialize() is not read-only: crash-tail recovery can rewrite manifests. A convenience
+    // store handle which never acquired the owner lease must therefore be fenced just like append
+    // and create, or a second process can race recovery before WorkflowService sees it.
+    await this.#assertLease()
     await mkdir(this.runsDirectory, { recursive: true, mode: 0o700 })
     await chmod(this.rootDirectory, 0o700).catch(() => undefined)
     await chmod(this.runsDirectory, 0o700)
@@ -85,7 +99,118 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  async acquireLease(ownerId: string): Promise<WorkflowStoreLease> {
+    if (ownerId.length === 0) throw new TypeError('Workflow store ownerId must not be empty')
+    await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 })
+    const lockDirectory = join(this.rootDirectory, OWNER_LOCK_DIRECTORY)
+    const metadataPath = join(lockDirectory, OWNER_METADATA_FILE)
+    const token = randomUUID()
+    const generation = (Date.now() * 1_000) + Math.floor(Math.random() * 1_000)
+    const processStartIdentity = await readProcessStartIdentity(process.pid)
+    for (let attempt = 0; attempt < OWNER_ACQUIRE_ATTEMPTS; attempt += 1) {
+      const candidateDirectory = join(
+        this.rootDirectory,
+        `${OWNER_LOCK_DIRECTORY}.candidate-${process.pid}-${randomUUID()}`,
+      )
+      try {
+        // WHY the directory is the lock primitive: replacing an expired ordinary file requires
+        // unlink-then-create, which lets two reclaimers both delete each other's lock (the classic
+        // ABA race). mkdir and rename are atomic namespace operations, so exactly one contender can
+        // claim an absent lock or detach one stale generation for deletion.
+        // Build the complete generation off to the side. Publishing an empty lock directory and
+        // filling owner.json afterward creates a window where another contender cannot distinguish
+        // a live claim from malformed crash debris and may reclaim it.
+        await mkdir(candidateDirectory, { mode: 0o700 })
+        const candidateMetadata = join(candidateDirectory, OWNER_METADATA_FILE)
+        const handle = await open(candidateMetadata, 'wx', 0o600)
+        try {
+          await handle.writeFile(`${JSON.stringify({
+            ownerId,
+            token,
+            generation,
+            pid: process.pid,
+            ...(processStartIdentity === undefined ? {} : { processStartIdentity }),
+            acquiredAt: new Date().toISOString(),
+          })}\n`)
+          await handle.sync()
+        } finally {
+          await handle.close()
+        }
+        await rename(candidateDirectory, lockDirectory)
+        this.#leaseToken = token
+        this.#leaseWasAcquired = true
+        let released = false
+        return {
+          ownerId,
+          generation,
+          release: async () => {
+            if (released) return
+            let completed = false
+            try {
+              try {
+                const current = JSON.parse(await readFile(metadataPath, 'utf8')) as { token?: unknown }
+                // WHY release checks the random fencing token instead of blindly unlinking: a stale
+                // owner can resume after another process reclaimed its dead PID lock. It must never
+                // delete the new owner's lease and reopen the store to concurrent writers.
+                if (current.token === token) {
+                  const tombstone = join(
+                    this.rootDirectory,
+                    `${OWNER_LOCK_DIRECTORY}.released-${process.pid}-${randomUUID()}`,
+                  )
+                  await rename(lockDirectory, tombstone)
+                  await rm(tombstone, { recursive: true, force: true })
+                }
+              } catch (error) {
+                if (!isMissing(error)) throw error
+              }
+              completed = true
+            } finally {
+              // An I/O failure must remain retryable. Marking release complete before the atomic
+              // rename would strand a live lock forever while every later release call no-ops.
+              if (completed) {
+                released = true
+                if (this.#leaseToken === token) this.#leaseToken = undefined
+              }
+            }
+          },
+        }
+      } catch (error) {
+        await rm(candidateDirectory, { recursive: true, force: true }).catch(() => undefined)
+        if (!isLockExists(error)) {
+          throw new WorkflowStoreError('io-error', `Cannot acquire workflow store ownership: ${lockDirectory}`, { cause: error })
+        }
+        const existing = await readOwner(metadataPath)
+        if (existing !== undefined && await ownerProcessIsAlive(existing)) {
+          throw new WorkflowStoreError(
+            'owner-conflict',
+            `Workflow store is already owned by ${existing.ownerId} (pid ${existing.pid})`,
+          )
+        }
+        const tombstone = join(
+          this.rootDirectory,
+          `${OWNER_LOCK_DIRECTORY}.stale-${process.pid}-${randomUUID()}`,
+        )
+        try {
+          // The stale directory outlives a hard crash. Rename is the takeover linearization point:
+          // a rival either renames this exact generation first or observes our newly created one.
+          // It can never unlink a generation created after its stale-owner inspection.
+          await rename(lockDirectory, tombstone)
+        } catch (cause) {
+          if (isMissing(cause)) continue
+          throw new WorkflowStoreError(
+            'io-error',
+            `Cannot reclaim stale workflow store ownership: ${lockDirectory}`,
+            { cause },
+          )
+        }
+        await rm(tombstone, { recursive: true, force: true })
+      }
+    }
+    throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership changed while acquiring it')
+  }
+
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest> {
+    await this.#assertLease()
     const directory = this.#runDirectory(input.runId)
     try {
       await mkdir(directory, { mode: 0o700 })
@@ -113,9 +238,15 @@ export class FileWorkflowStore implements WorkflowStore {
       createdAt: now,
       updatedAt: now,
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+      ...(input.clientId === undefined ? {} : { clientId: input.clientId }),
       ...(input.resumedFromRunId === undefined
         ? {}
         : { resumedFromRunId: input.resumedFromRunId }),
+      lineageId: input.lineageId ?? input.runId,
+      ...(input.recoveryMode === undefined ? {} : { recoveryMode: input.recoveryMode }),
+      ...(input.automaticReplaySafe === undefined
+        ? {}
+        : { automaticReplaySafe: input.automaticReplaySafe }),
     }
 
     try {
@@ -170,6 +301,21 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async appendEvent(runId: string, event: WorkflowEvent): Promise<StoredWorkflowEvent> {
+    const previous = this.#appendTails.get(runId) ?? Promise.resolve()
+    let releaseTail!: () => void
+    const owned = new Promise<void>((resolveOwned) => { releaseTail = resolveOwned })
+    this.#appendTails.set(runId, owned)
+    await previous.catch(() => undefined)
+    try {
+      return await this.#appendEvent(runId, event)
+    } finally {
+      releaseTail()
+      if (this.#appendTails.get(runId) === owned) this.#appendTails.delete(runId)
+    }
+  }
+
+  async #appendEvent(runId: string, event: WorkflowEvent): Promise<StoredWorkflowEvent> {
+    await this.#assertLease()
     const manifest = await this.#requiredManifest(runId)
     if (event.runId !== runId) {
       throw new WorkflowStoreError(
@@ -364,6 +510,13 @@ export class FileWorkflowStore implements WorkflowStore {
       cursor += 1
       if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
       const event = parseStoredEvent(value, runId, cursor, path)
+      // WHY the upper-bound check must happen before yield: append fsyncs events.jsonl before it
+      // advances manifest.cursor. A concurrent health/snapshot read can therefore see one durable
+      // record beyond its manifest. Yielding that future record under the old cursor poisons the
+      // projection cache, then the writer applies the same event a second time and fails the run
+      // with a false duplicate-sequence error. The manifest is the published commit boundary even
+      // though the append-only file intentionally reaches disk first for crash recovery.
+      if (cursor > throughCursor) break
       yield event
       startOffset += Buffer.byteLength(line, 'utf8') + 1
       if (cursor >= throughCursor) break
@@ -467,6 +620,40 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  async #assertLease(): Promise<void> {
+    const lockDirectory = join(this.rootDirectory, OWNER_LOCK_DIRECTORY)
+    const metadataPath = join(lockDirectory, OWNER_METADATA_FILE)
+    if (!this.#leaseWasAcquired) {
+      // Mutations never get an "unowned means safe" fast path. Checking for no lock and then
+      // appending is a classic check/use race: a service can publish its lock between those two
+      // operations and both handles become writers. Requiring every mutator to have acquired the
+      // lease makes acquisition itself the one linearization point.
+      throw new WorkflowStoreError(
+        'owner-conflict',
+        'Workflow store mutations require an acquired owner lease',
+      )
+    }
+    if (this.#leaseToken === undefined) {
+      throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership has been released')
+    }
+    try {
+      const current = JSON.parse(await readFile(metadataPath, 'utf8')) as { token?: unknown }
+      // WHY every externally initiated mutation rechecks the token: PID-only locks prevent two
+      // normal starts, but they do not fence an old asynchronous owner after its lock was reclaimed
+      // or replaced. A stale service must fail before appending, even if its JavaScript stack wakes
+      // much later with a previously valid store object.
+      if (current.token !== this.#leaseToken) {
+        throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership was fenced by another service')
+      }
+    } catch (error) {
+      if (error instanceof WorkflowStoreError) throw error
+      if (isMissing(error)) {
+        throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership file disappeared')
+      }
+      throw new WorkflowStoreError('io-error', 'Cannot verify workflow store ownership', { cause: error })
+    }
+  }
+
   #runDirectory(runId: string): string {
     if (!/^run_[A-Za-z0-9_-]+$/.test(runId)) {
       throw new TypeError(`Invalid workflow run ID: ${JSON.stringify(runId)}`)
@@ -480,6 +667,68 @@ export class FileWorkflowStore implements WorkflowStore {
 
   #eventsPath(runId: string): string {
     return join(this.#runDirectory(runId), 'events.jsonl')
+  }
+}
+
+async function readOwner(path: string): Promise<{
+  ownerId: string
+  pid: number
+  processStartIdentity?: string
+} | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path, 'utf8')) as unknown
+    if (
+      !isObject(value) ||
+      typeof value.ownerId !== 'string' ||
+      !Number.isSafeInteger(value.pid) ||
+      (value.pid as number) <= 0
+    ) return undefined
+    return {
+      ownerId: value.ownerId,
+      pid: value.pid as number,
+      ...(typeof value.processStartIdentity === 'string'
+        ? { processStartIdentity: value.processStartIdentity }
+        : {}),
+    }
+  } catch (error) {
+    if (isMissing(error) || error instanceof SyntaxError) return undefined
+    throw error
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return !(isObject(error) && error.code === 'ESRCH')
+  }
+}
+
+async function ownerProcessIsAlive(owner: {
+  pid: number
+  processStartIdentity?: string
+}): Promise<boolean> {
+  if (!processIsAlive(owner.pid)) return false
+  // Legacy locks have no start identity. Treat a live matching PID as owned rather than risking a
+  // split brain; only newly written locks can safely distinguish PID reuse.
+  if (owner.processStartIdentity === undefined) return true
+  const currentIdentity = await readProcessStartIdentity(owner.pid)
+  // Failure to inspect a live process is not proof it died (sandboxed `ps` is common in packaged
+  // apps), so ambiguity remains fenced and may require manual stale-lock removal.
+  return currentIdentity === undefined || currentIdentity === owner.processStartIdentity
+}
+
+async function readProcessStartIdentity(pid: number): Promise<string | undefined> {
+  if (process.platform === 'win32') return undefined
+  try {
+    const { stdout } = await execFileAsync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+    })
+    const value = stdout.trim().replace(/\s+/g, ' ')
+    return value.length === 0 ? undefined : value
+  } catch {
+    return undefined
   }
 }
 
@@ -574,4 +823,8 @@ function isMissing(error: unknown): boolean {
 
 function isAlreadyExists(error: unknown): boolean {
   return isObject(error) && error.code === 'EEXIST'
+}
+
+function isLockExists(error: unknown): boolean {
+  return isAlreadyExists(error) || (isObject(error) && error.code === 'ENOTEMPTY')
 }

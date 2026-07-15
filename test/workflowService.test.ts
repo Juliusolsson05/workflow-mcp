@@ -105,6 +105,29 @@ describe('WorkflowService', () => {
     await service.stop()
   })
 
+  it('coalesces concurrent starts with one idempotency key before provider execution', async () => {
+    const fixture = await project(`export const meta = { name: 'once', description: 'Idempotency race' }
+      return await agent('execute exactly once')`)
+    const provider = new FakeAgentProvider([{
+      delayMs: 20,
+      outcome: { type: 'result', output: { type: 'text', text: 'once' } },
+    }])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider,
+    })
+    await service.initialize()
+
+    const [first, second] = await Promise.all([
+      service.start({ cwd: fixture.cwd }, { name: 'once', idempotencyKey: 'same-request' }),
+      service.start({ cwd: fixture.cwd }, { name: 'once', idempotencyKey: 'same-request' }),
+    ])
+    expect(second.runId).toBe(first.runId)
+    await terminal(service, fixture.cwd, first.runId)
+    expect(provider.calls).toHaveLength(1)
+    await service.stop()
+  })
+
   it('resumes a cancelled run into a linked run using the durable provider session', async () => {
     const fixture = await project(`export const meta = { name: 'resume-me', description: 'Resume fixture' }
       return await agent('continue me')`)
@@ -144,12 +167,14 @@ describe('WorkflowService', () => {
   it('marks an abandoned queued manifest interrupted on service initialization', async () => {
     const fixture = await project(twoPhaseSource)
     const store = new FileWorkflowStore(fixture.storeRoot)
+    const seedLease = await store.acquireLease('abandoned-seed')
     await store.initialize()
     await store.createRun({
       runId: 'run_abandoned',
       cwd: fixture.cwd,
       workflow: parseWorkflowSource(twoPhaseSource),
     })
+    await seedLease.release()
     const service = new WorkflowService({ store, provider: new FakeAgentProvider([]) })
     await service.initialize()
 

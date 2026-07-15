@@ -172,6 +172,45 @@ against the workflow budget. Default provider concurrency is nine (the Agent Cod
 point; see the `DEFAULT_LIMITS` comment in `runWorkflow.ts`); callers can configure it through
 `limits.concurrency` or `WORKFLOW_MCP_CONCURRENCY`.
 
+## Unattended-run reliability
+
+`WorkflowService` owns one work-conserving provider scheduler across all of its runs. Nine is the
+default service-wide ceiling, while an individual run may request a lower ceiling. A workflow does
+not need to manufacture batches of nine: as soon as one attempt releases a permit, the oldest
+already-runnable call is admitted. Preparation, cleanup, retry backoff, and an open provider circuit
+do not occupy provider permits.
+
+Every logical agent can have multiple supervised attempts. The default host policy distinguishes
+provider startup, idle progress, one active operation, total attempt lifetime, and cancellation
+termination deadlines. When the provider affirmatively declares automatic replay safe, retryable
+failures and stalls resume the same provider session and reuse the same stable workspace identity.
+Unknown providers fail closed because a read-only checkout does not make remote MCP effects safe to
+repeat. Retries are bounded per agent and per run; repeated infrastructure failures open a shared
+circuit breaker so a provider outage cannot turn nine slots into an unbounded retry storm.
+`WorkflowReliabilityPolicy` is public for hosts that need measured overrides.
+
+The service store is single-writer fenced. On restart, an untouched cursor-zero queue reservation is
+always safe to continue. A run which durably reached `run.started` is marked interrupted and is
+continued only when both its sandbox and persisted provider capability permit automatic replay.
+Exact-source crash
+recovery reuses completed parallel siblings sparsely—for example, if call five of nine was in flight
+but calls six through nine completed, only call five executes again. Manual resume retains Claude's
+longest-unchanged-prefix behavior because edited source cannot safely make that sparse assumption.
+`workflow_run_status` includes scheduler utilization, provider-circuit state, stalled/retrying agent
+counts, last progress, lineage, and the successor run ID.
+
+There are two deliberate safety boundaries:
+
+- Mutable shared sandboxes are not automatically resumed unless the host explicitly opts in with
+  `recovery.allowMutableSandbox`. A provider adapter with a real process tree should implement
+  `terminateAttempt`; if hard termination cannot be confirmed, its permit is quarantined instead of
+  starting a potentially overlapping retry.
+- Automatic continuation begins when `WorkflowService.initialize()` runs after a host restart. The
+  current package does not install a separate always-on daemon, so it cannot keep agents executing
+  during the interval in which its owning application process is down. The daemon/provider-host
+  separation remains the final failure-domain milestone in
+  [`RELIABILITY_IMPLEMENTATION_PLAN.md`](./RELIABILITY_IMPLEMENTATION_PLAN.md).
+
 ## Why the name
 
 The repository should be named `workflow-mcp`, and Agent Code should eventually mount it at

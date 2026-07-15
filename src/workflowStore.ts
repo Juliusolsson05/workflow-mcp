@@ -20,11 +20,24 @@ export type CreateWorkflowRunInput = {
   workflow: LoadedWorkflow
   args?: unknown
   idempotencyKey?: string
+  clientId?: string
   resumedFromRunId?: string
+  lineageId?: string
+  recoveryMode?: 'manual' | 'automatic'
+  automaticReplaySafe?: boolean
+}
+
+export type WorkflowStoreLease = {
+  ownerId: string
+  /** Monotonic-enough local fencing generation; the random token remains the authority. */
+  generation: number
+  release(): Promise<void>
 }
 
 export interface WorkflowStore {
   initialize(): Promise<void>
+  /** Optional cross-process single-writer fence. It may be acquired before initialize(). */
+  acquireLease?(ownerId: string): Promise<WorkflowStoreLease>
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>
   getManifest(runId: string): Promise<WorkflowRunManifest | undefined>
   listManifests(): Promise<WorkflowRunManifest[]>

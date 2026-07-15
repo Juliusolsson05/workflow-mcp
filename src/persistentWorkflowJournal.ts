@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
@@ -11,6 +11,7 @@ import {
   type JournalIdentity,
   type JournalMiss,
   type JournalRecord,
+  type JournalReuseMode,
   type JournalSessionRecord,
   type JournalSnapshot,
   type WorkflowJournal,
@@ -82,8 +83,8 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
     return new PersistentWorkflowJournal(filePath, snapshots)
   }
 
-  beginRun(identity: JournalIdentity): WorkflowJournalRun {
-    const run = this.#inner.beginRun(identity)
+  beginRun(identity: JournalIdentity, options: { reuseMode?: JournalReuseMode } = {}): WorkflowJournalRun {
+    const run = this.#inner.beginRun(identity, options)
     // Do not replace a complete durable prefix with an empty current run. `admit()` is the first
     // actual mutation and persists immediately; if the process dies between beginRun and admit,
     // retaining the previous snapshot is the only state that can still resume useful work.
@@ -136,8 +137,8 @@ class PersistentWorkflowJournalRun implements WorkflowJournalRun {
     this.#persist()
   }
 
-  recordResult(decision: JournalMiss, result: unknown): void {
-    this.#inner.recordResult(decision, result)
+  recordResult(decision: JournalMiss, result: unknown, options: { successful?: boolean } = {}): void {
+    this.#inner.recordResult(decision, result, options)
     this.#persist()
   }
 
@@ -147,14 +148,35 @@ class PersistentWorkflowJournalRun implements WorkflowJournalRun {
 }
 
 function persistAtomically(filePath: string, journal: StoredJournal): void {
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
+  const directory = dirname(filePath)
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
   const temporary = `${filePath}.tmp-${process.pid}-${randomUUID()}`
   try {
     // Results can contain source fragments or business data. 0600 is intentional even when a user's
     // umask is permissive; standalone resume state should have the same privacy posture as provider
     // transcripts, not ordinary checked-in project files.
-    writeFileSync(temporary, `${JSON.stringify(journal)}\n`, { encoding: 'utf8', mode: 0o600 })
+    const file = openSync(temporary, 'wx', 0o600)
+    try {
+      writeFileSync(file, `${JSON.stringify(journal)}\n`, { encoding: 'utf8' })
+      // WHY rename alone is not a durable checkpoint: an OS may acknowledge the replace while the
+      // new bytes remain only in page cache. Resume correctness depends on a reported tool result
+      // surviving sudden power loss, so flush the bytes before publishing the new name.
+      fsyncSync(file)
+    } finally {
+      closeSync(file)
+    }
     renameSync(temporary, filePath)
+    if (process.platform !== 'win32') {
+      // WHY the directory is flushed after rename: fsyncing the file protects its contents, but
+      // POSIX does not promise the new directory entry survives a crash until the directory itself
+      // is synced. Windows does not expose portable directory fsync through Node.
+      const parent = openSync(directory, 'r')
+      try {
+        fsyncSync(parent)
+      } finally {
+        closeSync(parent)
+      }
+    }
   } catch (cause) {
     rmSync(temporary, { force: true })
     throw new PersistentJournalError('write-failed', `Cannot persist workflow journal: ${filePath}`, {
@@ -246,7 +268,19 @@ function parseRecord(value: unknown, filePath: string, index: number): JournalRe
       `Workflow journal result ${index + 1} has no value: ${filePath}`,
     )
   }
-  return { type: 'result', key: value.key, agentId: value.agentId, result: value.result }
+  if (value.successful !== undefined && typeof value.successful !== 'boolean') {
+    throw new PersistentJournalError(
+      'invalid-record',
+      `Workflow journal result ${index + 1} has an invalid success marker: ${filePath}`,
+    )
+  }
+  return {
+    type: 'result',
+    key: value.key,
+    agentId: value.agentId,
+    result: value.result,
+    ...(value.successful === undefined ? {} : { successful: value.successful }),
+  }
 }
 
 function parseSessions(value: unknown, filePath: string): JournalSessionRecord[] {

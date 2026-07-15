@@ -7,7 +7,7 @@ import type {
   WorkerWorkflowTarget,
   WorkflowWorkerLimits,
 } from './workerMessages.js'
-import { serializeWorkerError } from './workerMessages.js'
+import { serializeWorkerError, WORKFLOW_WORKER_HEARTBEAT_INTERVAL_MS } from './workerMessages.js'
 
 type PendingRequest = {
   resolve(value: unknown): void
@@ -38,6 +38,7 @@ let timerSequence = 0
 const pendingAgents = new Map<string, PendingRequest>()
 const pendingWorkflows = new Map<string, PendingRequest>()
 const timers = new Map<number, NodeJS.Timeout>()
+let heartbeatTimer: NodeJS.Timeout | undefined
 
 type ElectronParentPort = {
   postMessage(message: WorkerToParentMessage): void
@@ -108,6 +109,8 @@ function pendingRealmRequest(resolveRealm: RealmResolve, rejectRealm: RealmRejec
 function finish(message: Extract<WorkerToParentMessage, { type: 'complete' | 'failed' }>): void {
   if (terminal) return
   terminal = true
+  if (heartbeatTimer) clearInterval(heartbeatTimer)
+  heartbeatTimer = undefined
   clearTimers()
   rejectPending(new Error('Workflow ended before a pending request completed'))
 
@@ -498,6 +501,17 @@ async function execute(message: Extract<ParentToWorkerMessage, { type: 'start' }
   limits = message.limits
   budgetTotal = message.budgetTotal
   budgetSpent = message.budgetSpent
+  // Start only after the parent provides its watchdog policy. A hard-coded 5s emitter paired with
+  // a valid 1s parent deadline deterministically killed a healthy evaluator before its first tick.
+  heartbeatTimer = setInterval(() => {
+    if (terminal) return
+    send({
+      type: 'heartbeat',
+      pendingRequests: pendingAgents.size + pendingWorkflows.size,
+      timers: timers.size,
+    })
+  }, message.heartbeatIntervalMs)
+  heartbeatTimer.unref?.()
 
   const sandbox = Object.create(null) as Record<string, unknown>
   sandbox.__workflowBridge = makeBridge(message.metadataPhases)

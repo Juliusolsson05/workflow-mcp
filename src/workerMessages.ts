@@ -1,3 +1,6 @@
+/** Evaluator liveness cadence; parent policy validation must leave room for at least one tick. */
+export const WORKFLOW_WORKER_HEARTBEAT_INTERVAL_MS = 5_000
+
 export type WorkflowWorkerLimits = {
   maxCollectionItems: number
   maxLogCharacters: number
@@ -34,6 +37,7 @@ export type ParentToWorkerMessage =
       budgetTotal: number | null
       budgetSpent: number
       metadataPhases: string[]
+      heartbeatIntervalMs: number
       limits: WorkflowWorkerLimits
     }
   | {
@@ -59,6 +63,11 @@ export type ParentToWorkerMessage =
 
 export type WorkerToParentMessage =
   | { type: 'ready' }
+  | {
+      type: 'heartbeat'
+      pendingRequests: number
+      timers: number
+    }
   | { type: 'phase'; title: string; firstSeen: boolean }
   | { type: 'log'; level: 'log' | 'info' | 'warn' | 'error'; text: string }
   | {

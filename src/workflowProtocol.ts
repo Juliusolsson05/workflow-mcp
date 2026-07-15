@@ -21,7 +21,14 @@ export type WorkflowRunManifest = {
   createdAt: string
   updatedAt: string
   idempotencyKey?: string
+  /** Transport scope used to reconstruct the same provider/MCP client after a host restart. */
+  clientId?: string
   resumedFromRunId?: string
+  /** Root run shared by manual and automatic recovery descendants. */
+  lineageId?: string
+  recoveryMode?: 'manual' | 'automatic'
+  /** Persisted decision; recovery must not reinterpret a later host's provider configuration. */
+  automaticReplaySafe?: boolean
   cancellationReason?: string
   error?: string
 }
