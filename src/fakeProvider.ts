@@ -40,6 +40,7 @@ export type FakeProviderOutcome =
       message: string
       code?: string
       retryable?: boolean
+      circuitImpact?: 'infrastructure' | 'neutral'
     }
   | { type: 'error'; error: Error }
   | { type: 'wait-for-abort' }
@@ -204,6 +205,7 @@ async function settleOutcome(
       throw new AgentProviderFailure(outcome.message, {
         ...(outcome.code === undefined ? {} : { code: outcome.code }),
         ...(outcome.retryable === undefined ? {} : { retryable: outcome.retryable }),
+        ...(outcome.circuitImpact === undefined ? {} : { circuitImpact: outcome.circuitImpact }),
         providerSession,
       })
     case 'error':

@@ -6,10 +6,13 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   renameSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -44,6 +47,10 @@ export type ProcessOwnedCodexHostOptions = {
   codexOptions: SerializedCodexHostOptions
   modelAliases: Readonly<Record<string, string | null>>
   configurationIsolation?: CodexConfigurationIsolation
+}
+
+export type ProcessOwnedCodexExecutionOptions = {
+  allowFreshSessionFallback?: boolean
 }
 
 type HostTerminalMessage = Extract<ProviderHostToParentMessage, { type: 'result' | 'error' }>
@@ -95,7 +102,11 @@ export class ProcessOwnedCodexHost {
     }
   }
 
-  execute(request: AgentRequest, context: AgentProviderExecutionContext): Promise<AgentProviderResult> {
+  execute(
+    request: AgentRequest,
+    context: AgentProviderExecutionContext,
+    executionOptions: ProcessOwnedCodexExecutionOptions = {},
+  ): Promise<AgentProviderResult> {
     if (context.signal.aborted) return Promise.reject(new AgentProviderAbortError(context.signal.reason))
     const identity = context.attempt ?? {
       runId: 'direct',
@@ -107,9 +118,14 @@ export class ProcessOwnedCodexHost {
       return Promise.reject(new Error(`Provider attempt already exists: ${identity.attemptId}`))
     }
 
-    const codexOptions = this.#configurationIsolation === undefined
-      ? this.#codexOptions
-      : prepareIsolatedCodexOptions(this.#codexOptions, this.#configurationIsolation)
+    const prepared = this.#configurationIsolation === undefined
+      ? { codexOptions: this.#codexOptions, request, restartedSession: false }
+      : prepareIsolatedCodexAttempt(
+          this.#codexOptions,
+          this.#configurationIsolation,
+          request,
+          executionOptions.allowFreshSessionFallback === true,
+        )
 
     let resolveResult!: (result: AgentProviderResult) => void
     let rejectResult!: (error: unknown) => void
@@ -134,7 +150,13 @@ export class ProcessOwnedCodexHost {
       resolve: resolveResult,
       reject: rejectResult,
       context,
-      delivery: Promise.resolve(),
+      delivery: prepared.restartedSession
+        ? context.emit({
+            type: 'warning',
+            code: 'codex-session-restarted',
+            message: `Recorded Codex session ${request.session?.id ?? 'unknown'} was unavailable; starting a fresh replay-safe thread with the original assignment and recovery context`,
+          })
+        : Promise.resolve(),
       stderr: '',
       abortRequested: false,
       settled: false,
@@ -173,8 +195,8 @@ export class ProcessOwnedCodexHost {
 
     sendIfConnected(child, {
       type: 'start',
-      request,
-      options: codexOptions,
+      request: prepared.request,
+      options: prepared.codexOptions,
       modelAliases: this.#modelAliases,
       heartbeatIntervalMs: HOST_HEARTBEAT_INTERVAL_MS,
     })
@@ -286,27 +308,132 @@ multi_agent = false
 enable_fanout = false
 `
 
-function prepareIsolatedCodexOptions(
+function prepareIsolatedCodexAttempt(
   options: SerializedCodexHostOptions,
   isolation: CodexConfigurationIsolation,
-): SerializedCodexHostOptions {
+  request: AgentRequest,
+  allowFreshSessionFallback: boolean,
+): {
+  codexOptions: SerializedCodexHostOptions
+  request: AgentRequest
+  restartedSession: boolean
+} {
   const codexHome = resolve(isolation.codexHome)
   mkdirSync(codexHome, { recursive: true, mode: 0o700 })
   writePrivateFileAtomically(resolve(codexHome, 'config.toml'), ISOLATED_CODEX_CONFIG)
-  if (isolation.authenticationFile !== undefined && existsSync(isolation.authenticationFile)) {
-    copyPrivateFileAtomically(resolve(isolation.authenticationFile), resolve(codexHome, 'auth.json'))
+  synchronizeIsolatedAuthentication(isolation.authenticationFile, resolve(codexHome, 'auth.json'))
+
+  let effectiveRequest = request
+  let restartedSession = false
+  if (request.session !== undefined) {
+    const available = ensureSessionAvailable(codexHome, isolation.sessionSourceHome, request.session.id)
+    if (!available && allowFreshSessionFallback) {
+      // WHY omitting `session` is safe only behind the caller's replay attestation: the recovery
+      // input builder will include the original assignment plus the recovery note for this fresh
+      // thread. Blindly doing this for a mail/database-capable workflow could duplicate an
+      // uncertain external effect, so unsafe requests retain the old session and fail closed.
+      const { session: _unavailableSession, recovery, ...withoutSession } = request
+      effectiveRequest = {
+        ...withoutSession,
+        ...(recovery === undefined
+          ? {}
+          : {
+              recovery: {
+                ...recovery,
+                reason: `${recovery.reason}; recorded Codex session ${request.session.id} was unavailable`,
+                note: `${recovery.note}\n\nThe recorded Codex thread is unavailable in this isolated runtime. Start from the original assignment included in this turn, inspect current repository state, and do not assume prior unrecorded actions completed.`,
+              },
+            }),
+      }
+      restartedSession = true
+    }
   }
 
   return {
-    ...options,
-    // Supplying env to the SDK replaces, rather than augments, its process environment. Preserve
-    // the parent's explicit allowlist and pin only CODEX_HOME; no normal user configuration path
-    // remains reachable through the provider process.
-    env: {
-      ...(options.env ?? {}),
-      CODEX_HOME: codexHome,
+    request: effectiveRequest,
+    restartedSession,
+    codexOptions: {
+      ...options,
+      // Supplying env to the SDK replaces, rather than augments, its process environment. Preserve
+      // the parent's explicit allowlist and pin only CODEX_HOME; no normal user configuration path
+      // remains reachable through the provider process.
+      env: {
+        ...(options.env ?? {}),
+        CODEX_HOME: codexHome,
+      },
     },
   }
+}
+
+function synchronizeIsolatedAuthentication(sourcePath: string | undefined, destination: string): void {
+  if (sourcePath === undefined) return
+  const source = resolve(sourcePath)
+  if (!existsSync(source)) {
+    // The source file's absence is the only durable logout signal exposed by today's Agent Code
+    // integration. Keeping yesterday's isolated copy would let background workflows continue
+    // authenticating after the user explicitly logged out. Missing files therefore revoke the
+    // isolated credential as well; ENOENT is harmless if concurrent attempts observe the same
+    // transition.
+    try {
+      unlinkSync(destination)
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
+    }
+    return
+  }
+
+  if (existsSync(destination) && statSync(destination).mtimeMs >= statSync(source).mtimeMs) {
+    // Codex can rotate refresh tokens inside the isolated home. Blindly copying the interactive
+    // seed before every attempt resurrects an older one-time refresh token and causes the next
+    // agent to fail with refresh_token_reused. A newer isolated file is authoritative; a newer
+    // interactive file still wins so an explicit re-login/account switch propagates.
+    return
+  }
+  copyPrivateFileAtomically(source, destination)
+}
+
+function ensureSessionAvailable(
+  codexHome: string,
+  sessionSourceHome: string | undefined,
+  sessionId: string,
+): boolean {
+  const isolatedSessions = join(codexHome, 'sessions')
+  if (findSessionRollout(isolatedSessions, sessionId) !== undefined) return true
+  if (sessionSourceHome === undefined) return false
+
+  const sourceSessions = join(resolve(sessionSourceHome), 'sessions')
+  const source = findSessionRollout(sourceSessions, sessionId)
+  if (source === undefined) return false
+  const sourceRelativePath = relative(sourceSessions, source)
+  if (sourceRelativePath.startsWith('..') || resolve(sourceSessions, sourceRelativePath) !== source) {
+    throw new AgentProviderFailure('Codex session import escaped its configured source home', {
+      code: 'codex-session-import-unsafe',
+      circuitImpact: 'neutral',
+    })
+  }
+
+  const destination = join(isolatedSessions, sourceRelativePath)
+  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 })
+  copyPrivateFileAtomically(source, destination)
+  return true
+}
+
+function findSessionRollout(sessionsRoot: string, sessionId: string): string | undefined {
+  if (!existsSync(sessionsRoot)) return undefined
+  const suffix = `-${sessionId}.jsonl`
+  const pending = [resolve(sessionsRoot)]
+  while (pending.length > 0) {
+    const directory = pending.pop()!
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      // Session roots are private local state, but skipping symlinks keeps an accidentally linked
+      // directory from turning one exact-session import into an unbounded filesystem traversal.
+      if (entry.isSymbolicLink()) continue
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) pending.push(path)
+      else if (entry.isFile() && entry.name.endsWith(suffix)) return path
+    }
+  }
+  return undefined
 }
 
 function writePrivateFileAtomically(path: string, contents: string): void {

@@ -75,6 +75,11 @@ export type CodexConfigurationIsolation = {
   codexHome: string
   /** Optional login copied into the isolated home before each host starts. */
   authenticationFile?: string
+  /**
+   * Optional pre-isolation Codex home from which the exact requested rollout may be imported.
+   * Configuration, plugins, apps, and unrelated sessions are never copied.
+   */
+  sessionSourceHome?: string
 }
 
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -197,7 +202,15 @@ export class CodexAgentProvider implements AgentProvider {
     request: AgentRequest,
     context: AgentProviderExecutionContext,
   ): Promise<AgentProviderResult> {
-    if (this.#host) return this.#host.execute(request, context)
+    if (this.#host) {
+      return this.#host.execute(request, context, {
+        // A fresh thread repeats the original logical assignment. Only authorize that fallback
+        // after the same request-aware replay assessment used by the runtime has proved all
+        // reachable effects read-only/idempotent. Session import itself remains allowed for
+        // unsafe requests because it preserves rather than duplicates the provider turn.
+        allowFreshSessionFallback: this.assessReplaySafety(request).automatic,
+      })
+    }
     if (!this.#client) throw new Error('Codex provider has neither a client nor a process host')
     return executeCodexTurn(this.#client, request, context, this.#modelAliases)
   }
@@ -330,6 +343,21 @@ export async function executeCodexTurn(
         throw new AgentProviderAbortError(context.signal.reason ?? error)
       }
       if (error instanceof AgentProviderFailure) throw error
+      if (request.session !== undefined && isMissingCodexRollout(error)) {
+        throw new AgentProviderFailure(
+          `Codex session ${request.session.id} is unavailable in the configured Codex home`,
+          {
+            code: 'codex-session-unavailable',
+            // The same request can become runnable after an operator restores/imports the rollout,
+            // but this is not evidence that Codex itself is down. Keeping it retryable permits a
+            // replay-safe supervisor to recover while circuitImpact prevents global starvation.
+            retryable: true,
+            circuitImpact: 'neutral',
+            providerSession: request.session,
+            cause: error,
+          },
+        )
+      }
       throw new AgentProviderFailure(
         `Codex SDK execution failed: ${error instanceof Error ? error.message : String(error)}`,
         {
@@ -372,6 +400,11 @@ export async function executeCodexTurn(
         ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
       },
     }
+}
+
+function isMissingCodexRollout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /thread\/resume failed: no rollout found for thread id\b/i.test(message)
 }
 
 function codexThreadOptions(

@@ -202,6 +202,16 @@ export type AgentProvider = {
 export type AgentProviderFailureOptions = {
   code?: string
   retryable?: boolean
+  /**
+   * Whether this failure says the provider itself is unavailable.
+   *
+   * WHY retryability is not enough: a missing provider-session file can be safe to recover with a
+   * fresh thread, but it is deterministic and local to one logical agent. Treating every
+   * retryable failure as an outage lets five corrupt/stale sessions open a service-wide circuit
+   * and serialize unrelated healthy workflows. Providers therefore mark request-local failures
+   * neutral while transport/process/rate-limit failures retain the infrastructure default.
+   */
+  circuitImpact?: 'infrastructure' | 'neutral'
   providerSession?: ProviderSessionReference
   cause?: unknown
 }
@@ -214,6 +224,7 @@ export type AgentProviderFailureOptions = {
 export class AgentProviderFailure extends Error {
   readonly code?: string
   readonly retryable: boolean
+  readonly circuitImpact: 'infrastructure' | 'neutral'
   readonly providerSession?: ProviderSessionReference
 
   constructor(message: string, options: AgentProviderFailureOptions = {}) {
@@ -222,6 +233,7 @@ export class AgentProviderFailure extends Error {
     this.name = 'AgentProviderFailure'
     if (options.code !== undefined) this.code = options.code
     this.retryable = options.retryable ?? false
+    this.circuitImpact = options.circuitImpact ?? (this.retryable ? 'infrastructure' : 'neutral')
     if (options.providerSession !== undefined) this.providerSession = options.providerSession
   }
 }

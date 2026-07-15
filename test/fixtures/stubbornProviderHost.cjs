@@ -18,6 +18,7 @@ process.on('message', (message) => {
   })
   writeFileSync(message.request.prompt, String(grandchild.pid))
   writeFileSync(`${message.request.prompt}.options.json`, JSON.stringify(message.options))
+  writeFileSync(`${message.request.prompt}.request.json`, JSON.stringify(message.request))
   process.send?.({ type: 'ready', pid: process.pid })
   setInterval(() => undefined, 1_000)
 })
