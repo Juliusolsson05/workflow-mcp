@@ -70,7 +70,9 @@ from its strict cursor stream after a renderer reload or provider reconnect:
   manifest.json
   workflow.js
   args.json
-  journal.json
+  transcripts/
+    journal.jsonl
+    agent-<id>.jsonl
   events.jsonl
   artifacts/
 ```
@@ -100,6 +102,13 @@ The eight stable tools are `workflow_list`, `workflow_describe`, `workflow_valid
 `workflow_resume`. Machine results are returned as both `structuredContent` and JSON text so Claude
 and Codex transcript envelopes preserve the same run ID. `workflow_run_events` is bounded long
 polling over the durable cursor, not a transport-specific notification protocol.
+
+`workflow_run` accepts Claude's `scriptPath > script > name` source precedence. Inline scripts are
+validated and persisted at the Git project root under `.claude/workflows`, then the result returns
+that editable `scriptPath`; existing definitions are never overwritten implicitly. Every execution
+also keeps immutable private run bytes and returns a `transcriptDirectory` containing the current
+`journal.jsonl` snapshot and per-agent JSONL event mirrors. The MCP initialization instructions and
+tool descriptions carry this author-run-edit-poll loop so clients do not need repository context.
 
 Managed resume creates a new run with `resumedFromRunId`; it never appends a second execution to an
 old event stream. The same tool can import a Claude run with `{ claudeRunPath, workflowPath? }`.

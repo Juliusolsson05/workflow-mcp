@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto'
+import { COPYFILE_EXCL } from 'node:constants'
 import { createReadStream } from 'node:fs'
 import {
   chmod,
+  copyFile,
   mkdir,
   open,
   readFile,
@@ -288,7 +290,7 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   journalPath(runId: string): string {
-    return join(this.#runDirectory(runId), 'journal.json')
+    return join(this.transcriptDirectory(runId), 'journal.jsonl')
   }
 
   transcriptDirectory(runId: string): string {
@@ -373,6 +375,15 @@ export class FileWorkflowStore implements WorkflowStore {
     this.#snapshotCache.delete(runId)
     const manifest = await this.getManifest(runId)
     if (!manifest) return
+    await mkdir(this.transcriptDirectory(runId), { recursive: true, mode: 0o700 })
+    const legacyJournal = join(this.#runDirectory(runId), 'journal.json')
+    const currentJournal = this.journalPath(runId)
+    await copyFile(legacyJournal, currentJournal, COPYFILE_EXCL).catch((error: NodeJS.ErrnoException) => {
+      // Missing legacy state is normal for runs created after the transcript layout changed. Never
+      // overwrite the new journal: its atomic snapshots may already be ahead of the retained
+      // compatibility copy after a resumed process wrote more agent results.
+      if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error
+    })
     const path = this.#eventsPath(runId)
     let handle
     try {

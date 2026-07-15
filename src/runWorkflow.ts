@@ -200,35 +200,61 @@ function deferred<Value>(): Deferred<Value> {
 }
 
 class WorkflowEventStream implements AsyncIterable<WorkflowEvent> {
-  readonly #events: WorkflowEvent[] = []
-  readonly #waiters = new Set<() => void>()
+  readonly #subscribers = new Set<{
+    queue: WorkflowEvent[]
+    wake: (() => void) | undefined
+  }>()
   #closed = false
 
   publish(event: WorkflowEvent): void {
     if (this.#closed) return
-    this.#events.push(event)
-    for (const wake of this.#waiters) wake()
-    this.#waiters.clear()
+    for (const subscriber of this.#subscribers) {
+      subscriber.queue.push(event)
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
   }
 
   close(): void {
     this.#closed = true
-    for (const wake of this.#waiters) wake()
-    this.#waiters.clear()
+    for (const subscriber of this.#subscribers) {
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
   }
 
   [Symbol.asyncIterator](): AsyncIterator<WorkflowEvent> {
-    let cursor = 0
+    // WHY events are queued per active iterator instead of retained globally: WorkflowService uses
+    // the durable eventSink and intentionally never consumes this convenience stream. The old
+    // replay array therefore held every activity for the lifetime of every app-owned run even
+    // though no reader could observe it. Direct runWorkflow/CLI callers attach synchronously (all
+    // publishing is serialized through a promise turn) and retain lossless live delivery, while an
+    // unused stream now costs constant memory.
+    const subscriber: { queue: WorkflowEvent[]; wake: (() => void) | undefined } = {
+      queue: [],
+      wake: undefined,
+    }
+    this.#subscribers.add(subscriber)
+    const remove = (): void => {
+      this.#subscribers.delete(subscriber)
+      subscriber.queue.length = 0
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
     return {
       next: async (): Promise<IteratorResult<WorkflowEvent>> => {
-        while (cursor >= this.#events.length && !this.#closed) {
-          await new Promise<void>((resolveWait) => this.#waiters.add(resolveWait))
+        while (subscriber.queue.length === 0 && !this.#closed) {
+          await new Promise<void>((resolveWait) => { subscriber.wake = resolveWait })
         }
-        const event = this.#events[cursor]
+        const event = subscriber.queue.shift()
         if (event !== undefined) {
-          cursor += 1
           return { done: false, value: event }
         }
+        remove()
+        return { done: true, value: undefined }
+      },
+      return: async (): Promise<IteratorResult<WorkflowEvent>> => {
+        remove()
         return { done: true, value: undefined }
       },
     }
