@@ -8,7 +8,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 
 import type { WorkflowService, WorkflowServiceScope } from './workflowService.js'
-import { registerWorkflowMcpTools } from './workflowMcp.js'
+import { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
 
 export type WorkflowMcpHttpServer = {
   host: '127.0.0.1'
@@ -19,7 +19,15 @@ export type WorkflowMcpHttpServer = {
 }
 
 function createServerWithTools(service: WorkflowService, scope: WorkflowServiceScope): McpServer {
-  const server = new McpServer({ name: 'workflow-mcp', version: '0.0.0' })
+  const server = new McpServer(
+    { name: 'workflow-mcp', version: '0.0.0' },
+    {
+      // MCP initialization instructions are the only guidance guaranteed to reach a client before
+      // it chooses a tool. Keeping the authoring loop here prevents success from depending on a
+      // model having read this repository or previously seen Claude's private Workflow prompt.
+      instructions: WORKFLOW_MCP_INSTRUCTIONS,
+    },
+  )
   registerWorkflowMcpTools(server, service, scope)
   return server
 }

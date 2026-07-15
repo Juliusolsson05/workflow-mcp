@@ -11,6 +11,11 @@ import type { LoadedWorkflow } from './loadWorkflow.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 import { runWorkflow } from './runWorkflow.js'
 import type { WorkflowLimits, WorkflowRun } from './runWorkflow.js'
+import {
+  loadScopedWorkflowPath,
+  persistInlineWorkflow,
+  WorkflowAuthoringError,
+} from './workflowAuthoring.js'
 import type { WorkflowEvent } from './workflowEvents.js'
 import type { WorkflowWorkerLauncher } from './workerLauncher.js'
 import type {
@@ -59,6 +64,8 @@ export type WorkflowRunStartResult = {
     description: string
   }
   cursor: number
+  /** Editable Claude-visible definition. The private run store separately snapshots these bytes. */
+  scriptPath?: string
   resumedFromRunId?: string
 }
 
@@ -80,9 +87,16 @@ export class WorkflowServiceError extends Error {
   }
 }
 
-type StartInput = {
-  name: string
+export type WorkflowStartInput = {
+  /** Lowest-precedence source selector, matching Claude's Workflow tool. */
+  name?: string
+  /** Inline Claude-compatible workflow source; persisted before execution. */
+  script?: string
+  /** Highest-precedence source selector, scoped to visible .claude/workflows directories. */
+  scriptPath?: string
   args?: unknown
+  /** Claude-shaped resume alias; creates a new durable run and preserves the lineage. */
+  resumeFromRunId?: string
   idempotencyKey?: string
 }
 
@@ -170,7 +184,7 @@ export class WorkflowService {
     return { valid: true, workflow: await this.describe(scope, input) }
   }
 
-  async start(scope: WorkflowServiceScope, input: StartInput): Promise<WorkflowRunStartResult> {
+  async start(scope: WorkflowServiceScope, input: WorkflowStartInput): Promise<WorkflowRunStartResult> {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
     const existing = input.idempotencyKey === undefined
@@ -180,7 +194,15 @@ export class WorkflowService {
       this.#assertScope(scope, existing)
       return startResult(existing)
     }
-    const workflow = await this.#resolveVisibleWorkflow(scope, input.name)
+
+    if (input.resumeFromRunId !== undefined) {
+      return this.#resumeStored(scope, {
+        runId: input.resumeFromRunId,
+        ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+      }, input)
+    }
+
+    const workflow = await this.#resolveStartWorkflow(scope, input)
     return this.#startLoaded(scope, workflow, {
       ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
@@ -240,6 +262,14 @@ export class WorkflowService {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
     if ('claudeRunPath' in input) return this.#resumeClaude(scope, input)
+    return this.#resumeStored(scope, input)
+  }
+
+  async #resumeStored(
+    scope: WorkflowServiceScope,
+    input: Extract<WorkflowResumeInput, { runId: string }>,
+    overrides?: WorkflowStartInput,
+  ): Promise<WorkflowRunStartResult> {
     const original = await this.status(scope, input.runId)
     if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
       throw new WorkflowServiceError(
@@ -252,12 +282,23 @@ export class WorkflowService {
       if (existing) return startResult(existing)
     }
 
-    const workflow = await this.#options.store.loadWorkflow(input.runId)
-    const args = await this.#options.store.loadArgs(input.runId)
+    const originalWorkflow = await this.#options.store.loadWorkflow(input.runId)
+    const hasSourceOverride = overrides?.scriptPath !== undefined || overrides?.script !== undefined || overrides?.name !== undefined
+    const workflow = hasSourceOverride
+      ? await this.#resolveStartWorkflow(scope, overrides ?? {})
+      : originalWorkflow
+    const originalArgs = await this.#options.store.loadArgs(input.runId)
+    const args = overrides !== undefined && Object.prototype.hasOwnProperty.call(overrides, 'args')
+      ? { provided: true, value: overrides.args }
+      : originalArgs
     const priorJournal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(input.runId),
     )
-    const workflowId = workflow.filePath ?? workflow.meta.name
+    // WHY the old identity is used to retrieve the snapshot: `scriptPath` may point at edited
+    // bytes, but its stable path is precisely what allows beginRun to compare the prior source hash
+    // and invalidate only when the source actually changed. Looking up with a newly selected name
+    // would silently discard resumable history before the journal can make that decision.
+    const workflowId = originalWorkflow.filePath ?? originalWorkflow.meta.name
     const priorSnapshot = priorJournal.getSnapshot(workflowId)
     return this.#startLoaded(scope, workflow, {
       ...(args.provided ? { args: args.value } : {}),
@@ -265,6 +306,31 @@ export class WorkflowService {
       resumedFromRunId: input.runId,
       ...(priorSnapshot === undefined ? {} : { journalSnapshots: [priorSnapshot] }),
     })
+  }
+
+  async #resolveStartWorkflow(
+    scope: WorkflowServiceScope,
+    input: Pick<WorkflowStartInput, 'name' | 'script' | 'scriptPath'>,
+  ): Promise<LoadedWorkflow> {
+    const cwd = resolve(scope.cwd)
+    try {
+      // Claude's precedence is intentional: authoring clients commonly keep `name` in a reusable
+      // payload while adding script/scriptPath during iteration. Rejecting that combination would
+      // make a harmless stale selector override the bytes the user explicitly asked to test.
+      if (input.scriptPath !== undefined) return await loadScopedWorkflowPath(cwd, input.scriptPath)
+      if (input.script !== undefined) return await persistInlineWorkflow(cwd, input.script)
+      if (input.name !== undefined) return await this.#resolveVisibleWorkflow(scope, input.name)
+    } catch (cause) {
+      if (cause instanceof WorkflowAuthoringError) {
+        const code = cause.code === 'path-forbidden' ? 'scope-forbidden' : 'invalid-request'
+        throw new WorkflowServiceError(code, cause.message, { cause })
+      }
+      throw cause
+    }
+    throw new WorkflowServiceError(
+      'invalid-request',
+      'workflow_run requires one source selector: scriptPath, script, or name',
+    )
   }
 
   async #resumeClaude(
@@ -474,6 +540,7 @@ function startResult(manifest: WorkflowRunManifest): WorkflowRunStartResult {
       ...(manifest.workflow.title === undefined ? {} : { title: manifest.workflow.title }),
     },
     cursor: manifest.cursor,
+    ...(manifest.workflow.filePath === undefined ? {} : { scriptPath: manifest.workflow.filePath }),
     ...(manifest.resumedFromRunId === undefined
       ? {}
       : { resumedFromRunId: manifest.resumedFromRunId }),

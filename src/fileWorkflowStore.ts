@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { createReadStream } from 'node:fs'
 import {
   chmod,
   mkdir,
@@ -8,10 +9,10 @@ import {
   rename,
   rm,
   stat,
-  truncate,
   writeFile,
 } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
 
 import { parseWorkflowSource } from './loadWorkflow.js'
 import type { WorkflowEvent } from './workflowEvents.js'
@@ -39,6 +40,7 @@ const RUN_STATUSES = new Set<WorkflowRunStatus>([
   ...TERMINAL_STATUSES,
 ])
 const MAX_EVENT_FILE_BYTES = 512 * 1024 * 1024
+const EVENT_INDEX_STRIDE = 256
 
 export class WorkflowStoreError extends Error {
   readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'io-error'
@@ -61,6 +63,8 @@ export class WorkflowStoreError extends Error {
 export class FileWorkflowStore implements WorkflowStore {
   readonly rootDirectory: string
   readonly runsDirectory: string
+  readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
+  readonly #eventOffsets = new Map<string, Map<number, number>>()
 
   constructor(rootDirectory: string) {
     this.rootDirectory = resolve(rootDirectory)
@@ -189,7 +193,9 @@ export class FileWorkflowStore implements WorkflowStore {
     }
     const path = this.#eventsPath(runId)
     const handle = await open(path, 'a', 0o600)
+    let eventOffset = 0
     try {
+      eventOffset = (await handle.stat()).size
       await handle.writeFile(`${JSON.stringify(stored)}\n`, 'utf8')
       // Persist-before-publish is a user-visible guarantee: renderer replay after a crash must
       // include every event that IPC or MCP ever acknowledged. Awaiting fsync is intentionally
@@ -200,28 +206,61 @@ export class FileWorkflowStore implements WorkflowStore {
     }
 
     await this.#writeManifest(applyEventToManifest(manifest, stored))
+    if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) {
+      const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()
+      offsets.set(cursor, eventOffset)
+      this.#eventOffsets.set(runId, offsets)
+    }
+    const cached = this.#snapshotCache.get(runId)
+    if (cached?.cursor === manifest.cursor) {
+      this.#snapshotCache.set(runId, {
+        cursor,
+        state: reduceWorkflowState(cached.state, event),
+      })
+    } else if (cached !== undefined) {
+      // A cache gap means an append raced initial replay or recovery changed the durable cursor.
+      // Dropping the projection is cheaper and safer than attempting to infer the missing event.
+      this.#snapshotCache.delete(runId)
+    }
     return stored
   }
 
   async readEvents(runId: string, after: number, limit: number): Promise<WorkflowEventPage> {
     const manifest = await this.#requiredManifest(runId)
-    const events = await this.#readAllEvents(runId)
-    const selected = events.filter((event) => event.cursor > after).slice(0, limit)
+    const selected: StoredWorkflowEvent[] = []
+    for await (const event of this.#events(runId, Number.MAX_SAFE_INTEGER, after)) {
+      if (event.cursor <= after) continue
+      selected.push(event)
+      // One look-ahead record answers hasMore without retaining or parsing the rest of a history
+      // that may contain hundreds of thousands of provider activity events.
+      if (selected.length > limit) break
+    }
+    const hasMore = selected.length > limit
+    if (hasMore) selected.pop()
     return {
       runId,
       cwd: manifest.cwd,
       fromCursor: after,
       toCursor: selected.at(-1)?.cursor ?? after,
       events: selected,
-      hasMore: events.some((event) => event.cursor > (selected.at(-1)?.cursor ?? after)),
+      hasMore,
     }
   }
 
   async snapshot(runId: string): Promise<WorkflowRunSnapshot> {
     const manifest = await this.#requiredManifest(runId)
-    const events = await this.#readAllEvents(runId)
+    const cached = this.#snapshotCache.get(runId)
+    if (cached?.cursor === manifest.cursor) {
+      return { manifest, state: cached.state, cursor: manifest.cursor }
+    }
     let state = createWorkflowState(runId)
-    for (const stored of events) state = reduceWorkflowState(state, stored.event)
+    for await (const stored of this.#events(runId, manifest.cursor)) {
+      state = reduceWorkflowState(state, stored.event)
+    }
+    const newerCache = this.#snapshotCache.get(runId)
+    if (newerCache === undefined || newerCache.cursor <= manifest.cursor) {
+      this.#snapshotCache.set(runId, { cursor: manifest.cursor, state })
+    }
     return { manifest, state, cursor: manifest.cursor }
   }
 
@@ -256,15 +295,33 @@ export class FileWorkflowStore implements WorkflowStore {
     return manifest
   }
 
-  async #readAllEvents(runId: string): Promise<StoredWorkflowEvent[]> {
+  async *#events(
+    runId: string,
+    throughCursor = Number.MAX_SAFE_INTEGER,
+    nearCursor = 0,
+  ): AsyncGenerator<StoredWorkflowEvent> {
     const path = this.#eventsPath(runId)
     const info = await stat(path)
     if (info.size > MAX_EVENT_FILE_BYTES) {
       throw new WorkflowStoreError('corrupt-store', `Workflow event log is too large: ${path}`)
     }
-    const text = await readFile(path, 'utf8')
-    const events: StoredWorkflowEvent[] = []
-    for (const [index, line] of text.split('\n').entries()) {
+    const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()
+    this.#eventOffsets.set(runId, offsets)
+    let startCursor = 1
+    let startOffset = 0
+    for (const [indexedCursor, indexedOffset] of offsets) {
+      if (indexedCursor > nearCursor + 1 || indexedCursor < startCursor) continue
+      startCursor = indexedCursor
+      startOffset = indexedOffset
+    }
+    const lines = createInterface({
+      input: createReadStream(path, { encoding: 'utf8', start: startOffset }),
+      crlfDelay: Infinity,
+    })
+    let cursor = startCursor - 1
+    let lineNumber = 0
+    for await (const line of lines) {
+      lineNumber += 1
       if (line.length === 0) continue
       let value: unknown
       try {
@@ -272,50 +329,71 @@ export class FileWorkflowStore implements WorkflowStore {
       } catch (cause) {
         throw new WorkflowStoreError(
           'corrupt-store',
-          `Workflow event ${index + 1} is invalid JSON: ${path}`,
+          `Workflow event ${lineNumber} is invalid JSON: ${path}`,
           { cause },
         )
       }
-      events.push(parseStoredEvent(value, runId, events.length + 1, path))
+      cursor += 1
+      if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
+      const event = parseStoredEvent(value, runId, cursor, path)
+      yield event
+      startOffset += Buffer.byteLength(line, 'utf8') + 1
+      if (cursor >= throughCursor) break
     }
-    return events
   }
 
   async #recoverEventTail(runId: string): Promise<void> {
+    this.#eventOffsets.delete(runId)
+    this.#snapshotCache.delete(runId)
     const manifest = await this.getManifest(runId)
     if (!manifest) return
     const path = this.#eventsPath(runId)
-    let text: string
+    let handle
     try {
-      text = await readFile(path, 'utf8')
+      handle = await open(path, 'r+')
     } catch (cause) {
       throw new WorkflowStoreError('corrupt-store', `Cannot read workflow events: ${path}`, { cause })
     }
-    if (text.length > 0 && !text.endsWith('\n')) {
-      const finalBreak = text.lastIndexOf('\n')
-      const tail = text.slice(finalBreak + 1)
-      let completeRecord = true
-      try {
-        JSON.parse(tail)
-      } catch {
-        completeRecord = false
-      }
-      if (completeRecord) {
-        const handle = await open(path, 'a', 0o600)
-        try {
-          await handle.writeFile('\n', 'utf8')
-          await handle.sync()
-        } finally {
-          await handle.close()
+    try {
+      const info = await handle.stat()
+      if (info.size > 0) {
+        const finalByte = Buffer.alloc(1)
+        await handle.read(finalByte, 0, 1, info.size - 1)
+        if (finalByte[0] !== 0x0a) {
+          // Activity content is bounded before persistence, so one MiB is comfortably larger than
+          // a legitimate event. Reading only this tail prevents startup from allocating the entire
+          // log merely to repair one interrupted append.
+          const tailBytes = Math.min(info.size, 1024 * 1024)
+          const buffer = Buffer.alloc(tailBytes)
+          await handle.read(buffer, 0, tailBytes, info.size - tailBytes)
+          const finalBreak = buffer.lastIndexOf(0x0a)
+          if (finalBreak < 0 && info.size > tailBytes) {
+            throw new WorkflowStoreError('corrupt-store', `Workflow event tail is too large: ${path}`)
+          }
+          const tail = buffer.subarray(finalBreak + 1).toString('utf8')
+          let completeRecord = true
+          try {
+            JSON.parse(tail)
+          } catch {
+            completeRecord = false
+          }
+          if (completeRecord) {
+            await handle.write(Buffer.from('\n'), 0, 1, info.size)
+            await handle.sync()
+          } else {
+            // Only a torn final append is recoverable. The streaming parser below still rejects
+            // invalid JSON in the middle, so tail repair cannot hide older corruption.
+            await handle.truncate(info.size - tailBytes + finalBreak + 1)
+          }
         }
-      } else {
-        // Only a torn final append is recoverable. Earlier invalid JSON remains a hard error in
-        // #readAllEvents so recovery never hides mid-history corruption behind a plausible UI.
-        await truncate(path, finalBreak + 1)
       }
+    } finally {
+      await handle.close()
     }
-    const events = await this.#readAllEvents(runId)
-    const cursor = events.at(-1)?.cursor ?? 0
+    let cursor = 0
+    for await (const event of this.#events(runId)) {
+      cursor = event.cursor
+    }
     if (manifest.cursor !== cursor) {
       // A crash can land after fsyncing events.jsonl but before atomically replacing the manifest.
       // Replaying every durable event from the immutable identity fields is the only safe repair;
@@ -332,7 +410,9 @@ export class FileWorkflowStore implements WorkflowStore {
         cursor: 0,
         updatedAt: manifest.createdAt,
       }
-      for (const event of events) rebuilt = applyEventToManifest(rebuilt, event)
+      // The mismatch is rare (only a crash between event fsync and manifest rename). Rescan rather
+      // than holding the entire history in memory during every normal startup.
+      for await (const event of this.#events(runId)) rebuilt = applyEventToManifest(rebuilt, event)
       await this.#writeManifest(rebuilt)
     }
   }

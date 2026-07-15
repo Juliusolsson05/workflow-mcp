@@ -30,6 +30,15 @@ export type FindWorkflowsResult = {
   nearMisses: string[]
 }
 
+export type WorkflowSearchLayout = {
+  cwd: string
+  home: string
+  userDirectory: string
+  projectDirectories: string[]
+  /** Stable project-level destination for workflow source authored through MCP. */
+  authoredDirectory: string
+}
+
 const NEAR_MISS_EXTENSIONS = new Set(['.mjs', '.cjs', '.ts'])
 
 async function pathExists(path: string): Promise<boolean> {
@@ -57,6 +66,37 @@ async function detectProjectBoundary(cwd: string, home: string): Promise<Project
     const parent = dirname(current)
     if (parent === current) return { path: current, includeBoundary: false }
     current = parent
+  }
+}
+
+export async function resolveWorkflowSearchLayout(
+  options: FindWorkflowsOptions = {},
+): Promise<WorkflowSearchLayout> {
+  const cwd = resolve(options.cwd ?? process.cwd())
+  const home = resolve(options.homeDir ?? homedir())
+  const detectedBoundary = options.projectRoot === undefined
+    ? await detectProjectBoundary(cwd, home)
+    : undefined
+  const root = resolve(options.projectRoot ?? detectedBoundary?.path ?? cwd)
+  const includeRoot = options.projectRoot === undefined
+    ? (detectedBoundary?.includeBoundary ?? true)
+    : true
+  const directories = projectDirectories(root, cwd, includeRoot)
+
+  return {
+    cwd,
+    home,
+    userDirectory: join(home, '.claude', 'workflows'),
+    projectDirectories: directories,
+    // WHY a non-Git directory authors next to the requested cwd: the filesystem root or the
+    // user's home is only a discovery boundary, not a project identity. Writing `/.claude` or
+    // `~/.claude` here would unexpectedly turn a one-project inline workflow into global state.
+    // A real Git boundary, however, is stable when the caller starts Agent Code in a subfolder.
+    authoredDirectory: join(
+      detectedBoundary?.includeBoundary === true || options.projectRoot !== undefined ? root : cwd,
+      '.claude',
+      'workflows',
+    ),
   }
 }
 
@@ -145,11 +185,7 @@ async function readDirectory(
 }
 
 export async function findWorkflows(options: FindWorkflowsOptions = {}): Promise<FindWorkflowsResult> {
-  const cwd = resolve(options.cwd ?? process.cwd())
-  const home = resolve(options.homeDir ?? homedir())
-  const detectedBoundary = options.projectRoot === undefined ? await detectProjectBoundary(cwd, home) : undefined
-  const root = resolve(options.projectRoot ?? detectedBoundary?.path ?? cwd)
-  const includeRoot = options.projectRoot === undefined ? (detectedBoundary?.includeBoundary ?? true) : true
+  const layout = await resolveWorkflowSearchLayout(options)
   const workflows = new Map<string, FoundWorkflow>()
   const issues: WorkflowIssue[] = []
   const nearMisses: string[] = []
@@ -157,8 +193,8 @@ export async function findWorkflows(options: FindWorkflowsOptions = {}): Promise
   // Map insertion order is deliberately irrelevant: every layer may replace the same name, and
   // the public result is sorted afterward. This matches how users reason about precedence while
   // preventing filesystem enumeration order from leaking into the UI.
-  await readDirectory(join(home, '.claude', 'workflows'), 'user', workflows, issues, nearMisses)
-  for (const directory of projectDirectories(root, cwd, includeRoot)) {
+  await readDirectory(layout.userDirectory, 'user', workflows, issues, nearMisses)
+  for (const directory of layout.projectDirectories) {
     await readDirectory(directory, 'project', workflows, issues, nearMisses)
   }
 

@@ -41,7 +41,7 @@ export type CodexProviderOptions = Omit<CodexOptions, 'env'> & {
   modelAliases?: Readonly<Record<string, string | null>>
 }
 
-const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh'])
+const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const CLAUDE_MODEL_NAMES = new Set(['haiku', 'sonnet', 'opus', 'inherit'])
 // Keep this literal beside the adapter and the exact package.json pin. Reading package metadata at
 // runtime fails under some package export maps and bundlers; a mismatched upgrade should therefore
@@ -229,7 +229,11 @@ export class CodexAgentProvider implements AgentProvider {
       ...(model === undefined ? {} : { model }),
       ...(request.effort === undefined
         ? {}
-        : { modelReasoningEffort: request.effort as NonNullable<ThreadOptions['modelReasoningEffort']> }),
+        : {
+            // Claude's top tier is named `max`; the pinned Codex SDK's equivalent ceiling is
+            // `xhigh`. Keep `max` valid in portable source and translate only at this adapter seam.
+            modelReasoningEffort: (request.effort === 'max' ? 'xhigh' : request.effort) as NonNullable<ThreadOptions['modelReasoningEffort']>,
+          }),
     }
   }
 
