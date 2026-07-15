@@ -95,6 +95,8 @@ export type WorkflowAgentSnapshot = {
   status: WorkflowAgentStatus
   admittedAt: string
   queuedAt?: string
+  /** Human-readable provider/scheduler gate currently preventing attempt admission. */
+  queueReason?: string
   startedAt?: string
   completedAt?: string
   outcome?: AgentOutcome
@@ -617,11 +619,15 @@ export function reduceWorkflowState(
     }
 
     case 'agent.queued':
-      next = updateAgent(next, event.agentId, event.type, (agent) => ({
-        ...agent,
-        status: 'queued',
-        queuedAt: event.timestamp,
-      }))
+      next = updateAgent(next, event.agentId, event.type, (agent) => {
+        const { queueReason: _previousReason, ...withoutPreviousReason } = agent
+        return {
+          ...withoutPreviousReason,
+          status: 'queued',
+          queuedAt: event.timestamp,
+          ...(event.payload.reason === undefined ? {} : { queueReason: event.payload.reason }),
+        }
+      })
       break
 
     case 'agent.reused':
@@ -661,7 +667,11 @@ export function reduceWorkflowState(
             ? {}
             : { providerSession: event.payload.providerSession }),
         }
-        const { retry: _scheduledRetry, ...agentWithoutRetry } = agent
+        const {
+          retry: _scheduledRetry,
+          queueReason: _queueReason,
+          ...agentWithoutRetry
+        } = agent
         return {
           ...agentWithoutRetry,
           status: 'running',

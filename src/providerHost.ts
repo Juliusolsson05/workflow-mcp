@@ -144,6 +144,7 @@ function serializeProviderError(error: unknown): SerializedProviderHostError {
       ...(error.stack === undefined ? {} : { stack: error.stack }),
       ...(error.code === undefined ? {} : { code: error.code }),
       retryable: error.retryable,
+      circuitImpact: error.circuitImpact,
       ...(error.providerSession === undefined ? {} : { providerSession: error.providerSession }),
     }
   }
@@ -169,6 +170,7 @@ export function deserializeProviderHostError(error: SerializedProviderHostError)
     const failure = new AgentProviderFailure(error.message, {
       ...(error.code === undefined ? {} : { code: error.code }),
       retryable: error.retryable ?? false,
+      ...(error.circuitImpact === undefined ? {} : { circuitImpact: error.circuitImpact }),
       ...(error.providerSession === undefined ? {} : { providerSession: error.providerSession }),
     })
     if (error.stack !== undefined) failure.stack = error.stack

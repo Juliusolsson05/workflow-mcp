@@ -56,6 +56,7 @@ export type SerializedProviderHostError = {
   stack?: string
   code?: string
   retryable?: boolean
+  circuitImpact?: 'infrastructure' | 'neutral'
   providerSession?: ProviderSessionReference
 }
 

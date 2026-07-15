@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 import { AgentProviderAbortError, AgentProviderFailure } from '../src/agentProvider.js'
 import type { AgentProvider, AgentProviderResult } from '../src/agentProvider.js'
+import { ProviderCircuitBreaker } from '../src/executionReliability.js'
 import { FakeAgentProvider } from '../src/fakeProvider.js'
 import type { FakeProviderScript } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
@@ -182,6 +183,60 @@ describe('unattended workflow reliability', () => {
     await expect(run.result).resolves.toBe('probe recovered')
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(18)
     expect(provider.calls).toHaveLength(2)
+  })
+
+  it('releases unrelated queued work as soon as a half-open probe produces provider progress', async () => {
+    const circuit = new ProviderCircuitBreaker({
+      circuitBreakerThreshold: 1,
+      circuitBreakerWindowMs: 1_000,
+      circuitBreakerCooldownMs: 1,
+    })
+    const outage = await circuit.enter(new AbortController().signal)
+    expect(outage.startAllowed()).toBe(true)
+    outage.infrastructureFailure()
+    await new Promise((resolveWait) => setTimeout(resolveWait, 2))
+
+    const probe = await circuit.enter(new AbortController().signal)
+    expect(probe.probe).toBe(true)
+    expect(probe.startAllowed()).toBe(true)
+    const waiting = circuit.enter(new AbortController().signal)
+    probe.providerResponsive()
+    const released = await waiting
+
+    expect(released.startAllowed()).toBe(true)
+    expect(circuit.snapshot()).toEqual({ state: 'closed', recentFailures: 0 })
+    released.neutral()
+    probe.success()
+  })
+
+  it('does not let a retryable request-local failure poison the shared provider circuit', async () => {
+    const circuit = new ProviderCircuitBreaker({
+      circuitBreakerThreshold: 1,
+      circuitBreakerWindowMs: 10_000,
+      circuitBreakerCooldownMs: 10_000,
+    })
+    const provider = new FakeAgentProvider([
+      {
+        outcome: {
+          type: 'provider-failure',
+          message: 'historical thread is unavailable',
+          code: 'codex-session-unavailable',
+          retryable: true,
+          circuitImpact: 'neutral',
+        },
+      },
+    ])
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('session-local failure')`),
+      cwd: process.cwd(),
+      provider,
+      circuitBreaker: circuit,
+      sandbox: { mode: 'read-only' },
+      reliability: { ...FAST_RETRY, maxAttempts: 1, circuitBreakerThreshold: 1 },
+    })
+
+    await expect(run.result).resolves.toBeNull()
+    expect(circuit.snapshot()).toEqual({ state: 'closed', recentFailures: 0 })
   })
 
   it('revalidates circuit reservations after waiting for provider capacity', async () => {
@@ -943,6 +998,45 @@ describe('unattended workflow reliability', () => {
     expect(manifests.find((manifest) => manifest.runId === 'run_unsafe_crash')?.status)
       .toBe('interrupted')
     expect(manifests.some((manifest) => manifest.resumedFromRunId === 'run_unsafe_crash')).toBe(false)
+    await service.stop()
+  })
+
+  it('does not trust an old provider-wide replay attestation when restart enables network access', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-network-recovery-'))
+    const storeRoot = join(cwd, 'state')
+    const source = workflow(`return await agent('networked replay')`, 'network-recovery')
+    const seed = new FileWorkflowStore(storeRoot)
+    const seedLease = await seed.acquireLease('network-seed')
+    await seed.initialize()
+    await seed.createRun({
+      runId: 'run_network_crash',
+      cwd,
+      workflow: source,
+      // Models a pre-fix manifest that persisted only provider-wide safety and lost the
+      // request-specific network capability.
+      automaticReplaySafe: true,
+    })
+    await seed.appendEvent('run_network_crash', {
+      schemaVersion: 1,
+      runId: 'run_network_crash',
+      sequence: 1,
+      eventId: 'event_network_started',
+      timestamp: new Date().toISOString(),
+      type: 'run.started',
+      payload: { workflow: { name: source.meta.name, description: source.meta.description } },
+    })
+    await seedLease.release()
+
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(storeRoot),
+      provider: new FakeAgentProvider([]),
+      sandbox: { mode: 'read-only', network: true },
+    })
+    await service.initialize()
+    const manifests = await new FileWorkflowStore(storeRoot).listManifests()
+    expect(manifests.find((manifest) => manifest.runId === 'run_network_crash')?.status)
+      .toBe('interrupted')
+    expect(manifests.some((manifest) => manifest.resumedFromRunId === 'run_network_crash')).toBe(false)
     await service.stop()
   })
 

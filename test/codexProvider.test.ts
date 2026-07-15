@@ -258,6 +258,35 @@ describe('CodexAgentProvider', () => {
     expect(calls[0]?.input).not.toContain('Inspect the repository')
   })
 
+  it('classifies a missing historical rollout as session-local rather than a provider outage', async () => {
+    const client: CodexClientLike = {
+      startThread: () => { throw new Error('startThread should not be called') },
+      resumeThread: (id) => ({
+        id,
+        runStreamed: async () => {
+          throw new Error(`thread/resume: thread/resume failed: no rollout found for thread id ${id} (code -32600)`)
+        },
+      }),
+    }
+    const provider = new CodexAgentProvider({ client })
+
+    await expect(provider.execute(request({
+      session: { provider: 'codex', id: 'historical-thread' },
+      recovery: {
+        reason: 'manual resume',
+        previousAttemptNumber: 1,
+        lastProgressAt: '2026-07-15T20:39:32.000Z',
+        note: 'Continue safely.',
+      },
+    }), { signal: new AbortController().signal, emit: async () => undefined }))
+      .rejects.toMatchObject({
+        code: 'codex-session-unavailable',
+        retryable: true,
+        circuitImpact: 'neutral',
+        providerSession: { provider: 'codex', id: 'historical-thread' },
+      })
+  })
+
   it('bridges Claude-optional schema fields through Codex strict output without changing the result', async () => {
     const { client, calls } = mockClient([
       { type: 'thread.started', thread_id: 'thread-schema' },

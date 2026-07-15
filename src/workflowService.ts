@@ -739,7 +739,14 @@ export class WorkflowService {
       ...(input.resumedFromRunId === undefined ? {} : { resumedFromRunId: input.resumedFromRunId }),
       lineageId: input.lineageId ?? runId,
       ...(input.recoveryMode === undefined ? {} : { recoveryMode: input.recoveryMode }),
-      automaticReplaySafe: provider.automaticReplaySafety === 'safe',
+      // Provider-wide safety is necessary but not sufficient. Network is a request capability,
+      // and a read-only filesystem does not prevent HTTP POSTs or other remote effects. Persisting
+      // `safe` here previously let restart recovery forget that distinction and replay a networked
+      // attempt after a crash. The manifest records the effective host policy that every agent in
+      // this service inherits; per-agent capability expansion must likewise become durable before
+      // such expansion is added to the workflow language.
+      automaticReplaySafe: provider.automaticReplaySafety === 'safe'
+        && (this.#options.sandbox?.network ?? false) === false,
     })
     const journal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(runId),
@@ -885,6 +892,10 @@ export class WorkflowService {
   #automaticRecoveryIsSafe(manifest: WorkflowRunManifest): boolean {
     if (!this.#recovery.autoResumeOnInitialize || manifest.automaticReplaySafe !== true) return false
     const mode = this.#options.sandbox?.mode ?? 'read-only'
+    // Re-check the current host policy as well as the persisted decision. An operator can restart
+    // the service with broader capabilities than the crashed process had; recovery must become
+    // more conservative across that transition, never less.
+    if ((this.#options.sandbox?.network ?? false) !== false) return false
     return mode === 'read-only' || this.#recovery.allowMutableSandbox
   }
 
