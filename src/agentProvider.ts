@@ -33,6 +33,40 @@ export type AgentRequest = {
   instructions?: string
   /** When present, the adapter resumes this provider session instead of opening a fresh one. */
   session?: ProviderSessionReference
+  /**
+   * Host-generated context for a replacement physical attempt.
+   *
+   * WHY this is separate from `prompt`: the original prompt participates in Claude-compatible
+   * journal identity. Folding an operational recovery note into that prompt would turn a retry of
+   * one logical call into a different call and invalidate otherwise reusable siblings. Providers
+   * may render this context differently, but they must never use it as journal/cache identity.
+   */
+  recovery?: AgentRecoveryContext
+}
+
+export type AgentRecoveryContext = {
+  reason: string
+  previousAttemptNumber: number
+  lastProgressAt: string
+  uncertainInFlightActivity?: {
+    id: string
+    kind: AgentActivityKind
+    title?: string
+  }
+  /** The exact host-generated note sent to a resumed provider session. */
+  note: string
+}
+
+export type AgentReplayRisk =
+  | 'read_only'
+  | 'worktree_write'
+  | 'idempotent_external'
+  | 'unknown_external'
+
+export type AgentReplaySafetyAssessment = {
+  automatic: boolean
+  risk: AgentReplayRisk
+  reason: string
 }
 
 export type AgentUsage = {
@@ -103,6 +137,12 @@ export type AgentProviderExecutionContext = {
    * callbacks can reorder an activity completion ahead of its update under concurrent load.
    */
   emit(event: AgentProviderEvent): Promise<void>
+  /**
+   * A provider-host heartbeat proves only that the host boundary is responsive. It deliberately
+   * does not enter the durable activity stream and must not reset the meaningful-progress clock;
+   * otherwise a healthy wrapper around a wedged Codex child could defeat the idle watchdog.
+   */
+  heartbeat?(at: string): void
 }
 
 export type AgentProviderAttemptIdentity = {
@@ -130,6 +170,12 @@ export type AgentProvider = {
    * remains available when that cannot be proven.
    */
   readonly automaticReplaySafety?: 'safe' | 'unsafe-or-unknown'
+  /**
+   * Request-aware replay classification supersedes the legacy provider-wide flag when present.
+   * Filesystem policy, worktree isolation, network access, and exposed MCP capabilities are known
+   * only after a concrete request exists, so one global boolean cannot describe them honestly.
+   */
+  assessReplaySafety?(request: AgentRequest): AgentReplaySafetyAssessment
   /**
    * What execution-promise settlement proves after cancellation.
    *

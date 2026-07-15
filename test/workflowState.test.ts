@@ -240,6 +240,7 @@ describe('workflow state projection', () => {
       running: 0,
       completed: 2,
       failed: 0,
+      recovery_required: 0,
       skipped: 74,
       cancelled: 0,
       reused: 1,

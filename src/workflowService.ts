@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import type { AgentProvider, AgentSandboxPolicy } from './agentProvider.js'
 import { loadClaudeWorkflowResume } from './claudeResume.js'
@@ -10,6 +11,7 @@ import { findWorkflows } from './findWorkflows.js'
 import type { FoundWorkflow } from './findWorkflows.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
+import type { JournalReuseMode } from './workflowJournal.js'
 import { runWorkflow } from './runWorkflow.js'
 import type { RunWorkflowOptions, WorkflowLimits, WorkflowRun } from './runWorkflow.js'
 import { normalizeReliabilityPolicy, ProviderCircuitBreaker } from './executionReliability.js'
@@ -123,6 +125,7 @@ export type WorkflowRunHealth = {
     retrying: number
     completed: number
     failed: number
+    recoveryRequired: number
   }
   lastProgressAt?: string
   oldestRunningSince?: string
@@ -500,6 +503,7 @@ export class WorkflowService {
         retrying: snapshot.state.agents.filter((agent) => agent.retry !== undefined && agent.status === 'queued').length,
         completed: snapshot.state.counts.completed,
         failed: snapshot.state.counts.failed,
+        recoveryRequired: snapshot.state.counts.recovery_required,
       },
       ...(lastProgressAt === undefined ? {} : { lastProgressAt }),
       ...(oldestRunningSince === undefined ? {} : { oldestRunningSince }),
@@ -604,12 +608,20 @@ export class WorkflowService {
     // would silently discard resumable history before the journal can make that decision.
     const workflowId = originalWorkflow.filePath ?? originalWorkflow.meta.name
     const priorSnapshot = priorJournal.getSnapshot(workflowId)
+    const exactSourceAndArgs =
+      workflow.sourceHash === originalWorkflow.sourceHash &&
+      isDeepStrictEqual(args, originalArgs)
     return this.#startLoaded(scope, workflow, {
       ...(args.provided ? { args: args.value } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       resumedFromRunId: input.runId,
       lineageId: original.lineageId ?? original.runId,
       recoveryMode,
+      // Manual recovery should be sparse when the operator is resuming the exact same logical
+      // program. Claude's longest-prefix rule remains the compatibility fallback for edited source
+      // or changed args, where reusing a later sibling could smuggle an obsolete control-flow path
+      // into the new run.
+      journalReuseMode: exactSourceAndArgs ? 'exact-source-sparse' : 'longest-prefix',
       ...(priorSnapshot === undefined ? {} : { journalSnapshots: [priorSnapshot] }),
     })
   }
@@ -700,6 +712,7 @@ export class WorkflowService {
       resumedFromRunId?: string
       lineageId?: string
       recoveryMode?: 'manual' | 'automatic'
+      journalReuseMode?: JournalReuseMode
       journalSnapshots?: Parameters<typeof PersistentWorkflowJournal.open>[1]
     },
   ): Promise<WorkflowRunStartResult> {
@@ -746,9 +759,9 @@ export class WorkflowService {
       cwd,
       provider,
       journal,
-      journalReuseMode: input.recoveryMode === 'automatic'
-        ? 'exact-source-sparse'
-        : 'longest-prefix',
+      journalReuseMode: input.journalReuseMode ?? (
+        input.recoveryMode === 'automatic' ? 'exact-source-sparse' : 'longest-prefix'
+      ),
       scheduler: this.#scheduler,
       circuitBreaker,
       lineageId: input.lineageId ?? runId,

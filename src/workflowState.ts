@@ -27,10 +27,17 @@ export type WorkflowAgentStatus =
   | 'running'
   | 'completed'
   | 'failed'
+  | 'recovery_required'
   | 'skipped'
   | 'cancelled'
 
-export type WorkflowAttemptStatus = 'running' | 'stalled' | 'completed' | 'failed' | 'cancelled'
+export type WorkflowAttemptStatus =
+  | 'running'
+  | 'stalled'
+  | 'completed'
+  | 'failed'
+  | 'recovery_required'
+  | 'cancelled'
 export type WorkflowActivityStatus = 'running' | 'completed' | 'failed'
 
 export type WorkflowActivitySnapshot = WorkflowActivityDetails & {
@@ -60,6 +67,19 @@ export type WorkflowAttemptSnapshot = {
     kind: 'startup' | 'idle' | 'active-operation' | 'absolute'
     lastProgressAt: string
     deadlineAt: string
+  }
+  termination?: {
+    reason: 'timeout' | 'cancellation' | 'shutdown'
+    boundary: 'settlement' | 'process-tree'
+    confirmedAt: string
+  }
+  recovery?: {
+    previousAttemptId: string
+    previousAttemptNumber: number
+    reason: string
+    note: string
+    startedAt: string
+    completedAt?: string
   }
   activities: WorkflowActivitySnapshot[]
 }
@@ -123,6 +143,7 @@ export type WorkflowAgentCounts = {
   running: number
   completed: number
   failed: number
+  recovery_required: number
   skipped: number
   cancelled: number
   /** Journal reuse is a subset of completed, not a second logical agent. */
@@ -190,6 +211,7 @@ const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
 const TERMINAL_AGENT_STATUSES = new Set<WorkflowAgentStatus>([
   'completed',
   'failed',
+  'recovery_required',
   'skipped',
   'cancelled',
 ])
@@ -217,6 +239,7 @@ function emptyCounts(): WorkflowAgentCounts {
     running: 0,
     completed: 0,
     failed: 0,
+    recovery_required: 0,
     skipped: 0,
     cancelled: 0,
     reused: 0,
@@ -348,6 +371,39 @@ function finalizeDerivedState(state: WorkflowSnapshot): WorkflowSnapshot {
   }
 }
 
+function closeNonterminalAgents(
+  agents: WorkflowAgentSnapshot[],
+  status: 'failed' | 'cancelled',
+  timestamp: string,
+  error?: WorkflowErrorReference,
+): WorkflowAgentSnapshot[] {
+  // A terminal run record is the persisted ownership boundary. If a renderer missed an agent-level
+  // cancellation during a crash or sink race, leaving that attempt "running" after run.failed is a
+  // materially false claim: no owner remains that could advance it. Reconciliation belongs in the
+  // deterministic reducer so live projection and replayed manifests make the same correction.
+  return agents.map((agent) => {
+    if (TERMINAL_AGENT_STATUSES.has(agent.status)) return agent
+    const attempts = agent.attempts.map((attempt) => (
+      attempt.status === 'running' || attempt.status === 'stalled'
+        ? {
+            ...attempt,
+            status,
+            completedAt: timestamp,
+            ...(status === 'failed' && error !== undefined ? { error } : {}),
+          }
+        : attempt
+    ))
+    return {
+      ...agent,
+      status,
+      completedAt: timestamp,
+      attempts,
+      ...(status === 'failed' && error !== undefined ? { error } : {}),
+      ...(status === 'cancelled' ? { cancelledReason: 'Run became terminal' } : {}),
+    }
+  })
+}
+
 function assertNever(event: never): never {
   throw new Error(`Unhandled workflow event: ${JSON.stringify(event)}`)
 }
@@ -403,6 +459,7 @@ export function reduceWorkflowState(
         status: 'failed',
         completedAt: event.timestamp,
         error: event.payload.error,
+        agents: closeNonterminalAgents(next.agents, 'failed', event.timestamp, event.payload.error),
       }
       break
 
@@ -424,21 +481,25 @@ export function reduceWorkflowState(
         ...(event.payload.reason === undefined
           ? {}
           : { cancellationReason: event.payload.reason }),
+        agents: closeNonterminalAgents(next.agents, 'cancelled', event.timestamp),
       }
       break
 
-    case 'run.interrupted':
+    case 'run.interrupted': {
+      const interruption = {
+        name: 'WorkflowInterruptedError',
+        code: 'run-interrupted',
+        message: event.payload.reason,
+      }
       next = {
         ...next,
         status: 'interrupted',
         completedAt: event.timestamp,
-        error: {
-          name: 'WorkflowInterruptedError',
-          code: 'run-interrupted',
-          message: event.payload.reason,
-        },
+        error: interruption,
+        agents: closeNonterminalAgents(next.agents, 'failed', event.timestamp, interruption),
       }
       break
+    }
 
     case 'phase.discovered': {
       // The runtime promises one discovery event per phase. Guarding here preserves the original
@@ -764,6 +825,60 @@ export function reduceWorkflowState(
           reason: event.payload.reason,
         },
       }))
+      break
+
+    case 'agent.termination_confirmed':
+      next = updateAttempt(next, event.agentId, event.attemptId, event.type, (attempt) => ({
+        ...attempt,
+        termination: {
+          ...event.payload,
+          confirmedAt: event.timestamp,
+        },
+      }))
+      break
+
+    case 'agent.recovery_started':
+      next = updateAttempt(next, event.agentId, event.attemptId, event.type, (attempt) => ({
+        ...attempt,
+        recovery: {
+          previousAttemptId: event.payload.previousAttemptId,
+          previousAttemptNumber: event.payload.context.previousAttemptNumber,
+          reason: event.payload.context.reason,
+          note: event.payload.context.note,
+          startedAt: event.timestamp,
+        },
+      }))
+      break
+
+    case 'agent.recovery_completed':
+      next = updateAttempt(next, event.agentId, event.attemptId, event.type, (attempt) => ({
+        ...attempt,
+        ...(attempt.recovery === undefined
+          ? {}
+          : { recovery: { ...attempt.recovery, completedAt: event.timestamp } }),
+      }))
+      break
+
+    case 'agent.recovery_required':
+      next = updateAgent(next, event.agentId, event.type, (agent) => {
+        const index = attemptIndex(agent, event.attemptId, event.type)
+        const attempts = agent.attempts.slice()
+        const attempt = attempts[index]
+        if (!attempt) throw new Error(`Attempt index ${index} disappeared during ${event.type}`)
+        attempts[index] = {
+          ...attempt,
+          status: 'recovery_required',
+          completedAt: event.timestamp,
+          error: event.payload.error,
+        }
+        return {
+          ...agent,
+          status: 'recovery_required',
+          completedAt: event.timestamp,
+          error: event.payload.error,
+          attempts,
+        }
+      })
       break
 
     case 'agent.cancelled':

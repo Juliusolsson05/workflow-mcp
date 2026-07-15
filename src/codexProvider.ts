@@ -1,4 +1,3 @@
-import { Codex } from '@openai/codex-sdk'
 import type {
   CodexOptions,
   Input,
@@ -13,14 +12,18 @@ import {
 } from './agentProvider.js'
 import { adaptCodexOutputSchema } from './codexSchema.js'
 import type {
+  AgentReplaySafetyAssessment,
   AgentProvider,
   AgentProviderActivity,
+  AgentProviderAttemptIdentity,
   AgentProviderExecutionContext,
   AgentProviderResult,
+  AgentProviderTerminationReason,
   AgentRequest,
   AgentUsage,
   ProviderSessionReference,
 } from './agentProvider.js'
+import { ProcessOwnedCodexHost } from './processOwnedProviderHost.js'
 
 export type CodexThreadLike = {
   readonly id: string | null
@@ -39,6 +42,39 @@ export type CodexProviderOptions = Omit<CodexOptions, 'env'> & {
   env?: Record<string, string>
   /** A null mapping intentionally selects the SDK/CLI configured default model. */
   modelAliases?: Readonly<Record<string, string | null>>
+  /** Built provider-host entry; Agent Code supplies its electron-vite emitted sibling. */
+  providerHostFilePath?: string
+  /**
+   * Dedicated Codex state root used to prevent workflow attempts from inheriting user/project
+   * configuration while retaining durable thread files for provider-session resume.
+   */
+  configurationIsolation?: CodexConfigurationIsolation
+  /**
+   * Host attestation for tools outside the local sandbox.
+   *
+   * WHY omitted means unknown: the Codex CLI can inherit MCP servers from user/project config.
+   * Merely passing no additional server in this constructor does not prove that the effective tool
+   * set is empty. A host may mark inheritance disabled only when it enforces that at its config
+   * boundary, and must classify every server it intentionally exposes.
+   */
+  capabilities?: CodexExecutionCapabilities
+}
+
+export type CodexExternalCapabilityEffect = 'read-only' | 'idempotent' | 'mutating' | 'unknown'
+
+export type CodexExecutionCapabilities = {
+  inheritedMcpServers: 'disabled' | 'unknown'
+  mcpServers?: readonly {
+    name: string
+    effect: CodexExternalCapabilityEffect
+  }[]
+}
+
+export type CodexConfigurationIsolation = {
+  /** Stable across attempts and application restarts so Codex thread resume remains possible. */
+  codexHome: string
+  /** Optional login copied into the isolated home before each host starts. */
+  authenticationFile?: string
 }
 
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -57,33 +93,147 @@ const CODEX_SDK_VERSION = '0.144.4'
  */
 export class CodexAgentProvider implements AgentProvider {
   readonly name = 'codex'
-  // Codex can reach MCP servers whose tools mutate state outside the local sandbox. A read-only
-  // checkout therefore cannot prove that replaying a lost turn is harmless. Keep automatic retry
-  // and post-start crash continuation fail-closed until the embedding host can attest that every
-  // reachable remote tool is read-only or independently idempotent.
-  readonly automaticReplaySafety = 'unsafe-or-unknown' as const
-  // The pinned SDK exposes only the direct `codex exec` promise and calls ChildProcess.kill(). It
-  // does not expose the PID/process group, so workflow-mcp cannot prove that tool grandchildren
-  // died after cancellation. Fail closed until the host supplies a process-group-owning adapter.
-  readonly terminationBoundary = 'unconfirmed-descendants' as const
-  readonly #client: CodexClientLike
+  readonly #client: CodexClientLike | undefined
+  readonly #host: ProcessOwnedCodexHost | undefined
   readonly #modelAliases: Readonly<Record<string, string | null>>
+  readonly #capabilities: CodexExecutionCapabilities
 
   constructor(options: CodexProviderOptions = {}) {
-    const { client, modelAliases = {}, env, ...codexOptions } = options
+    const {
+      client,
+      modelAliases = {},
+      providerHostFilePath,
+      configurationIsolation,
+      capabilities = { inheritedMcpServers: 'unknown' },
+      env,
+      ...codexOptions
+    } = options
     this.#modelAliases = { ...modelAliases }
-    this.#client = client ?? new Codex({
-      ...codexOptions,
-      env: safeCodexEnvironment(env),
-    })
+    this.#capabilities = {
+      inheritedMcpServers: capabilities.inheritedMcpServers,
+      ...(capabilities.mcpServers === undefined
+        ? {}
+        : { mcpServers: capabilities.mcpServers.map((server) => ({ ...server })) }),
+    }
+    if (client) {
+      // Injected clients are an in-process conformance seam. Production never takes this branch;
+      // preserving it keeps adapter tests focused on event translation without spawning hosts.
+      this.#client = client
+      this.#host = undefined
+    } else {
+      if (capabilities.inheritedMcpServers === 'disabled' && configurationIsolation === undefined) {
+        // A declaration is not an isolation boundary. Without a dedicated CODEX_HOME, the CLI
+        // still reads ~/.codex/config.toml, project .codex/config.toml, plugins, and apps. Refusing
+        // this combination prevents a host from accidentally converting "we did not pass an MCP
+        // server" into the much stronger—and false—claim that no mutating server is reachable.
+        throw new AgentProviderFailure(
+          'Codex inherited MCP servers can be marked disabled only with configurationIsolation',
+          { code: 'codex-capability-attestation-invalid' },
+        )
+      }
+      this.#client = undefined
+      this.#host = new ProcessOwnedCodexHost({
+        ...(providerHostFilePath === undefined ? {} : { hostFilePath: providerHostFilePath }),
+        ...(configurationIsolation === undefined ? {} : { configurationIsolation }),
+        codexOptions: {
+          ...codexOptions,
+          env: safeCodexEnvironment(env),
+        },
+        modelAliases: this.#modelAliases,
+      })
+    }
+  }
+
+  get automaticReplaySafety(): 'safe' | 'unsafe-or-unknown' {
+    return this.#externallyReplaySafe()
+      ? 'safe'
+      : 'unsafe-or-unknown'
+  }
+
+  get terminationBoundary(): 'settlement' | 'process-tree' | 'unconfirmed-descendants' {
+    // Production turns always use the process owner. Injected clients deliberately retain the
+    // weaker settlement boundary because no OS process exists for workflow-mcp to reap. Windows
+    // taskkill is useful escalation, but unlike a Job Object it does not bind future descendants
+    // at creation time, so advertising the POSIX guarantee there would be stronger than reality.
+    if (this.#host === undefined) return 'settlement'
+    return process.platform === 'win32' ? 'unconfirmed-descendants' : 'process-tree'
+  }
+
+  assessReplaySafety(request: AgentRequest): AgentReplaySafetyAssessment {
+    if (request.sandbox.network) {
+      return {
+        automatic: false,
+        risk: 'unknown_external',
+        reason: 'Network-enabled shell execution can produce external effects outside the workflow journal',
+      }
+    }
+    if (this.#host !== undefined && this.terminationBoundary !== 'process-tree') {
+      return {
+        automatic: false,
+        risk: 'unknown_external',
+        reason: 'This platform cannot yet prove creation-time ownership of every Codex descendant',
+      }
+    }
+    if (!this.#externallyReplaySafe()) {
+      return {
+        automatic: false,
+        risk: 'unknown_external',
+        reason: this.#capabilities.inheritedMcpServers === 'unknown'
+          ? 'Effective Codex MCP capabilities include unverified inherited user/project servers'
+          : 'At least one exposed Codex MCP server is mutating or has unknown effects',
+      }
+    }
+    const idempotent = this.#capabilities.mcpServers?.some((server) => server.effect === 'idempotent') === true
+    return {
+      automatic: true,
+      risk: idempotent ? 'idempotent_external' : 'read_only',
+      reason: idempotent
+        ? 'Every external tool is read-only or independently idempotent'
+        : 'No inherited MCP servers are enabled and every exposed tool is read-only',
+    }
   }
 
   async execute(
     request: AgentRequest,
     context: AgentProviderExecutionContext,
   ): Promise<AgentProviderResult> {
+    if (this.#host) return this.#host.execute(request, context)
+    if (!this.#client) throw new Error('Codex provider has neither a client nor a process host')
+    return executeCodexTurn(this.#client, request, context, this.#modelAliases)
+  }
+
+  async terminateAttempt(
+    attempt: AgentProviderAttemptIdentity,
+    reason: AgentProviderTerminationReason,
+  ): Promise<void> {
+    await this.#host?.terminateAttempt(attempt, reason)
+  }
+
+  #externallyReplaySafe(): boolean {
+    if (this.#host !== undefined && this.terminationBoundary !== 'process-tree') return false
+    if (this.#capabilities.inheritedMcpServers !== 'disabled') return false
+    return (this.#capabilities.mcpServers ?? []).every(
+      (server) => server.effect === 'read-only' || server.effect === 'idempotent',
+    )
+  }
+}
+
+/**
+ * Execute one SDK turn inside whichever process owns the supplied client.
+ *
+ * WHY this function is shared by the in-process test seam and providerHost.ts: duplicating event
+ * translation in the child would let hosted production behavior drift from unit-tested behavior.
+ * Process ownership changes only lifecycle and transport; Codex SDK protocol semantics remain one
+ * implementation.
+ */
+export async function executeCodexTurn(
+  client: CodexClientLike,
+  request: AgentRequest,
+  context: AgentProviderExecutionContext,
+  modelAliases: Readonly<Record<string, string | null>> = {},
+): Promise<AgentProviderResult> {
     if (context.signal.aborted) throw new AgentProviderAbortError(context.signal.reason)
-    if (request.session !== undefined && request.session.provider !== this.name) {
+    if (request.session !== undefined && request.session.provider !== 'codex') {
       throw new AgentProviderFailure(
         `Cannot resume ${JSON.stringify(request.session.provider)} session with Codex`,
         { code: 'provider-session-mismatch' },
@@ -100,13 +250,11 @@ export class CodexAgentProvider implements AgentProvider {
       )
     }
 
-    const threadOptions = this.#threadOptions(request)
+    const threadOptions = codexThreadOptions(request, modelAliases)
     const thread = request.session
-      ? this.#client.resumeThread(request.session.id, threadOptions)
-      : this.#client.startThread(threadOptions)
-    const input = request.instructions === undefined
-      ? request.prompt
-      : `${request.instructions}\n\nTask:\n${request.prompt}`
+      ? client.resumeThread(request.session.id, threadOptions)
+      : client.startThread(threadOptions)
+    const input = codexTurnInput(request)
     const turnOptions: TurnOptions = {
       signal: context.signal,
       ...(schemaAdapter === undefined ? {} : { outputSchema: schemaAdapter.outputSchema }),
@@ -121,10 +269,10 @@ export class CodexAgentProvider implements AgentProvider {
       for await (const event of streamed.events) {
         switch (event.type) {
           case 'thread.started':
-            providerSession = { provider: this.name, id: event.thread_id }
+            providerSession = { provider: 'codex', id: event.thread_id }
             await context.emit({
               type: 'session.started',
-              session: { provider: this.name, id: event.thread_id },
+              session: { provider: 'codex', id: event.thread_id },
             })
             break
 
@@ -194,10 +342,10 @@ export class CodexAgentProvider implements AgentProvider {
     }
 
     if (providerSession === undefined && thread.id !== null) {
-      providerSession = { provider: this.name, id: thread.id }
+      providerSession = { provider: 'codex', id: thread.id }
       await context.emit({
         type: 'session.started',
-        session: { provider: this.name, id: thread.id },
+        session: { provider: 'codex', id: thread.id },
       })
     }
     if (finalResponse === undefined) {
@@ -221,48 +369,76 @@ export class CodexAgentProvider implements AgentProvider {
         sdk: '@openai/codex-sdk',
         sdkVersion: CODEX_SDK_VERSION,
         bundledCliVersion: CODEX_SDK_VERSION,
+        ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
       },
     }
-  }
+}
 
-  #threadOptions(request: AgentRequest): ThreadOptions {
-    const model = this.#model(request.model)
-    if (request.effort !== undefined && !CODEX_EFFORTS.has(request.effort)) {
-      throw new AgentProviderFailure(`Unsupported Codex reasoning effort ${JSON.stringify(request.effort)}`, {
-        code: 'codex-effort-unmapped',
-      })
-    }
-    return {
-      workingDirectory: request.workingDirectory,
-      sandboxMode: request.sandbox.mode,
-      approvalPolicy: request.sandbox.approvalPolicy,
-      networkAccessEnabled: request.sandbox.network,
-      ...(request.sandbox.additionalWritableDirectories === undefined
-        ? {}
-        : { additionalDirectories: [...request.sandbox.additionalWritableDirectories] }),
-      ...(model === undefined ? {} : { model }),
-      ...(request.effort === undefined
-        ? {}
-        : {
-            // Claude's top tier is named `max`; the pinned Codex SDK's equivalent ceiling is
-            // `xhigh`. Keep `max` valid in portable source and translate only at this adapter seam.
-            modelReasoningEffort: (request.effort === 'max' ? 'xhigh' : request.effort) as NonNullable<ThreadOptions['modelReasoningEffort']>,
-          }),
-    }
+function codexThreadOptions(
+  request: AgentRequest,
+  modelAliases: Readonly<Record<string, string | null>>,
+): ThreadOptions {
+  const model = codexModel(request.model, modelAliases)
+  if (request.effort !== undefined && !CODEX_EFFORTS.has(request.effort)) {
+    throw new AgentProviderFailure(`Unsupported Codex reasoning effort ${JSON.stringify(request.effort)}`, {
+      code: 'codex-effort-unmapped',
+    })
   }
+  return {
+    workingDirectory: request.workingDirectory,
+    sandboxMode: request.sandbox.mode,
+    approvalPolicy: request.sandbox.approvalPolicy,
+    networkAccessEnabled: request.sandbox.network,
+    // Codex web search is a separate native tool, not ordinary shell network access. Explicitly
+    // removing it for an offline request keeps the replay-safety classification truthful even if
+    // the user's normal Codex profile enables live search by default.
+    ...(request.sandbox.network ? {} : { webSearchMode: 'disabled' }),
+    ...(request.sandbox.additionalWritableDirectories === undefined
+      ? {}
+      : { additionalDirectories: [...request.sandbox.additionalWritableDirectories] }),
+    ...(model === undefined ? {} : { model }),
+    ...(request.effort === undefined
+      ? {}
+      : {
+          // Claude's top tier is named `max`; the pinned Codex SDK's equivalent ceiling is
+          // `xhigh`. Keep `max` valid in portable source and translate only at this adapter seam.
+          modelReasoningEffort: (request.effort === 'max' ? 'xhigh' : request.effort) as NonNullable<ThreadOptions['modelReasoningEffort']>,
+        }),
+  }
+}
 
-  #model(value: string | undefined): string | undefined {
-    if (value === undefined) return undefined
-    const mapped = this.#modelAliases[value]
-    if (mapped !== undefined) return mapped ?? undefined
-    if (CLAUDE_MODEL_NAMES.has(value)) {
-      throw new AgentProviderFailure(
-        `Claude model alias ${JSON.stringify(value)} needs an explicit Codex model mapping`,
-        { code: 'codex-model-unmapped' },
-      )
-    }
-    return value
+function codexModel(
+  value: string | undefined,
+  modelAliases: Readonly<Record<string, string | null>>,
+): string | undefined {
+  if (value === undefined) return undefined
+  const mapped = modelAliases[value]
+  if (mapped !== undefined) return mapped ?? undefined
+  if (CLAUDE_MODEL_NAMES.has(value)) {
+    throw new AgentProviderFailure(
+      `Claude model alias ${JSON.stringify(value)} needs an explicit Codex model mapping`,
+      { code: 'codex-model-unmapped' },
+    )
   }
+  return value
+}
+
+function codexTurnInput(request: AgentRequest): Input {
+  if (request.recovery !== undefined && request.session !== undefined) {
+    // The resumed thread already contains the original task and all completed tool calls. Sending
+    // that task again looks like a new assignment and empirically encourages duplicate external
+    // actions. The host-generated note is the entire new user turn; agent-type instructions are
+    // retained because they may contain the output contract for the specialist.
+    return request.instructions === undefined
+      ? request.recovery.note
+      : `${request.instructions}\n\nRecovery:\n${request.recovery.note}`
+  }
+  const task = request.instructions === undefined
+    ? request.prompt
+    : `${request.instructions}\n\nTask:\n${request.prompt}`
+  return request.recovery === undefined
+    ? task
+    : `${task}\n\nRecovery:\n${request.recovery.note}`
 }
 
 function parseStructuredOutput(

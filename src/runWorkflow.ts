@@ -17,6 +17,9 @@ import type {
   AgentProviderAttemptIdentity,
   AgentProviderEvent,
   AgentProviderResult,
+  AgentRecoveryContext,
+  AgentReplaySafetyAssessment,
+  AgentRequest,
   AgentSandboxPolicy,
   ProviderSessionReference,
 } from './agentProvider.js'
@@ -375,6 +378,7 @@ class WorkflowRuntime {
   #underutilizationTimer: NodeJS.Timeout | undefined
   #lastUnderutilizationSignature: string | undefined
   #retryAttemptsScheduled = 0
+  #recoveryRequiredError: WorkflowExecutionError | undefined
 
   constructor(options: RunWorkflowOptions) {
     this.id = options.runId ?? `run_${randomUUID()}`
@@ -494,6 +498,7 @@ class WorkflowRuntime {
       // late events appear after run.completed. Drain a stable snapshot until no task remains.
       await this.#drainTasks()
       if (this.#controller.signal.aborted || this.#terminal) return
+      if (this.#recoveryRequiredError !== undefined) throw this.#recoveryRequiredError
       if (!this.#claimTerminal('completion')) return
 
       await this.#emit({
@@ -668,6 +673,7 @@ class WorkflowRuntime {
         draft.type === 'agent.reused' ||
         draft.type === 'agent.completed' ||
         (draft.type === 'agent.failed' && draft.payload.retrying !== true) ||
+        draft.type === 'agent.recovery_required' ||
         draft.type === 'agent.skipped' ||
         draft.type === 'agent.cancelled'
       ) {
@@ -1150,6 +1156,7 @@ class WorkflowRuntime {
 
   async #executeAgent(admission: AgentAdmission): Promise<void> {
     let prepared: PreparedWorkingDirectory | undefined
+    let preserveWorkspaceForRecovery = false
     let lastAttemptId: string | undefined
     let lastAttemptOpen = false
     let providerSession = admission.journalMiss.providerSession?.provider === this.#options.provider.name
@@ -1244,10 +1251,13 @@ class WorkflowRuntime {
         }
       }
 
+      let recovery: AgentRecoveryContext | undefined
+      let previousAttemptId: string | undefined
       for (let attemptNumber = 1; attemptNumber <= this.#reliability.maxAttempts; attemptNumber += 1) {
         const attemptId = `${admission.agentId}_attempt_${attemptNumber}`
         let providerLease: SchedulerLease | undefined
         let circuitLease: ProviderCircuitLease | undefined
+        let attemptRequest: AgentRequest | undefined
         try {
           // Circuit wait owns no provider capacity. When the provider is globally unavailable,
           // queued work remains visible without nine backoff loops pinning all nine permits.
@@ -1270,6 +1280,13 @@ class WorkflowRuntime {
           }
 
           const resumeSession = providerSession
+          attemptRequest = this.#providerRequest({
+            admission,
+            workingDirectory,
+            ...(instructions === undefined ? {} : { instructions }),
+            ...(resumeSession === undefined ? {} : { resumeSession }),
+            ...(recovery === undefined ? {} : { recovery }),
+          })
           const startedAt = Date.now()
           await this.#emit({
             type: 'agent.started',
@@ -1288,14 +1305,21 @@ class WorkflowRuntime {
           })
           lastAttemptId = attemptId
           lastAttemptOpen = true
+          if (recovery !== undefined && previousAttemptId !== undefined) {
+            await this.#emit({
+              type: 'agent.recovery_started',
+              agentId: admission.agentId,
+              attemptId,
+              ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+              payload: { previousAttemptId, context: recovery },
+            })
+          }
 
           const result = await this.#executeProviderAttempt({
             admission,
             attemptId,
             attemptNumber,
-            workingDirectory,
-            ...(instructions === undefined ? {} : { instructions }),
-            ...(resumeSession === undefined ? {} : { resumeSession }),
+            request: attemptRequest,
             onSession: (session) => { providerSession = session },
           })
           circuitLease.success()
@@ -1310,6 +1334,16 @@ class WorkflowRuntime {
           if (result.usage?.outputTokens !== undefined) this.#budgetSpent += result.usage.outputTokens
           admission.journalRun.recordResult(admission.journalMiss, value, { successful: true })
           const completedSession = result.providerSession ?? providerSession
+
+          if (recovery !== undefined && previousAttemptId !== undefined) {
+            await this.#emit({
+              type: 'agent.recovery_completed',
+              agentId: admission.agentId,
+              attemptId,
+              ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+              payload: { previousAttemptId },
+            })
+          }
 
           await this.#emit({
             type: 'agent.completed',
@@ -1356,7 +1390,19 @@ class WorkflowRuntime {
                 this.#observeScheduler(this.#runScheduler.snapshot())
               }).catch(() => undefined)
             }
-            throw error
+            preserveWorkspaceForRecovery = true
+            await this.#markRecoveryRequired(
+              admission,
+              attemptId,
+              error,
+              {
+                automatic: false,
+                risk: 'unknown_external',
+                reason: 'The previous provider process tree could not be proven stopped',
+              },
+            )
+            lastAttemptOpen = false
+            return
           }
           if (error instanceof AgentProviderFailure && error.providerSession !== undefined) {
             providerSession = error.providerSession
@@ -1374,7 +1420,27 @@ class WorkflowRuntime {
           if (error instanceof AgentProviderFailure) {
             if (error.retryable) circuitLease?.infrastructureFailure()
             else circuitLease?.neutral()
-            const retrying = this.#reserveRetry(admission, error, attemptNumber)
+            const replaySafety = this.#replaySafety(
+              admission,
+              attemptRequest ?? this.#providerRequest({
+                admission,
+                workingDirectory,
+                ...(instructions === undefined ? {} : { instructions }),
+                ...(providerSession === undefined ? {} : { resumeSession: providerSession }),
+              }),
+            )
+            const retrying = this.#reserveRetry(admission, error, attemptNumber, replaySafety)
+            const replayWouldBeUnsafe =
+              error.retryable &&
+              attemptNumber < this.#reliability.maxAttempts &&
+              this.#reliability.automaticRetry !== 'never' &&
+              !replaySafety.automatic
+            if (replayWouldBeUnsafe) {
+              preserveWorkspaceForRecovery = true
+              await this.#markRecoveryRequired(admission, attemptId, error, replaySafety)
+              lastAttemptOpen = false
+              return
+            }
             await this.#emit({
               type: 'agent.failed',
               agentId: admission.agentId,
@@ -1404,6 +1470,8 @@ class WorkflowRuntime {
               return
             }
 
+            previousAttemptId = attemptId
+            recovery = recoveryContext(error, attemptNumber)
             const delayMs = retryDelayMs(this.#reliability, attemptNumber)
             const retryAt = new Date(Date.now() + delayMs).toISOString()
             await this.#emit({
@@ -1436,10 +1504,6 @@ class WorkflowRuntime {
         }
       }
     } catch (error) {
-      // The adapter explicitly survived both cooperative and hard termination. Treating this as an
-      // ordinary agent error lets workflow JavaScript catch it and launch sibling/replacement work
-      // while the credentialed execution is still alive. Escalate to the run owner instead.
-      if (error instanceof UnconfirmedProviderTerminationError) throw error
       if (
         this.#controller.signal.aborted ||
         error instanceof WorkflowCancelledError ||
@@ -1465,9 +1529,26 @@ class WorkflowRuntime {
       }
     } finally {
       try {
-        const cleanup = prepared?.cleanup
+        const cleanup = prepared?.cleanup && !preserveWorkspaceForRecovery
           ? await this.#cleanupWorkingDirectory(prepared)
           : undefined
+        if (prepared !== undefined && preserveWorkspaceForRecovery) {
+          // Recovery must observe the exact filesystem state which surrounded the uncertain turn.
+          // Cleaning here is especially dangerous for an unconfirmed process: that process may
+          // still have its cwd or files open. The host/reconciler owns eventual disposition after
+          // an operator resolves the ambiguity.
+          await this.#emit({
+            type: 'warning',
+            agentId: admission.agentId,
+            ...(lastAttemptId === undefined ? {} : { attemptId: lastAttemptId }),
+            ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+            payload: {
+              code: 'working-directory-preserved-for-recovery',
+              message: `Isolated working directory was preserved for recovery at ${prepared.path}`,
+              details: { path: prepared.path, workspaceId },
+            },
+          })
+        }
         if (cleanup?.preservedPath) {
           await this.#emit({
             type: 'warning',
@@ -1543,15 +1624,33 @@ class WorkflowRuntime {
     admission: AgentAdmission
     attemptId: string
     attemptNumber: number
-    workingDirectory: string
-    instructions?: string
-    resumeSession?: ProviderSessionReference
+    request: AgentRequest
     onSession(session: ProviderSessionReference): void
   }): Promise<AgentProviderResult> {
     const attemptController = new AbortController()
     const onRunAbort = (): void => attemptController.abort(this.#controller.signal.reason)
     this.#controller.signal.addEventListener('abort', onRunAbort, { once: true })
-    const monitor = new AttemptLivenessMonitor(attemptController, this.#reliability)
+    const monitor = new AttemptLivenessMonitor(
+      attemptController,
+      this.#reliability,
+      (snapshot) => {
+        // A quiet model turn can be legitimate reasoning. This durable warning gives the operator a
+        // visible soft phase without declaring progress or extending the hard deadline. A responsive
+        // host heartbeat is intentionally absent from this decision because wrapper liveness does
+        // not prove the model/tool stream is advancing.
+        void this.#emit({
+          type: 'warning',
+          agentId: input.admission.agentId,
+          attemptId: input.attemptId,
+          ...(input.admission.phaseId === undefined ? {} : { phaseId: input.admission.phaseId }),
+          payload: {
+            code: 'agent-soft-stall',
+            message: 'Agent has been quiet long enough to warrant observation; the hard deadline has not fired',
+            details: snapshot,
+          },
+        }).catch(() => undefined)
+      },
+    )
     const activityIds = new Set<string>()
     const identity: AgentProviderAttemptIdentity = {
       runId: this.id,
@@ -1561,22 +1660,7 @@ class WorkflowRuntime {
     }
 
     const execution = this.#options.provider.execute(
-      {
-        prompt: input.admission.prompt,
-        ...(input.admission.normalizedOptions.schema === undefined
-          ? {}
-          : { schema: input.admission.normalizedOptions.schema }),
-        ...(input.admission.normalizedOptions.model === undefined
-          ? {}
-          : { model: input.admission.normalizedOptions.model }),
-        ...(input.admission.normalizedOptions.effort === undefined
-          ? {}
-          : { effort: input.admission.normalizedOptions.effort }),
-        workingDirectory: input.workingDirectory,
-        sandbox: this.#sandbox,
-        ...(input.instructions === undefined ? {} : { instructions: input.instructions }),
-        ...(input.resumeSession === undefined ? {} : { session: input.resumeSession }),
-      },
+      input.request,
       {
         signal: attemptController.signal,
         attempt: identity,
@@ -1585,6 +1669,9 @@ class WorkflowRuntime {
           if (event.type === 'session.started') input.onSession(event.session)
           await this.#emitProviderEvent(input.admission, input.attemptId, event, activityIds)
         },
+        // Provider-host heartbeat is recorded only by process diagnostics. Feeding it to `progress`
+        // would let a healthy Node wrapper mask a permanently wedged Codex stream.
+        heartbeat: () => undefined,
       },
     )
     // A timeout wins Promise.race even if a broken adapter ignores AbortSignal forever. The
@@ -1609,6 +1696,18 @@ class WorkflowRuntime {
             { cause: error },
           )
         }
+        await this.#emit({
+          type: 'agent.termination_confirmed',
+          agentId: input.admission.agentId,
+          attemptId: input.attemptId,
+          ...(input.admission.phaseId === undefined ? {} : { phaseId: input.admission.phaseId }),
+          payload: {
+            reason: 'cancellation',
+            boundary: this.#options.provider.terminationBoundary === 'process-tree'
+              ? 'process-tree'
+              : 'settlement',
+          },
+        })
         throw new WorkflowCancelledError(abortReason(this.#controller.signal))
       }
       if (!(error instanceof AgentAttemptTimeoutError)) throw error
@@ -1635,6 +1734,18 @@ class WorkflowRuntime {
           { cause: error },
         )
       }
+      await this.#emit({
+        type: 'agent.termination_confirmed',
+        agentId: input.admission.agentId,
+        attemptId: input.attemptId,
+        ...(input.admission.phaseId === undefined ? {} : { phaseId: input.admission.phaseId }),
+        payload: {
+          reason: 'timeout',
+          boundary: this.#options.provider.terminationBoundary === 'process-tree'
+            ? 'process-tree'
+            : 'settlement',
+        },
+      })
       // A completion can race the timeout and cooperative abort. Once the provider returned a
       // successful result during the bounded grace period, discarding it and replaying the same
       // tool-bearing turn is both wasteful and potentially duplicative. Rejections still retain
@@ -1679,7 +1790,7 @@ class WorkflowRuntime {
       ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
       payload: {
         code: 'provider-termination-unconfirmed',
-        message: 'Provider ignored cancellation and no confirmed hard termination was observed; capacity is quarantined and automatic retry is suppressed',
+        message: 'The provider execution boundary could not prove that every descendant stopped; capacity is quarantined and automatic retry is suppressed',
       },
     })
   }
@@ -1700,14 +1811,103 @@ class WorkflowRuntime {
     return quarantine
   }
 
-  #reserveRetry(admission: AgentAdmission, error: AgentProviderFailure, attemptNumber: number): boolean {
+  #providerRequest(input: {
+    admission: AgentAdmission
+    workingDirectory: string
+    instructions?: string
+    resumeSession?: ProviderSessionReference
+    recovery?: AgentRecoveryContext
+  }): AgentRequest {
+    return {
+      prompt: input.admission.prompt,
+      ...(input.admission.normalizedOptions.schema === undefined
+        ? {}
+        : { schema: input.admission.normalizedOptions.schema }),
+      ...(input.admission.normalizedOptions.model === undefined
+        ? {}
+        : { model: input.admission.normalizedOptions.model }),
+      ...(input.admission.normalizedOptions.effort === undefined
+        ? {}
+        : { effort: input.admission.normalizedOptions.effort }),
+      workingDirectory: input.workingDirectory,
+      sandbox: this.#sandbox,
+      ...(input.instructions === undefined ? {} : { instructions: input.instructions }),
+      ...(input.resumeSession === undefined ? {} : { session: input.resumeSession }),
+      ...(input.recovery === undefined ? {} : { recovery: input.recovery }),
+    }
+  }
+
+  #replaySafety(admission: AgentAdmission, request: AgentRequest): AgentReplaySafetyAssessment {
+    const providerAssessment = this.#options.provider.assessReplaySafety?.(request) ?? {
+      automatic: this.#options.provider.automaticReplaySafety === 'safe',
+      risk: this.#options.provider.automaticReplaySafety === 'safe'
+        ? ('read_only' as const)
+        : ('unknown_external' as const),
+      reason: this.#options.provider.automaticReplaySafety === 'safe'
+        ? 'Provider attests that reachable external effects are replay-safe'
+        : 'Provider does not attest that reachable external effects are replay-safe',
+    }
+    if (!providerAssessment.automatic) return providerAssessment
+    if (this.#sandbox.mode === 'read-only') return providerAssessment
+    if (admission.options.isolation === 'worktree') {
+      return {
+        ...providerAssessment,
+        risk: 'worktree_write',
+        reason: `${providerAssessment.reason}; local writes remain in the same durable isolated worktree`,
+      }
+    }
+    return {
+      automatic: false,
+      risk: 'unknown_external',
+      reason: 'The attempt may have modified the shared working directory without durable isolation',
+    }
+  }
+
+  async #markRecoveryRequired(
+    admission: AgentAdmission,
+    attemptId: string,
+    error: unknown,
+    replaySafety: AgentReplaySafetyAssessment,
+  ): Promise<void> {
+    const reference = errorReference(error)
+    await this.#emit({
+      type: 'agent.recovery_required',
+      agentId: admission.agentId,
+      attemptId,
+      ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+      payload: { error: reference, replaySafety },
+    })
+    // Continue already-admitted siblings and let workflow JavaScript cross its current barrier with
+    // a null result. The run itself fails after all tracked work drains, which avoids turning one
+    // uncertain agent into a cancellation storm while still refusing to label the run successful.
+    // Crucially, no null journal result is recorded, so exact-source manual resume revisits only this
+    // unresolved logical call and can reuse completed siblings on either side of it.
+    this.#recoveryRequiredError ??= new WorkflowExecutionError(
+      'agent-recovery-required',
+      `Agent ${admission.agentId} requires operator-approved recovery: ${reference.message}`,
+      { cause: error },
+    )
+    this.#completeWorkerRequest(admission.worker, admission.requestId, {
+      type: 'agent.result',
+      requestId: admission.requestId,
+      result: { type: 'success', value: null },
+      budgetSpent: this.#budgetSpent,
+    })
+  }
+
+  #reserveRetry(
+    admission: AgentAdmission,
+    error: AgentProviderFailure,
+    attemptNumber: number,
+    replaySafety: AgentReplaySafetyAssessment,
+  ): boolean {
     if (!error.retryable || attemptNumber >= this.#reliability.maxAttempts) return false
     if (this.#retryAttemptsScheduled >= this.#reliability.maxRetryAttemptsPerRun) return false
     if (this.#reliability.automaticRetry === 'never') return false
     // A local read-only sandbox says nothing about remote MCP side effects. Retrying an unknown
     // provider after a lost response can duplicate an email, deployment, or database mutation, so
     // automatic replay requires an affirmative provider capability instead of optimistic guessing.
-    if (this.#options.provider.automaticReplaySafety !== 'safe') return false
+    if (!replaySafety.automatic) return false
     // WHY workspace-write without isolation is excluded even when an adapter says "retryable": a
     // network failure can happen after a tool changed the user's checkout. Read-only calls cannot
     // mutate it, and a stable isolated worktree makes repeated local writes inspectable/reconcilable.
@@ -2295,6 +2495,41 @@ function errorReference(error: unknown): WorkflowErrorReference {
     }
   }
   return { message: typeof error === 'string' ? error : String(error) }
+}
+
+function recoveryContext(error: AgentProviderFailure, previousAttemptNumber: number): AgentRecoveryContext {
+  const lastProgressAt = error instanceof AgentAttemptTimeoutError
+    ? error.lastProgressAt
+    : new Date().toISOString()
+  const uncertain = error instanceof AgentAttemptTimeoutError
+    ? error.uncertainInFlightActivity
+    : undefined
+  const uncertainInFlightActivity = uncertain === undefined
+    ? undefined
+    : {
+        id: uncertain.id,
+        kind: uncertain.kind,
+        ...(uncertain.title === undefined ? {} : { title: uncertain.title }),
+      }
+  const uncertaintyLine = uncertainInFlightActivity === undefined
+    ? 'No specific in-flight activity was recorded; inspect the current thread and repository state before acting.'
+    : `The last open activity was ${uncertainInFlightActivity.kind} ${JSON.stringify(uncertainInFlightActivity.title ?? uncertainInFlightActivity.id)}; its completion is uncertain.`
+  const note = [
+    'Your previous turn was interrupted after the last recorded activity.',
+    'Continue the same assignment from the current repository and thread state.',
+    'Inspect existing state before acting. Do not repeat completed external actions.',
+    `Interruption reason: ${error.message}`,
+    `Previous physical attempt: ${previousAttemptNumber}. Last recorded progress: ${lastProgressAt}.`,
+    uncertaintyLine,
+    'Finish the assignment and return the requested output schema only.',
+  ].join(' ')
+  return {
+    reason: error.message,
+    previousAttemptNumber,
+    lastProgressAt,
+    ...(uncertainInFlightActivity === undefined ? {} : { uncertainInFlightActivity }),
+    note,
+  }
 }
 
 function workerError(error: SerializedWorkerError): Error {
