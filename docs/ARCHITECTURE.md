@@ -92,7 +92,14 @@ import {
 
 const service = new WorkflowService({
   store: new FileWorkflowStore('/private/application/state/workflows'),
-  provider: () => new CodexAgentProvider({ codexPathOverride: '/approved/codex' }),
+  provider: () => new CodexAgentProvider({
+    codexPathOverride: '/approved/codex',
+    configurationIsolation: {
+      codexHome: '/private/application/state/workflow-codex',
+      authenticationFile: '/home/user/.codex/auth.json',
+    },
+    capabilities: { inheritedMcpServers: 'disabled' },
+  }),
   modelAliases: { inherit: null, haiku: null, sonnet: null, opus: null },
   sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
 })
@@ -147,6 +154,13 @@ const run = runWorkflow({
   provider: new CodexAgentProvider({
     // Claude aliases are never guessed. Configure the capability mapping you intend.
     modelAliases: { sonnet: 'your-codex-model' },
+    // Hosts that need automatic retry must enforce this boundary; omitting it leaves inherited
+    // MCP capability unknown and therefore fails closed after an ambiguous interruption.
+    configurationIsolation: {
+      codexHome: '/private/application/state/workflow-codex',
+      authenticationFile: '/home/user/.codex/auth.json',
+    },
+    capabilities: { inheritedMcpServers: 'disabled' },
   }),
   journal,
 })
@@ -163,7 +177,8 @@ tests or the Codex provider in production. The Codex adapter uses the existing l
 the SDK's API-key mode, passes only an explicit environment allowlist, defaults to workspace-write
 with no network and no approvals, and requires explicit mappings for Claude model aliases.
 
-The in-memory journal implements longest-prefix reuse and interrupted provider-session resume. The
+The in-memory journal implements exact-source sparse reuse, edited-source longest-prefix reuse, and
+interrupted provider-session resume. The
 `resume` command imports Claude's saved source and v2 JSONL, then atomically persists the combined
 Claude-plus-Codex run under `~/.workflow-mcp/journals/`. It never rewrites Claude's metadata or
 journal. The sidecar records completed results and Codex thread IDs after every mutation, so a
@@ -197,10 +212,10 @@ circuit breaker so a provider outage cannot turn nine slots into an unbounded re
 The service store is single-writer fenced. On restart, an untouched cursor-zero queue reservation is
 always safe to continue. A run which durably reached `run.started` is marked interrupted and is
 continued only when both its sandbox and persisted provider capability permit automatic replay.
-Exact-source crash
-recovery reuses completed parallel siblings sparsely—for example, if call five of nine was in flight
-but calls six through nine completed, only call five executes again. Manual resume retains Claude's
-longest-unchanged-prefix behavior because edited source cannot safely make that sparse assumption.
+Exact-source crash recovery and exact-source manual resume reuse completed parallel siblings
+sparsely—for example, if call five of nine was in flight but calls six through nine completed, only
+call five executes again. Edited source or arguments retain Claude's longest-unchanged-prefix
+behavior because changed workflow semantics cannot safely make that sparse assumption.
 `workflow_run_status` includes scheduler utilization, provider-circuit state, stalled/retrying agent
 counts, last progress, lineage, and the successor run ID.
 
@@ -208,8 +223,10 @@ There are two deliberate safety boundaries:
 
 - Mutable shared sandboxes are not automatically resumed unless the host explicitly opts in with
   `recovery.allowMutableSandbox`. A provider adapter with a real process tree should implement
-  `terminateAttempt`; if hard termination cannot be confirmed, its permit is quarantined instead of
-  starting a potentially overlapping retry.
+  `terminateAttempt`; the Codex adapter now does so through one provider-host process group per
+  attempt on POSIX. If hard termination cannot be confirmed, its permit is quarantined instead of
+  starting a potentially overlapping retry. Windows currently uses awaited `taskkill /T /F`; a
+  native Job Object remains the stronger creation-time ownership boundary.
 - Automatic continuation begins when `WorkflowService.initialize()` runs after a host restart. The
   current package does not install a separate always-on daemon, so it cannot keep agents executing
   during the interval in which its owning application process is down. The daemon/provider-host

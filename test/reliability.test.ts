@@ -154,7 +154,10 @@ describe('unattended workflow reliability', () => {
     expect(state.agents[0]?.attempts.map((attempt) => attempt.status)).toEqual(['failed', 'completed'])
     expect(state.agents[0]?.outcome?.source).toBe('provider-resume')
     expect(captured.some((event) => event.type === 'agent.retry_scheduled')).toBe(true)
+    expect(captured.some((event) => event.type === 'agent.recovery_started')).toBe(true)
+    expect(captured.some((event) => event.type === 'agent.recovery_completed')).toBe(true)
     expect(provider.calls[1]?.request.session?.id).toBe('durable-session')
+    expect(provider.calls[1]?.request.recovery?.note).toContain('previous turn was interrupted')
   })
 
   it('opens the provider circuit and admits only a half-open recovery probe', async () => {
@@ -292,8 +295,43 @@ describe('unattended workflow reliability', () => {
       reliability: FAST_RETRY,
     })
 
-    await expect(run.result).resolves.toBeNull()
+    const events = collect(run)
+    await expect(run.result).rejects.toMatchObject({ code: 'agent-recovery-required' })
     expect(calls).toBe(1)
+    const state = projectWorkflowState(run.id, await events)
+    expect(state.agents[0]?.status).toBe('recovery_required')
+    expect(state.agents[0]?.attempts[0]?.status).toBe('recovery_required')
+    expect(state.counts.running).toBe(0)
+  })
+
+  it('preserves an isolated workspace when an ambiguous attempt requires recovery', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-recovery-workspace-'))
+    let cleanups = 0
+    const provider: AgentProvider = {
+      name: 'unknown-effects',
+      execute: async () => {
+        throw new AgentProviderFailure('result lost after uncertain work', { retryable: true })
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('uncertain worktree', { isolation: 'worktree' })`),
+      cwd: process.cwd(),
+      provider,
+      sandbox: { mode: 'workspace-write' },
+      prepareWorkingDirectory: async () => ({
+        path: root,
+        cleanup: async () => { cleanups += 1 },
+      }),
+      reliability: FAST_RETRY,
+    })
+    const events = collect(run)
+
+    await expect(run.result).rejects.toMatchObject({ code: 'agent-recovery-required' })
+    expect(cleanups).toBe(0)
+    expect(await events).toContainEqual(expect.objectContaining({
+      type: 'warning',
+      payload: expect.objectContaining({ code: 'working-directory-preserved-for-recovery' }),
+    }))
   })
 
   it('keeps a failed attempt failed when cancellation interrupts retry backoff', async () => {
@@ -356,6 +394,68 @@ describe('unattended workflow reliability', () => {
       payload: expect.objectContaining({ kind: 'idle' }),
     }))
     expect(provider.calls.map((call) => call.status)).toEqual(['aborted', 'completed'])
+  })
+
+  it('recovers one silent attempt among nine without cancelling its healthy siblings', async () => {
+    const provider = new FakeAgentProvider([
+      { sessionId: 'silent-session', outcome: { type: 'wait-for-abort' } },
+      ...Array.from({ length: 8 }, (_, index): FakeProviderScript => ({
+        // Finish before the deliberately tiny idle deadline; only the first fixture is silent.
+        delayMs: 5,
+        outcome: { type: 'result', output: { type: 'text', text: `healthy-${index}` } },
+      })),
+      {
+        expect: { sessionId: 'silent-session' },
+        outcome: { type: 'result', output: { type: 'text', text: 'silent-recovered' } },
+      },
+    ])
+    const run = runWorkflow({
+      workflow: workflow(`
+        return await parallel(Array.from({ length: 9 }, (_, index) => () => agent('peer-' + index)))
+      `),
+      cwd: process.cwd(),
+      provider,
+      limits: { concurrency: 9, cancellationGraceMs: 5 },
+      sandbox: { mode: 'read-only' },
+      reliability: { ...FAST_RETRY, idleTimeoutMs: 20 },
+    })
+    const events = collect(run)
+
+    await expect(run.result).resolves.toEqual(expect.arrayContaining([
+      'silent-recovered',
+      ...Array.from({ length: 8 }, (_, index) => `healthy-${index}`),
+    ]))
+    const captured = await events
+    expect(captured.filter((event) => event.type === 'agent.completed')).toHaveLength(9)
+    expect(captured.some((event) => event.type === 'agent.cancelled')).toBe(false)
+    expect(provider.maxConcurrentExecutions).toBe(9)
+  })
+
+  it('emits a soft-stall diagnostic without cancelling a healthy quiet attempt', async () => {
+    const provider = new FakeAgentProvider([{
+      delayMs: 40,
+      outcome: { type: 'result', output: { type: 'text', text: 'quietly healthy' } },
+    }])
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('quiet reasoning')`),
+      cwd: process.cwd(),
+      provider,
+      reliability: {
+        ...FAST_RETRY,
+        softStallTimeoutMs: 10,
+        idleTimeoutMs: 100,
+        attemptTimeoutMs: 200,
+      },
+    })
+    const events = collect(run)
+
+    await expect(run.result).resolves.toBe('quietly healthy')
+    const captured = await events
+    expect(captured).toContainEqual(expect.objectContaining({
+      type: 'warning',
+      payload: expect.objectContaining({ code: 'agent-soft-stall' }),
+    }))
+    expect(captured.some((event) => event.type === 'agent.stalled')).toBe(false)
   })
 
   it('keeps a successful result which arrives during timeout cancellation grace', async () => {
@@ -926,6 +1026,75 @@ describe('unattended workflow reliability', () => {
     })
     expect(provider.calls).toHaveLength(1)
     provider.assertExhausted()
+    await service.stop()
+  })
+
+  it('uses exact-source sparse reuse for an unchanged manual resume beyond a journal gap', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-sparse-manual-recovery-'))
+    const storeRoot = join(cwd, 'state')
+    const source = workflow(`
+      return await parallel(Array.from({ length: 6 }, (_, index) => () => agent('manual-' + index)))
+    `, 'sparse-manual-recovery')
+    const seed = new FileWorkflowStore(storeRoot)
+    const lease = await seed.acquireLease('sparse-manual-seed')
+    await seed.initialize()
+    await seed.createRun({ runId: 'run_sparse_manual', cwd, workflow: source })
+    await seed.appendEvent('run_sparse_manual', {
+      schemaVersion: 1,
+      runId: 'run_sparse_manual',
+      sequence: 1,
+      eventId: 'event_sparse_manual_started',
+      timestamp: new Date().toISOString(),
+      type: 'run.started',
+      payload: { workflow: { name: source.meta.name, description: source.meta.description } },
+    })
+    await seed.appendEvent('run_sparse_manual', {
+      schemaVersion: 1,
+      runId: 'run_sparse_manual',
+      sequence: 2,
+      eventId: 'event_sparse_manual_interrupted',
+      timestamp: new Date().toISOString(),
+      type: 'run.interrupted',
+      payload: { reason: 'fixture interruption' },
+    })
+    const journal = await PersistentWorkflowJournal.open(seed.journalPath('run_sparse_manual'))
+    const prior = journal.beginRun({ workflowId: source.meta.name, sourceHash: source.sourceHash })
+    for (let index = 0; index < 6; index += 1) {
+      const decision = prior.admit({ agentId: `old-${index}`, prompt: `manual-${index}` })
+      if (decision.reused) throw new Error('Fresh manual sparse fixture unexpectedly reused work')
+      if (index !== 2) prior.recordResult(decision, `old-result-${index}`, { successful: true })
+    }
+    await lease.release()
+
+    const provider = new FakeAgentProvider([{
+      expect: { prompt: 'manual-2' },
+      outcome: { type: 'result', output: { type: 'text', text: 'manual-recovered-2' } },
+    }])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(storeRoot),
+      provider,
+      recovery: { autoResumeOnInitialize: false },
+    })
+    await service.initialize()
+    const resumed = await service.resume({ cwd }, { runId: 'run_sparse_manual' })
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if ((await service.status({ cwd }, resumed.runId)).status === 'completed') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+    const completed = (await new FileWorkflowStore(storeRoot).readEvents(resumed.runId, 0, 1_000))
+      .events.find((stored) => stored.event.type === 'run.completed')
+    expect(completed?.event).toMatchObject({
+      type: 'run.completed',
+      payload: { result: { content: [
+        'old-result-0',
+        'old-result-1',
+        'manual-recovered-2',
+        'old-result-3',
+        'old-result-4',
+        'old-result-5',
+      ] } },
+    })
+    expect(provider.calls).toHaveLength(1)
     await service.stop()
   })
 

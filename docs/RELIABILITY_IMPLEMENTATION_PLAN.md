@@ -1,16 +1,16 @@
 # Workflow reliability and continuous-utilization implementation plan
 
-Status: in progress; in-process reliability slice implemented on 2026-07-15
+Status: in progress; in-process supervision and POSIX provider-process ownership implemented on 2026-07-15
 Date: 2026-07-15
 Scope: `workflow-mcp` runtime, service, persistence, provider lifecycle, worktree lifecycle, MCP
 health surface, and the narrow Agent Code host callbacks required to make those guarantees real.
 
 ## Implementation status
 
-This document intentionally remains the full end-state plan. The first implementation PR completes
-the reliability work which can be enforced inside the current `workflow-mcp` process and leaves the
-last process-isolation milestones explicit instead of claiming a guarantee the current deployment
-shape cannot provide.
+This document intentionally remains the full end-state plan. Two implementation slices now cover
+the work-conserving runtime and a process-owning Codex attempt host. The remaining milestones stay
+explicit instead of turning a tested same-process recovery boundary into a claim that execution
+survives an absent application or every platform-specific process model.
 
 Implemented in the first reliability slice:
 
@@ -26,7 +26,8 @@ Implemented in the first reliability slice:
 - serialized durable appends, event/manifest crash-tail repair, a process-owner fence, and concurrent
   idempotency-key coalescing;
 - linked automatic restart recovery for safe read-only runs, with exact-source sparse sibling reuse
-  and Claude-compatible longest-prefix behavior retained for manual or edited-source resume;
+  for both automatic and manual recovery while edited source/arguments retain Claude-compatible
+  longest-prefix behavior;
 - scheduler, circuit, progress, retry, stall, lineage, and successor-run health through MCP status;
 - deterministic tests for utilization, limits, stalls, retries, cancellation, circuit breaking,
   workspace reuse, owner fencing, automatic recovery, and the "call five of nine" crash case.
@@ -35,8 +36,9 @@ Still architectural follow-up rather than silently implied by this PR:
 
 - a separately installed persistent supervisor/daemon, so execution continues while Electron or the
   parent CLI process is absent;
-- a provider subprocess host that can kill and reap an entire real provider process tree. The core
-  now exposes and enforces `terminateAttempt`, but each host adapter must supply that OS boundary;
+- a native Windows Job Object host. POSIX attempts now run in dedicated process groups and are
+  verified reaped; Windows currently uses awaited `taskkill /T /F`, which is useful but not the
+  same ownership guarantee as assigning the child to a Job Object at creation;
 - a durable capability/idempotency ledger for externally mutating tools. Mutable sandbox recovery is
   therefore opt-in, and unknown external side effects must not be described as exactly-once;
 - append-log/SQLite compaction and bounded ingestion queues for histories materially larger than the
@@ -45,6 +47,24 @@ Still architectural follow-up rather than silently implied by this PR:
 The “current behavior” sections below describe the baseline that motivated the plan. Where they
 conflict with the status list above, the status list describes the implemented runtime and the
 baseline text remains as design history and acceptance rationale.
+
+Implemented in the process-ownership/self-healing slice:
+
+- one data-only Codex provider-host process and POSIX process group per physical attempt, with
+  attempt-addressed cooperative cancellation, escalation, descendant reaping, and settlement only
+  after the process boundary is gone;
+- agent-local timeout and infrastructure recovery, so a failed attempt does not cancel healthy
+  siblings and replacement attempts keep the logical-agent identity, Codex thread, and workspace;
+- durable termination, retry, recovery-started/completed, and `recovery_required` events plus
+  terminal-state reconciliation that cannot simultaneously report a failed run and running agents;
+- an explicit continuation turn containing interruption diagnostics instead of resending the
+  original task to a resumed Codex thread;
+- request-aware replay classification and optional isolated `CODEX_HOME` enforcement. A production
+  host cannot claim inherited MCP servers are disabled without supplying that isolation boundary;
+- a visible soft-stall phase before the hard deadline and a real nine-agent regression where one
+  silent attempt is replaced while eight siblings continue;
+- exact-source sparse manual recovery across a journal gap, while edited source/arguments retain
+  longest-prefix compatibility.
 
 ## Executive summary
 
@@ -999,6 +1019,9 @@ Exit criteria:
 - ambiguous external effects do not auto-repeat.
 
 ### Milestone 5 — Provider host and hard process-tree control
+
+Status: implemented for POSIX in the current slice; Windows Job Object ownership and startup orphan
+reconciliation remain follow-up work.
 
 Deliverables:
 

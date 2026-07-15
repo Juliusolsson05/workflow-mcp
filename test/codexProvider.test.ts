@@ -165,6 +165,26 @@ describe('CodexAgentProvider', () => {
     })
   })
 
+  it('disables native web search for offline attempts and rejects unenforced replay attestations', async () => {
+    const { client, calls } = mockClient([
+      { type: 'thread.started', thread_id: 'thread-offline' },
+      { type: 'item.completed', item: { id: 'message-1', type: 'agent_message', text: 'Done' } },
+    ])
+    const provider = new CodexAgentProvider({ client })
+    await provider.execute(request({
+      sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+    }), { signal: new AbortController().signal, emit: async () => undefined })
+
+    expect(calls[0]?.threadOptions).toMatchObject({
+      networkAccessEnabled: false,
+      webSearchMode: 'disabled',
+    })
+    expect(() => new CodexAgentProvider({
+      codexPathOverride: '/tmp/codex',
+      capabilities: { inheritedMcpServers: 'disabled' },
+    })).toThrow(expect.objectContaining({ code: 'codex-capability-attestation-invalid' }))
+  })
+
   it('resumes a thread, maps a Claude model alias, prepends agent instructions, and parses schema output', async () => {
     const { client, calls } = mockClient([
       { type: 'thread.started', thread_id: 'thread-old' },
@@ -207,6 +227,35 @@ describe('CodexAgentProvider', () => {
       turnOptions: { outputSchema: schema },
     })
     expect(result.output).toEqual({ type: 'structured', value: { ok: true } })
+  })
+
+  it('sends only the continuation note when recovering an existing provider thread', async () => {
+    const { client, calls } = mockClient([
+      { type: 'thread.started', thread_id: 'thread-old' },
+      { type: 'item.completed', item: { id: 'message-1', type: 'agent_message', text: 'Recovered' } },
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1,
+          cached_input_tokens: 0,
+          output_tokens: 1,
+          reasoning_output_tokens: 0,
+        },
+      },
+    ])
+    const provider = new CodexAgentProvider({ client })
+    await provider.execute(request({
+      session: { provider: 'codex', id: 'thread-old' },
+      recovery: {
+        reason: 'idle timeout',
+        previousAttemptNumber: 1,
+        lastProgressAt: '2026-07-15T20:39:32.000Z',
+        note: 'Continue from the recorded state without repeating completed actions.',
+      },
+    }), { signal: new AbortController().signal, emit: async () => undefined })
+
+    expect(calls[0]?.input).toBe('Continue from the recorded state without repeating completed actions.')
+    expect(calls[0]?.input).not.toContain('Inspect the repository')
   })
 
   it('bridges Claude-optional schema fields through Codex strict output without changing the result', async () => {

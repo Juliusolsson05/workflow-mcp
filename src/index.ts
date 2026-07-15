@@ -64,6 +64,9 @@ export {
 export type {
   AgentActivityKind,
   AgentApprovalPolicy,
+  AgentRecoveryContext,
+  AgentReplayRisk,
+  AgentReplaySafetyAssessment,
   AgentProvider,
   AgentProviderActivity,
   AgentProviderAttemptIdentity,
@@ -81,7 +84,15 @@ export type {
 } from './agentProvider.js'
 
 export { CodexAgentProvider } from './codexProvider.js'
-export type { CodexClientLike, CodexProviderOptions, CodexThreadLike } from './codexProvider.js'
+export { startCodexProviderHost } from './providerHost.js'
+export type {
+  CodexClientLike,
+  CodexConfigurationIsolation,
+  CodexExecutionCapabilities,
+  CodexExternalCapabilityEffect,
+  CodexProviderOptions,
+  CodexThreadLike,
+} from './codexProvider.js'
 
 export { FakeAgentProvider, FakeProviderSetupError } from './fakeProvider.js'
 export type {
