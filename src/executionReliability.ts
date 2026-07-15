@@ -1,5 +1,5 @@
 import { AgentProviderFailure } from './agentProvider.js'
-import type { AgentProviderEvent } from './agentProvider.js'
+import type { AgentProviderActivity, AgentProviderEvent } from './agentProvider.js'
 
 export type AutomaticRetryMode = 'never' | 'safe'
 
@@ -7,6 +7,7 @@ export type WorkflowReliabilityPolicy = {
   maxAttempts: number
   maxRetryAttemptsPerRun: number
   startupTimeoutMs: number
+  softStallTimeoutMs: number
   idleTimeoutMs: number
   activeOperationTimeoutMs: number
   attemptTimeoutMs: number
@@ -32,6 +33,7 @@ export const DEFAULT_WORKFLOW_RELIABILITY_POLICY: Readonly<WorkflowReliabilityPo
   maxAttempts: 3,
   maxRetryAttemptsPerRun: 100,
   startupTimeoutMs: 90_000,
+  softStallTimeoutMs: 60_000,
   idleTimeoutMs: 6 * 60_000,
   activeOperationTimeoutMs: 20 * 60_000,
   attemptTimeoutMs: 45 * 60_000,
@@ -59,8 +61,14 @@ export class AgentAttemptTimeoutError extends AgentProviderFailure {
   readonly kind: AttemptTimeoutKind
   readonly lastProgressAt: string
   readonly deadlineAt: string
+  readonly uncertainInFlightActivity?: AgentProviderActivity
 
-  constructor(kind: AttemptTimeoutKind, lastProgressAt: string, deadlineAt: string) {
+  constructor(
+    kind: AttemptTimeoutKind,
+    lastProgressAt: string,
+    deadlineAt: string,
+    uncertainInFlightActivity?: AgentProviderActivity,
+  ) {
     super(timeoutMessage(kind), {
       code: `agent-${kind}-timeout`,
       retryable: true,
@@ -69,6 +77,9 @@ export class AgentAttemptTimeoutError extends AgentProviderFailure {
     this.kind = kind
     this.lastProgressAt = lastProgressAt
     this.deadlineAt = deadlineAt
+    if (uncertainInFlightActivity !== undefined) {
+      this.uncertainInFlightActivity = { ...uncertainInFlightActivity }
+    }
   }
 }
 
@@ -78,6 +89,7 @@ export type AttemptLivenessSnapshot = {
   deadlineAt: string
   phase: 'startup' | 'idle' | 'active-operation'
   openActivities: number
+  uncertainInFlightActivity?: AgentProviderActivity
 }
 
 /**
@@ -94,17 +106,26 @@ export class AttemptLivenessMonitor {
   readonly #policy: WorkflowReliabilityPolicy
   readonly #startedAtMs: number
   readonly #openActivities = new Set<string>()
+  readonly #activities = new Map<string, AgentProviderActivity>()
+  readonly #onSoftStall: ((snapshot: AttemptLivenessSnapshot) => void) | undefined
   readonly #timeout: Promise<never>
   #rejectTimeout!: (error: unknown) => void
   #lastProgressAtMs: number
   #sawProgress = false
   #timer: NodeJS.Timeout | undefined
+  #softTimer: NodeJS.Timeout | undefined
   #stopped = false
 
-  constructor(controller: AbortController, policy: WorkflowReliabilityPolicy, now = Date.now()) {
+  constructor(
+    controller: AbortController,
+    policy: WorkflowReliabilityPolicy,
+    onSoftStall?: (snapshot: AttemptLivenessSnapshot) => void,
+    now = Date.now(),
+  ) {
     this.#controller = controller
     this.#policy = policy
     this.#startedAtMs = now
+    this.#onSoftStall = onSoftStall
     this.#lastProgressAtMs = now
     this.#timeout = new Promise<never>((_resolve, reject) => { this.#rejectTimeout = reject })
     this.#arm()
@@ -118,26 +139,42 @@ export class AttemptLivenessMonitor {
     if (this.#stopped) return
     this.#sawProgress = true
     this.#lastProgressAtMs = now
-    if (event.type === 'activity.started') this.#openActivities.add(event.activity.id)
-    if (event.type === 'activity.completed') this.#openActivities.delete(event.activity.id)
+    if (event.type === 'activity.started') {
+      this.#openActivities.add(event.activity.id)
+      this.#activities.set(event.activity.id, { ...event.activity })
+    }
+    if (event.type === 'activity.updated') {
+      const current = this.#activities.get(event.activityId)
+      if (current) this.#activities.set(event.activityId, { ...current, ...event.patch })
+    }
+    if (event.type === 'activity.completed') {
+      this.#openActivities.delete(event.activity.id)
+      this.#activities.delete(event.activity.id)
+    }
     this.#arm()
   }
 
   snapshot(now = Date.now()): AttemptLivenessSnapshot {
     const phase = this.#phase()
+    const uncertainInFlightActivity = this.#uncertainActivity()
     return {
       startedAt: new Date(this.#startedAtMs).toISOString(),
       lastProgressAt: new Date(this.#lastProgressAtMs).toISOString(),
       deadlineAt: new Date(this.#deadline(phase, now)).toISOString(),
       phase,
       openActivities: this.#openActivities.size,
+      ...(uncertainInFlightActivity === undefined
+        ? {}
+        : { uncertainInFlightActivity }),
     }
   }
 
   stop(): void {
     this.#stopped = true
     if (this.#timer) clearTimeout(this.#timer)
+    if (this.#softTimer) clearTimeout(this.#softTimer)
     this.#timer = undefined
+    this.#softTimer = undefined
   }
 
   #phase(): AttemptLivenessSnapshot['phase'] {
@@ -159,9 +196,22 @@ export class AttemptLivenessMonitor {
   #arm(): void {
     if (this.#stopped) return
     if (this.#timer) clearTimeout(this.#timer)
+    if (this.#softTimer) clearTimeout(this.#softTimer)
     const now = Date.now()
     const phase = this.#phase()
     const deadline = this.#deadline(phase, now)
+    const softDeadline = Math.min(
+      this.#lastProgressAtMs + this.#policy.softStallTimeoutMs,
+      deadline - 1,
+    )
+    if (this.#onSoftStall && softDeadline > now) {
+      this.#softTimer = setTimeout(() => {
+        if (!this.#stopped) this.#onSoftStall?.(this.snapshot())
+      }, softDeadline - now)
+      this.#softTimer.unref?.()
+    } else {
+      this.#softTimer = undefined
+    }
     this.#timer = setTimeout(() => {
       if (this.#stopped) return
       this.#stopped = true
@@ -171,6 +221,7 @@ export class AttemptLivenessMonitor {
         kind,
         new Date(this.#lastProgressAtMs).toISOString(),
         new Date(deadline).toISOString(),
+        this.#uncertainActivity(),
       )
       // WHY reject before abort: an adapter normally rejects immediately when its signal aborts.
       // Settling the supervisor timeout first guarantees callers see the actionable stall reason
@@ -179,6 +230,12 @@ export class AttemptLivenessMonitor {
       this.#controller.abort(error)
     }, Math.max(1, deadline - now))
     this.#timer.unref?.()
+  }
+
+  #uncertainActivity(): AgentProviderActivity | undefined {
+    const latestId = [...this.#openActivities].at(-1)
+    const activity = latestId === undefined ? undefined : this.#activities.get(latestId)
+    return activity === undefined ? undefined : { ...activity }
   }
 }
 
@@ -190,6 +247,7 @@ export function normalizeReliabilityPolicy(
     'maxAttempts',
     'maxRetryAttemptsPerRun',
     'startupTimeoutMs',
+    'softStallTimeoutMs',
     'idleTimeoutMs',
     'activeOperationTimeoutMs',
     'attemptTimeoutMs',

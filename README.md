@@ -82,8 +82,9 @@ provider-neutral AgentProvider
   deterministic fake provider runs the conformance suite. Model aliases
   (`haiku`/`sonnet`/`opus`) are host policy, never guessed.
 - **Reliability.** One work-conserving scheduler across all runs, supervised
-  per-agent retries, a shared provider circuit breaker, single-writer fencing,
-  and interrupted-run recovery that sparsely reuses already-completed siblings.
+  per-agent retries, one process-owned Codex host per attempt, a shared provider
+  circuit breaker, single-writer fencing, and interrupted-run recovery that
+  sparsely reuses already-completed siblings.
 
 ## What you get
 
@@ -95,8 +96,9 @@ provider-neutral AgentProvider
 - **Immediate run handles** — `workflow_run` returns a run ID at once; clients
   follow progress by polling a durable cursor, not a transport-specific push.
 - **Resume** — continue a managed run, or import-and-resume a real Claude run
-  after verifying its source and journal byte-identity, reusing the longest
-  unchanged prefix. Claude's own files are never rewritten.
+  after verifying its source and journal byte-identity. Exact source/arguments
+  reuse completed calls sparsely; edited source retains the longest unchanged
+  prefix. Claude's own files are never rewritten.
 - **An embeddable service** — the same `WorkflowService` and tool registrar that
   the CLI uses can be mounted inside another host (this is how
   [Agent Code](https://github.com/Juliusolsson05/agent-code) renders each run as
@@ -155,7 +157,16 @@ import {
 
 const service = new WorkflowService({
   store: new FileWorkflowStore('/private/application/state/workflows'),
-  provider: () => new CodexAgentProvider({ codexPathOverride: '/approved/codex' }),
+  provider: () => new CodexAgentProvider({
+    codexPathOverride: '/approved/codex',
+    // Required before a host may attest that normal user/project MCP servers cannot leak into
+    // an automatically replayed read-only workflow attempt.
+    configurationIsolation: {
+      codexHome: '/private/application/state/workflow-codex',
+      authenticationFile: '/home/user/.codex/auth.json',
+    },
+    capabilities: { inheritedMcpServers: 'disabled' },
+  }),
   sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
 })
 await service.initialize()

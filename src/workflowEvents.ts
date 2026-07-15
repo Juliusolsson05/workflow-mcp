@@ -1,5 +1,7 @@
 import type {
   AgentActivityKind,
+  AgentRecoveryContext,
+  AgentReplaySafetyAssessment,
   AgentSandboxPolicy,
   AgentUsage,
   ProviderSessionReference,
@@ -249,6 +251,31 @@ export type AgentRetryScheduledEvent = AgentEvent<
     reason: WorkflowErrorReference
   }
 >
+export type AgentTerminationConfirmedEvent = AttemptEvent<
+  'agent.termination_confirmed',
+  {
+    reason: 'timeout' | 'cancellation' | 'shutdown'
+    boundary: 'settlement' | 'process-tree'
+  }
+>
+export type AgentRecoveryStartedEvent = AttemptEvent<
+  'agent.recovery_started',
+  {
+    previousAttemptId: string
+    context: AgentRecoveryContext
+  }
+>
+export type AgentRecoveryCompletedEvent = AttemptEvent<
+  'agent.recovery_completed',
+  { previousAttemptId: string }
+>
+export type AgentRecoveryRequiredEvent = AttemptEvent<
+  'agent.recovery_required',
+  {
+    error: WorkflowErrorReference
+    replaySafety: AgentReplaySafetyAssessment
+  }
+>
 export type AgentSkippedEvent = AgentEvent<'agent.skipped', { reason?: string }>
 export type AgentCancelledEvent = AgentEvent<'agent.cancelled', { reason?: string }>
 
@@ -319,6 +346,10 @@ export type WorkflowEvent =
   | AgentStalledEvent
   | AgentFailedEvent
   | AgentRetryScheduledEvent
+  | AgentTerminationConfirmedEvent
+  | AgentRecoveryStartedEvent
+  | AgentRecoveryCompletedEvent
+  | AgentRecoveryRequiredEvent
   | AgentSkippedEvent
   | AgentCancelledEvent
   | LogEvent
