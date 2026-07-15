@@ -232,6 +232,8 @@ export type ProviderCircuitSnapshot = {
 
 export type ProviderCircuitLease = {
   readonly probe: boolean
+  /** Atomically revalidates a reservation after scheduler capacity has been obtained. */
+  startAllowed(): boolean
   success(): void
   infrastructureFailure(): void
   neutral(): void
@@ -252,6 +254,7 @@ export class ProviderCircuitBreaker {
   readonly #failures: number[] = []
   #openUntil = 0
   #halfOpenProbe = false
+  #generation = 0
 
   constructor(policy: Pick<
     WorkflowReliabilityPolicy,
@@ -291,14 +294,29 @@ export class ProviderCircuitBreaker {
 
   #lease(probe: boolean): ProviderCircuitLease {
     let settled = false
+    const generation = this.#generation
+    let startCommitted = false
+    const startAllowed = (): boolean => {
+      if (settled) return false
+      if (startCommitted) return true
+      const allowed = generation === this.#generation && (
+        probe
+          ? this.#halfOpenProbe && this.#openUntil !== 0
+          : this.#openUntil === 0
+      )
+      if (allowed) startCommitted = true
+      return allowed
+    }
     const settle = (outcome: 'success' | 'failure' | 'neutral'): void => {
       if (settled) return
       settled = true
       const now = Date.now()
       if (outcome === 'success') {
+        const changedCircuitState = probe || this.#openUntil !== 0
         this.#failures.length = 0
         this.#openUntil = 0
         this.#halfOpenProbe = false
+        if (changedCircuitState) this.#generation += 1
         return
       }
       if (outcome === 'failure') {
@@ -307,6 +325,10 @@ export class ProviderCircuitBreaker {
         if (probe || this.#failures.length >= this.#threshold) {
           this.#openUntil = now + this.#cooldownMs
           this.#halfOpenProbe = false
+          // Every circuit transition invalidates reservations which passed enter() but were still
+          // waiting for scheduler capacity. Without this generation fence, a full nine-agent queue
+          // can continue launching one stale request at a time throughout an outage.
+          this.#generation += 1
         }
         return
       }
@@ -315,10 +337,12 @@ export class ProviderCircuitBreaker {
         // different queued call probe immediately instead of holding the circuit half-open forever.
         this.#halfOpenProbe = false
         this.#openUntil = now
+        this.#generation += 1
       }
     }
     return {
       probe,
+      startAllowed,
       success: () => settle('success'),
       infrastructureFailure: () => settle('failure'),
       neutral: () => settle('neutral'),

@@ -90,6 +90,41 @@ describe('PersistentWorkflowJournal', () => {
     })
   })
 
+  it('retains an unvisited exact-source sparse tail without receiving the fallback again', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-persistent-sparse-tail-'))
+    const filePath = join(root, 'resume.json')
+    const firstKey = createJournalKey('', 'one')
+    const secondKey = createJournalKey(firstKey, 'two')
+    const thirdKey = createJournalKey(secondKey, 'three')
+    const inherited: JournalSnapshot = {
+      ...identity,
+      records: [
+        { type: 'started', key: firstKey, agentId: 'old-one' },
+        { type: 'result', key: firstKey, agentId: 'old-one', result: 'one-result' },
+        { type: 'started', key: secondKey, agentId: 'old-two' },
+        { type: 'result', key: secondKey, agentId: 'old-two', result: 'two-result' },
+        { type: 'started', key: thirdKey, agentId: 'old-three' },
+        { type: 'result', key: thirdKey, agentId: 'old-three', result: 'three-result' },
+      ],
+    }
+    const replacement = await PersistentWorkflowJournal.open(filePath, [inherited])
+    const partial = replacement.beginRun(identity, { reuseMode: 'exact-source-sparse' })
+    expect(partial.admit({ agentId: 'replacement-one', prompt: 'one' }).reused).toBe(true)
+
+    const next = (await PersistentWorkflowJournal.open(filePath)).beginRun(identity, {
+      reuseMode: 'exact-source-sparse',
+    })
+    expect(next.admit({ agentId: 'next-one', prompt: 'one' }).reused).toBe(true)
+    expect(next.admit({ agentId: 'next-two', prompt: 'two' })).toMatchObject({
+      reused: true,
+      result: 'two-result',
+    })
+    expect(next.admit({ agentId: 'next-three', prompt: 'three' })).toMatchObject({
+      reused: true,
+      result: 'three-result',
+    })
+  })
+
   it('fails closed for corrupt files and source-mismatched sidecars', async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-persistent-invalid-'))
     const filePath = join(root, 'resume.json')

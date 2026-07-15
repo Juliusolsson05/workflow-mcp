@@ -57,6 +57,15 @@ const CODEX_SDK_VERSION = '0.144.4'
  */
 export class CodexAgentProvider implements AgentProvider {
   readonly name = 'codex'
+  // Codex can reach MCP servers whose tools mutate state outside the local sandbox. A read-only
+  // checkout therefore cannot prove that replaying a lost turn is harmless. Keep automatic retry
+  // and post-start crash continuation fail-closed until the embedding host can attest that every
+  // reachable remote tool is read-only or independently idempotent.
+  readonly automaticReplaySafety = 'unsafe-or-unknown' as const
+  // The pinned SDK exposes only the direct `codex exec` promise and calls ChildProcess.kill(). It
+  // does not expose the PID/process group, so workflow-mcp cannot prove that tool grandchildren
+  // died after cancellation. Fail closed until the host supplies a process-group-owning adapter.
+  readonly terminationBoundary = 'unconfirmed-descendants' as const
   readonly #client: CodexClientLike
   readonly #modelAliases: Readonly<Record<string, string | null>>
 

@@ -29,6 +29,7 @@ describe('FileWorkflowStore', () => {
   it('fsyncs append-only events and reconstructs a reducer snapshot', async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-store-'))
     const store = new FileWorkflowStore(root)
+    await store.acquireLease('test-store')
     await store.initialize()
     await store.createRun({ runId: 'run_store', cwd: root, workflow: loaded(), args: { a: 1 } })
 
@@ -45,12 +46,15 @@ describe('FileWorkflowStore', () => {
   it('truncates only a torn final JSONL append during startup recovery', async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-store-recover-'))
     const store = new FileWorkflowStore(root)
+    const lease = await store.acquireLease('seed-store')
     await store.initialize()
     await store.createRun({ runId: 'run_recover', cwd: root, workflow: loaded() })
     await store.appendEvent('run_recover', started('run_recover'))
     await appendFile(join(root, 'runs', 'run_recover', 'events.jsonl'), '{"runId":"run_recover"')
+    await lease.release()
 
     const reopened = new FileWorkflowStore(root)
+    await reopened.acquireLease('recovery-store')
     await reopened.initialize()
 
     await expect(reopened.readEvents('run_recover', 0, 10)).resolves.toMatchObject({
@@ -63,12 +67,16 @@ describe('FileWorkflowStore', () => {
   it('rejects corruption before the final torn record', async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-store-corrupt-'))
     const store = new FileWorkflowStore(root)
+    const lease = await store.acquireLease('seed-store')
     await store.initialize()
     await store.createRun({ runId: 'run_corrupt', cwd: root, workflow: loaded() })
     await store.appendEvent('run_corrupt', started('run_corrupt'))
     await appendFile(join(root, 'runs', 'run_corrupt', 'events.jsonl'), '{bad json}\n{"also":"data"}\n')
+    await lease.release()
 
-    await expect(new FileWorkflowStore(root).initialize()).rejects.toMatchObject({
+    const reopened = new FileWorkflowStore(root)
+    await reopened.acquireLease('corruption-reader')
+    await expect(reopened.initialize()).rejects.toMatchObject({
       code: 'corrupt-store',
     })
   })
@@ -76,6 +84,7 @@ describe('FileWorkflowStore', () => {
   it('rebuilds a stale manifest from events that were fsynced before a crash', async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-store-manifest-'))
     const store = new FileWorkflowStore(root)
+    const lease = await store.acquireLease('seed-store')
     await store.initialize()
     await store.createRun({ runId: 'run_manifest', cwd: root, workflow: loaded() })
     await store.appendEvent('run_manifest', started('run_manifest'))
@@ -97,8 +106,10 @@ describe('FileWorkflowStore', () => {
         event: completed,
       })}\n`,
     )
+    await lease.release()
 
     const reopened = new FileWorkflowStore(root)
+    await reopened.acquireLease('recovery-store')
     await reopened.initialize()
     await expect(reopened.getManifest('run_manifest')).resolves.toMatchObject({
       cursor: 2,

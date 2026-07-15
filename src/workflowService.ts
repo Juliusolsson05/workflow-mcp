@@ -57,6 +57,11 @@ export type WorkflowServiceOptions = {
   /** Shared provider capacity across every run owned by this service. */
   scheduler?: AgentScheduler
   recovery?: Partial<WorkflowRecoveryPolicy>
+  /**
+   * Selects which provider outage domain shares a circuit. The provider name is the safe default;
+   * hosts with multiple accounts or regions can include that immutable scope here.
+   */
+  providerCircuitKey?(provider: AgentProvider, context: WorkflowProviderFactoryContext): string
   budgetTokens?: number | null
   defaultModel?: string
   modelAliases?: Readonly<Record<string, string | null>>
@@ -100,7 +105,7 @@ export type WorkflowRunStartResult = {
   /** Directory containing Claude-shaped agent-<id>.jsonl transcript mirrors for this run. */
   transcriptDirectory: string
   resumedFromRunId?: string
-  lineageId: string
+  lineageId?: string
   recoveryMode?: 'manual' | 'automatic'
 }
 
@@ -133,6 +138,7 @@ export type WorkflowServiceErrorCode =
   | 'workflow-not-found'
   | 'run-not-resumable'
   | 'service-stopped'
+  | 'unsafe-provider-active'
   | 'invalid-request'
 
 export class WorkflowServiceError extends Error {
@@ -181,40 +187,107 @@ export type WorkflowServiceListener = (event: StoredWorkflowEvent) => void
 export class WorkflowService {
   readonly #options: WorkflowServiceOptions
   readonly #scheduler: AgentScheduler
-  readonly #circuitBreaker: ProviderCircuitBreaker
+  readonly #reliability: WorkflowReliabilityPolicy
+  readonly #circuitBreakers = new Map<string, ProviderCircuitBreaker>()
+  readonly #runCircuitKeys = new Map<string, string>()
   readonly #recovery: WorkflowRecoveryPolicy
   readonly #active = new Map<string, WorkflowRun>()
+  readonly #ownedRuns = new Map<string, WorkflowRun>()
   readonly #listeners = new Set<WorkflowServiceListener>()
   readonly #waiters = new Map<string, Set<() => void>>()
   readonly #runVersions = new Map<string, number>()
   readonly #idempotentStarts = new Map<string, Promise<WorkflowRunStartResult>>()
   #storeLease: WorkflowStoreLease | undefined
+  #storeLeaseRelease: Promise<void> | undefined
+  #initializePromise: Promise<void> | undefined
+  #stopPromise: Promise<void> | undefined
   #initialized = false
   #stopped = false
 
   constructor(options: WorkflowServiceOptions) {
     this.#options = options
     this.#scheduler = options.scheduler ?? new WorkConservingScheduler(options.limits?.concurrency ?? 9)
-    this.#circuitBreaker = new ProviderCircuitBreaker(normalizeReliabilityPolicy(options.reliability))
+    this.#reliability = normalizeReliabilityPolicy(options.reliability)
     this.#recovery = { ...DEFAULT_RECOVERY_POLICY, ...options.recovery }
   }
 
   async initialize(): Promise<void> {
+    if (this.#stopped) {
+      throw new WorkflowServiceError('service-stopped', 'Workflow service is stopped')
+    }
     if (this.#initialized) return
+    if (this.#initializePromise) return this.#initializePromise
+    const initialization = this.#initializeOnce()
+    this.#initializePromise = initialization
+    try {
+      await initialization
+    } finally {
+      if (this.#initializePromise === initialization) this.#initializePromise = undefined
+    }
+  }
+
+  async #initializeOnce(): Promise<void> {
+    let acquiredLease: WorkflowStoreLease | undefined
     try {
       // Acquire before recovery scans: FileWorkflowStore.initialize() can repair an event tail and
       // rewrite a manifest. Two hosts must not both perform that mutation before either announces
       // ownership. Stores without a lease API retain their historical initialize-first behavior.
-      this.#storeLease = await this.#options.store.acquireLease?.(`workflow-service:${randomUUID()}`)
+      acquiredLease = this.#storeLease ?? await this.#options.store.acquireLease?.(
+        `workflow-service:${randomUUID()}`,
+      )
+      this.#storeLease = acquiredLease
+      if (this.#stopped) {
+        await this.#releaseStoreLease()
+        throw new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+      }
       await this.#options.store.initialize()
+      // stop() may arrive while an asynchronous store repair is in flight. It deliberately waits
+      // for this initialization owner rather than stealing the lease, so this owner must notice the
+      // stop before advertising availability or creating recovery successors.
+      if (this.#stopped) {
+        throw new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+      }
       this.#initialized = true
+      const manifests = await this.#options.store.listManifests()
+      // The manifest scan can itself be a long filesystem operation on a FAT history. Recheck at
+      // each awaited boundary: otherwise a stop which lands during the scan can return only after
+      // initialization has unexpectedly launched every automatic-recovery run.
+      if (this.#stopped) {
+        throw new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+      }
+      const continuedRuns = new Set(
+        manifests.flatMap((manifest) => (
+          manifest.resumedFromRunId === undefined ? [] : [manifest.resumedFromRunId]
+        )),
+      )
       const recoverable: WorkflowRunManifest[] = []
-      for (const manifest of await this.#options.store.listManifests()) {
-        if (TERMINAL_STATUSES.has(manifest.status)) continue
+      for (const manifest of manifests) {
+        if (TERMINAL_STATUSES.has(manifest.status)) {
+          // WHY interrupted runs are reconsidered: the previous host may have durably written the
+          // terminal marker and died before creating its successor manifest. A successor is the
+          // recovery commit record; without one, skipping every terminal run strands the lineage.
+          if (
+            manifest.status === 'interrupted' &&
+            !continuedRuns.has(manifest.runId) &&
+            (
+              this.#automaticRecoveryIsSafe(manifest) ||
+              // A lone run.interrupted event is the recovery record for a cursor-zero queued run.
+              // No evaluator or provider was ever admitted, so continuing it cannot repeat a tool
+              // side effect even when the provider correctly refuses general automatic replay.
+              manifest.cursor === 1
+            )
+          ) recoverable.push(manifest)
+          continue
+        }
         const shouldRecover =
           this.#recovery.autoResumeOnInitialize &&
-          manifest.status === 'running' &&
-          this.#automaticRecoveryIsSafe()
+          (
+            (manifest.status === 'running' && this.#automaticRecoveryIsSafe(manifest)) ||
+            // WHY cursor zero makes this queued state unambiguous: createRun durably reserves the
+            // identity before runWorkflow can emit run.started. A process death in that narrow
+            // window performed no workflow call, so provider replay safety is irrelevant.
+            (manifest.status === 'queued' && manifest.cursor === 0)
+          )
         const timestamp = new Date().toISOString()
         const event: WorkflowEvent = {
           schemaVersion: 1,
@@ -239,7 +312,10 @@ export class WorkflowService {
           // allow two physical executions to publish the same sequence and make crash forensics
           // indistinguishable from duplicate provider events.
           await this.#resumeStored(
-            { cwd: manifest.cwd },
+            {
+              cwd: manifest.cwd,
+              ...(manifest.clientId === undefined ? {} : { clientId: manifest.clientId }),
+            },
             {
               runId: manifest.runId,
               idempotencyKey: `automatic-recovery:${manifest.runId}`,
@@ -260,24 +336,68 @@ export class WorkflowService {
       // next healthy process from recovering. Recovery is retriable only from a clean ownership
       // boundary.
       this.#initialized = false
-      await this.#storeLease?.release().catch(() => undefined)
-      this.#storeLease = undefined
+      // Only the initializer which acquired this generation may release it. A concurrent caller
+      // awaits the same promise, so it cannot tear down a lease another successful initializer won.
+      if (this.#storeLease === acquiredLease) {
+        try {
+          await acquiredLease?.release()
+          this.#storeLease = undefined
+        } catch (releaseError) {
+          // Preserve the lease object so stop() or a later initialize() can retry its token-owned
+          // release. Clearing it here would strand a live lock until process exit.
+          throw new AggregateError(
+            [error, releaseError],
+            'Workflow initialization failed and store ownership could not be released',
+          )
+        }
+      }
       throw error
     }
   }
 
   async stop(reason = 'Workflow service is stopping'): Promise<void> {
-    if (this.#stopped) return
+    if (this.#stopPromise) return this.#stopPromise
     this.#stopped = true
+    const stopping = this.#stopOnce(reason)
+    this.#stopPromise = stopping
+    try {
+      await stopping
+    } finally {
+      // FileWorkflowStore.release() deliberately remains retryable after transient I/O failure.
+      // Do not memoize a rejected service stop forever or callers can never exercise that retry.
+      if (this.#stopPromise === stopping) this.#stopPromise = undefined
+    }
+  }
+
+  async #stopOnce(reason: string): Promise<void> {
+    // Initialization owns the lease transition and recovery scan. Cancelling/releasing in the
+    // middle would let a second host enter while the first still mutates manifests. Once the shared
+    // initialization promise settles, this stop owns a clean, deterministic teardown boundary.
+    await this.#initializePromise?.catch(() => undefined)
+    let ownershipCanTransfer = true
     try {
       const runs = [...this.#active.values()]
       await Promise.allSettled(runs.map((run) => run.cancel(reason)))
       this.#active.clear()
+      ownershipCanTransfer = [...this.#ownedRuns.values()]
+        .every((run) => run.ownershipReleaseSafe?.() !== false)
       for (const waiters of this.#waiters.values()) for (const wake of waiters) wake()
       this.#waiters.clear()
     } finally {
-      await this.#storeLease?.release()
-      this.#storeLease = undefined
+      // WHY an unconfirmed adapter keeps the store lease even after its logical run failed: the
+      // old execution may still be mutating its workspace and can wake later with callbacks into
+      // this store. Releasing ownership would let a replacement service resume the same lineage
+      // concurrently. The OS removes this process-bound fence on process exit; before then, a
+      // cooperative adapter which eventually settles makes a later stop/resume safe again.
+      if (ownershipCanTransfer) {
+        await this.#releaseStoreLease()
+      }
+    }
+    if (!ownershipCanTransfer) {
+      throw new WorkflowServiceError(
+        'unsafe-provider-active',
+        'Workflow service retained store ownership because a provider attempt did not confirm termination',
+      )
     }
   }
 
@@ -336,12 +456,28 @@ export class WorkflowService {
 
   async health(scope: WorkflowServiceScope, runId: string): Promise<WorkflowRunHealth> {
     const snapshot = await this.snapshot(scope, runId)
+    return this.#healthFromSnapshot(snapshot)
+  }
+
+  /** A single replay drives both halves of the MCP status response. */
+  async inspect(
+    scope: WorkflowServiceScope,
+    runId: string,
+  ): Promise<{ run: WorkflowRunManifest; health: WorkflowRunHealth }> {
+    const snapshot = await this.snapshot(scope, runId)
+    return { run: snapshot.manifest, health: await this.#healthFromSnapshot(snapshot) }
+  }
+
+  async #healthFromSnapshot(snapshot: WorkflowRunSnapshot): Promise<WorkflowRunHealth> {
+    const runId = snapshot.manifest.runId
     const successor = (await this.#options.store.listManifests())
       .filter((manifest) => manifest.resumedFromRunId === runId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
       .at(-1)
     const attempts = snapshot.state.agents.flatMap((agent) => agent.attempts)
-    const progressTimes = attempts.map((attempt) => attempt.lastProgressAt).filter(Boolean)
+    const progressTimes = attempts
+      .map((attempt) => attempt.lastProgressAt)
+      .filter((value): value is string => value !== undefined)
     const runningStarts = attempts
       .filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
       .map((attempt) => attempt.startedAt)
@@ -352,7 +488,10 @@ export class WorkflowService {
       status: snapshot.manifest.status,
       cursor: snapshot.cursor,
       scheduler: this.#scheduler.snapshot(),
-      providerCircuit: this.#circuitBreaker.snapshot(),
+      providerCircuit: this.#circuitBreakers.get(this.#runCircuitKeys.get(runId) ?? '')?.snapshot() ?? {
+        state: 'closed',
+        recentFailures: 0,
+      },
       agents: {
         total: snapshot.state.counts.total,
         queued: snapshot.state.counts.queued,
@@ -428,6 +567,13 @@ export class WorkflowService {
     overrides?: WorkflowStartInput,
     recoveryMode: 'manual' | 'automatic' = 'manual',
   ): Promise<WorkflowRunStartResult> {
+    const owned = this.#ownedRuns.get(input.runId)
+    if (owned?.ownershipReleaseSafe?.() === false) {
+      throw new WorkflowServiceError(
+        'unsafe-provider-active',
+        `Workflow run ${input.runId} still has an unconfirmed provider execution`,
+      )
+    }
     const original = await this.status(scope, input.runId)
     if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
       throw new WorkflowServiceError(
@@ -558,28 +704,41 @@ export class WorkflowService {
     },
   ): Promise<WorkflowRunStartResult> {
     const runId = `run_${randomUUID()}`
+    const cwd = resolve(scope.cwd)
+    const providerContext: WorkflowProviderFactoryContext = {
+      runId,
+      cwd,
+      ...(scope.clientId === undefined ? {} : { clientId: scope.clientId }),
+    }
+    // Construct the provider before reserving the manifest so its replay-safety decision becomes
+    // part of the durable crash contract. Deriving this later from a replacement host would allow
+    // an upgraded or differently scoped MCP client to reinterpret an already-issued side effect.
+    const provider = typeof this.#options.provider === 'function'
+      ? this.#options.provider(providerContext)
+      : this.#options.provider
     let manifest = await this.#options.store.createRun({
       runId,
-      cwd: resolve(scope.cwd),
+      cwd,
       workflow,
       ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+      ...(scope.clientId === undefined ? {} : { clientId: scope.clientId }),
       ...(input.resumedFromRunId === undefined ? {} : { resumedFromRunId: input.resumedFromRunId }),
       lineageId: input.lineageId ?? runId,
       ...(input.recoveryMode === undefined ? {} : { recoveryMode: input.recoveryMode }),
+      automaticReplaySafe: provider.automaticReplaySafety === 'safe',
     })
     const journal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(runId),
       input.journalSnapshots,
     )
-    const cwd = resolve(scope.cwd)
-    const provider = typeof this.#options.provider === 'function'
-      ? this.#options.provider({
-          runId,
-          cwd,
-          ...(scope.clientId === undefined ? {} : { clientId: scope.clientId }),
-        })
-      : this.#options.provider
+    const circuitKey = this.#options.providerCircuitKey?.(provider, providerContext) ?? provider.name
+    if (circuitKey.length === 0) {
+      throw new WorkflowServiceError('invalid-request', 'Workflow provider circuit key must not be empty')
+    }
+    const circuitBreaker = this.#circuitBreakers.get(circuitKey) ?? new ProviderCircuitBreaker(this.#reliability)
+    this.#circuitBreakers.set(circuitKey, circuitBreaker)
+    this.#runCircuitKeys.set(runId, circuitKey)
     const run = runWorkflow({
       runId,
       workflow,
@@ -591,7 +750,7 @@ export class WorkflowService {
         ? 'exact-source-sparse'
         : 'longest-prefix',
       scheduler: this.#scheduler,
-      circuitBreaker: this.#circuitBreaker,
+      circuitBreaker,
       lineageId: input.lineageId ?? runId,
       ...(this.#options.workerLauncher === undefined
         ? {}
@@ -624,15 +783,39 @@ export class WorkflowService {
         network: false,
         ...this.#options.sandbox,
       },
+      // Durable store replay is the service source of truth. Keeping a second in-memory copy was
+      // the renderer-host memory amplification that originally made large workflows unstable.
+      retainEventHistory: false,
       eventSink: async (event) => {
         const stored = await this.#options.store.appendEvent(runId, event)
         this.#publish(stored)
       },
     })
     this.#active.set(runId, run)
+    this.#ownedRuns.set(runId, run)
     void run.result
       .catch(() => undefined)
-      .finally(() => this.#active.delete(runId))
+      .finally(() => {
+        this.#active.delete(runId)
+        if (run.ownershipReleaseSafe?.() !== false) {
+          this.#ownedRuns.delete(runId)
+          return
+        }
+        // A hostile adapter may outlive the finite cancellation path but still exit eventually.
+        // Keep the cross-process fence during that interval, then retire the quarantine and release
+        // a stopped service's lease automatically; requiring process exit after a late clean stop
+        // would turn a bounded provider fault into needless downtime.
+        void run.waitForOwnershipRelease?.().then(async () => {
+          if (run.ownershipReleaseSafe?.() === false) return
+          this.#ownedRuns.delete(runId)
+          if (this.#stopped && [...this.#ownedRuns.values()]
+            .every((owned) => owned.ownershipReleaseSafe?.() !== false)) {
+            await this.#releaseStoreLease()
+          }
+        }).catch((error: unknown) => {
+          console.error(`[workflow-mcp] Cannot retire provider quarantine for ${runId}:`, error)
+        })
+      })
 
     // First event persistence is asynchronous by design; returning queued immediately is what lets
     // an MCP client render a card before the evaluator or provider has completed any work.
@@ -686,9 +869,24 @@ export class WorkflowService {
     }
   }
 
-  #automaticRecoveryIsSafe(): boolean {
+  #automaticRecoveryIsSafe(manifest: WorkflowRunManifest): boolean {
+    if (!this.#recovery.autoResumeOnInitialize || manifest.automaticReplaySafe !== true) return false
     const mode = this.#options.sandbox?.mode ?? 'read-only'
     return mode === 'read-only' || this.#recovery.allowMutableSandbox
+  }
+
+  async #releaseStoreLease(): Promise<void> {
+    if (this.#storeLeaseRelease) return this.#storeLeaseRelease
+    const lease = this.#storeLease
+    if (!lease) return
+    const release = lease.release()
+    this.#storeLeaseRelease = release
+    try {
+      await release
+      if (this.#storeLease === lease) this.#storeLease = undefined
+    } finally {
+      if (this.#storeLeaseRelease === release) this.#storeLeaseRelease = undefined
+    }
   }
 
   async #serializeIdempotentStart(

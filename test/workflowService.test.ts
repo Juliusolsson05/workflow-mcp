@@ -167,12 +167,14 @@ describe('WorkflowService', () => {
   it('marks an abandoned queued manifest interrupted on service initialization', async () => {
     const fixture = await project(twoPhaseSource)
     const store = new FileWorkflowStore(fixture.storeRoot)
+    const seedLease = await store.acquireLease('abandoned-seed')
     await store.initialize()
     await store.createRun({
       runId: 'run_abandoned',
       cwd: fixture.cwd,
       workflow: parseWorkflowSource(twoPhaseSource),
     })
+    await seedLease.release()
     const service = new WorkflowService({ store, provider: new FakeAgentProvider([]) })
     await service.initialize()
 
