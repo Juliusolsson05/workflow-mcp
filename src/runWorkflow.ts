@@ -66,7 +66,7 @@ export type WorkflowResolver = (
 
 export type PreparedWorkingDirectory = {
   path: string
-  cleanup?(): Promise<void>
+  cleanup?(): Promise<void | { preservedPath: string }>
 }
 
 export type WorkingDirectoryPreparer = (input: {
@@ -1168,7 +1168,20 @@ class WorkflowRuntime {
       }
     } finally {
       try {
-        await prepared?.cleanup?.()
+        const cleanup = await prepared?.cleanup?.()
+        if (cleanup?.preservedPath) {
+          await this.#emit({
+            type: 'warning',
+            agentId: admission.agentId,
+            ...(attemptStarted ? { attemptId: admission.attemptId } : {}),
+            ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+            payload: {
+              code: 'working-directory-preserved',
+              message: `Isolated worktree contains changes and was preserved at ${cleanup.preservedPath}`,
+              details: { path: cleanup.preservedPath },
+            },
+          })
+        }
       } catch (error) {
         // Cleanup happens after the provider outcome is already authoritative. Turning a failed
         // best-effort worktree removal into a second agent failure would contradict the event

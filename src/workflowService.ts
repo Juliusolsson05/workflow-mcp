@@ -52,7 +52,7 @@ export type WorkflowServiceOptions = {
   modelAliases?: Readonly<Record<string, string | null>>
   defaultEffort?: string
   sandbox?: Partial<AgentSandboxPolicy>
-  resolveAgentType?(name: string): Promise<string | undefined>
+  resolveAgentType?(name: string, cwd: string): Promise<string | undefined>
   prepareWorkingDirectory?: RunWorkflowOptions['prepareWorkingDirectory']
 }
 
@@ -75,6 +75,8 @@ export type WorkflowRunStartResult = {
   cursor: number
   /** Editable Claude-visible definition. The private run store separately snapshots these bytes. */
   scriptPath?: string
+  /** Directory containing Claude-shaped agent-<id>.jsonl transcript mirrors for this run. */
+  transcriptDirectory: string
   resumedFromRunId?: string
 }
 
@@ -201,7 +203,7 @@ export class WorkflowService {
       : await this.#options.store.findByIdempotencyKey(resolve(scope.cwd), input.idempotencyKey)
     if (existing) {
       this.#assertScope(scope, existing)
-      return startResult(existing)
+      return startResult(existing, this.#options.store)
     }
 
     if (input.resumeFromRunId !== undefined) {
@@ -288,7 +290,7 @@ export class WorkflowService {
     }
     if (input.idempotencyKey !== undefined) {
       const existing = await this.#options.store.findByIdempotencyKey(resolve(scope.cwd), input.idempotencyKey)
-      if (existing) return startResult(existing)
+      if (existing) return startResult(existing, this.#options.store)
     }
 
     const originalWorkflow = await this.#options.store.loadWorkflow(input.runId)
@@ -373,7 +375,7 @@ export class WorkflowService {
 
     if (input.idempotencyKey !== undefined) {
       const existing = await this.#options.store.findByIdempotencyKey(cwd, input.idempotencyKey)
-      if (existing) return startResult(existing)
+      if (existing) return startResult(existing, this.#options.store)
     }
     const imported = await loadClaudeWorkflowResume(metadataPath, {
       ...(workflowPath === undefined ? {} : { workflowPath }),
@@ -447,7 +449,7 @@ export class WorkflowService {
         : { defaultEffort: this.#options.defaultEffort }),
       ...(this.#options.resolveAgentType === undefined
         ? {}
-        : { resolveAgentType: this.#options.resolveAgentType }),
+        : { resolveAgentType: (name: string) => this.#options.resolveAgentType!(name, cwd) }),
       ...(this.#options.prepareWorkingDirectory === undefined
         ? {}
         : { prepareWorkingDirectory: this.#options.prepareWorkingDirectory }),
@@ -473,7 +475,7 @@ export class WorkflowService {
     // First event persistence is asynchronous by design; returning queued immediately is what lets
     // an MCP client render a card before the evaluator or provider has completed any work.
     manifest = await this.#options.store.getManifest(runId) ?? manifest
-    return startResult(manifest)
+    return startResult(manifest, this.#options.store)
   }
 
   async #resolveVisibleWorkflow(scope: WorkflowServiceScope, name: string): Promise<FoundWorkflow> {
@@ -550,7 +552,10 @@ export class WorkflowService {
   }
 }
 
-function startResult(manifest: WorkflowRunManifest): WorkflowRunStartResult {
+function startResult(
+  manifest: WorkflowRunManifest,
+  store: WorkflowStore,
+): WorkflowRunStartResult {
   return {
     runId: manifest.runId,
     status: manifest.status,
@@ -560,6 +565,7 @@ function startResult(manifest: WorkflowRunManifest): WorkflowRunStartResult {
       ...(manifest.workflow.title === undefined ? {} : { title: manifest.workflow.title }),
     },
     cursor: manifest.cursor,
+    transcriptDirectory: store.transcriptDirectory(manifest.runId),
     ...(manifest.workflow.filePath === undefined ? {} : { scriptPath: manifest.workflow.filePath }),
     ...(manifest.resumedFromRunId === undefined
       ? {}

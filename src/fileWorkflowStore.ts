@@ -129,6 +129,7 @@ export class FileWorkflowStore implements WorkflowStore {
       await writePrivateFile(join(directory, 'events.jsonl'), '')
       await this.#writeManifest(manifest)
       await mkdir(join(directory, 'artifacts'), { mode: 0o700 })
+      await mkdir(join(directory, 'transcripts'), { mode: 0o700 })
       return manifest
     } catch (cause) {
       await rm(directory, { recursive: true, force: true })
@@ -206,6 +207,7 @@ export class FileWorkflowStore implements WorkflowStore {
     }
 
     await this.#writeManifest(applyEventToManifest(manifest, stored))
+    await this.#appendAgentTranscript(stored)
     if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) {
       const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()
       offsets.set(cursor, eventOffset)
@@ -287,6 +289,30 @@ export class FileWorkflowStore implements WorkflowStore {
 
   journalPath(runId: string): string {
     return join(this.#runDirectory(runId), 'journal.json')
+  }
+
+  transcriptDirectory(runId: string): string {
+    return join(this.#runDirectory(runId), 'transcripts')
+  }
+
+  async #appendAgentTranscript(stored: StoredWorkflowEvent): Promise<void> {
+    const event = stored.event
+    if (!('agentId' in event) || typeof event.agentId !== 'string') return
+    const agentId = event.agentId.replace(/[^A-Za-z0-9_-]/g, '-')
+    const path = join(this.transcriptDirectory(stored.runId), `agent-${agentId}.jsonl`)
+    try {
+      await writeFile(path, `${JSON.stringify(stored)}\n`, {
+        encoding: 'utf8',
+        flag: 'a',
+        mode: 0o600,
+      })
+    } catch (cause) {
+      // The canonical events.jsonl append and manifest are already durable. A transcript mirror is
+      // a discoverability aid for Claude-shaped tooling, never a second source of truth; failing a
+      // live workflow after its event committed would create a worse split-brain than reporting the
+      // secondary I/O problem and allowing replay to remain authoritative.
+      console.warn(`[workflow-mcp] Cannot append agent transcript ${path}:`, cause)
+    }
   }
 
   async #requiredManifest(runId: string): Promise<WorkflowRunManifest> {

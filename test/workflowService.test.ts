@@ -115,7 +115,9 @@ describe('WorkflowService', () => {
     })
     await first.initialize()
     const original = await first.start({ cwd: fixture.cwd }, { name: 'resume-me' })
-    while ((await first.status({ cwd: fixture.cwd }, original.runId)).cursor < 4) {
+    // session.started is the durable resume boundary; agent.started alone only proves the provider
+    // call was dispatched and may still lack a thread ID if the host stops immediately afterward.
+    while ((await first.status({ cwd: fixture.cwd }, original.runId)).cursor < 5) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 5))
     }
     await first.stop('test restart')
