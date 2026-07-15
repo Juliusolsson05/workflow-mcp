@@ -11,13 +11,18 @@ export type {
   WorkflowPhase,
 } from './loadWorkflow.js'
 
-export { findWorkflows, workflowLabel } from './findWorkflows.js'
+export {
+  findWorkflows,
+  resolveWorkflowSearchLayout,
+  workflowLabel,
+} from './findWorkflows.js'
 export type {
   FindWorkflowsOptions,
   FindWorkflowsResult,
   FoundWorkflow,
   WorkflowIssue,
   WorkflowLocation,
+  WorkflowSearchLayout,
 } from './findWorkflows.js'
 
 export {
@@ -119,6 +124,45 @@ export {
   canonicalizeJournalValue,
   createJournalKey,
 } from './workflowJournal.js'
+
+export type {
+  ParentToWorkerMessage,
+  WorkerToParentMessage,
+} from './workerMessages.js'
+export type {
+  WorkflowWorkerExit,
+  WorkflowWorkerHandle,
+  WorkflowWorkerLauncher,
+  WorkflowWorkerLaunchOptions,
+} from './workerLauncher.js'
+export { NodeWorkflowWorkerLauncher } from './nodeWorkflowWorkerLauncher.js'
+
+export { FileWorkflowStore, WorkflowStoreError } from './fileWorkflowStore.js'
+export type {
+  CreateWorkflowRunInput,
+  StoredWorkflowEvent,
+  WorkflowEventPage,
+  WorkflowRunManifest,
+  WorkflowRunSnapshot,
+  WorkflowStore,
+} from './workflowStore.js'
+
+export { WorkflowService, WorkflowServiceError } from './workflowService.js'
+export type {
+  WorkflowRunStartResult,
+  WorkflowStartInput,
+  WorkflowResumeInput,
+  WorkflowServiceErrorCode,
+  WorkflowServiceListener,
+  WorkflowServiceOptions,
+  WorkflowServiceScope,
+  WorkflowProviderFactoryContext,
+} from './workflowService.js'
+
+export { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
+export type { WorkflowMcpRegistrationHooks } from './workflowMcp.js'
+export { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
+export type { WorkflowMcpHttpServer } from './standaloneServer.js'
 export type {
   JournalAgentOptions,
   JournalCall,

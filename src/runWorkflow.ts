@@ -1,8 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { fork } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import { setMaxListeners } from 'node:events'
 import { existsSync } from 'node:fs'
-import { availableParallelism } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -46,6 +44,8 @@ import type {
   WorkflowWorkerLimits,
 } from './workerMessages.js'
 import { serializeWorkerError } from './workerMessages.js'
+import { NodeWorkflowWorkerLauncher } from './nodeWorkflowWorkerLauncher.js'
+import type { WorkflowWorkerHandle, WorkflowWorkerLauncher } from './workerLauncher.js'
 
 export type WorkflowLimits = {
   concurrency: number
@@ -66,7 +66,7 @@ export type WorkflowResolver = (
 
 export type PreparedWorkingDirectory = {
   path: string
-  cleanup?(): Promise<void>
+  cleanup?(): Promise<void | { preservedPath: string }>
 }
 
 export type WorkingDirectoryPreparer = (input: {
@@ -77,6 +77,8 @@ export type WorkingDirectoryPreparer = (input: {
 }) => Promise<PreparedWorkingDirectory>
 
 export type RunWorkflowOptions = {
+  /** A service may allocate and persist identity before starting the evaluator. */
+  runId?: string
   workflow: LoadedWorkflow
   args?: unknown
   cwd: string
@@ -88,10 +90,14 @@ export type RunWorkflowOptions = {
   resolveAgentType?(name: string): Promise<string | undefined>
   prepareWorkingDirectory?: WorkingDirectoryPreparer
   defaultModel?: string
+  /** Host-owned portable-name mapping; null selects the provider's configured default model. */
+  modelAliases?: Readonly<Record<string, string | null>>
   defaultEffort?: string
   sandbox?: Partial<AgentSandboxPolicy>
   eventSink?: WorkflowEventSink
   signal?: AbortSignal
+  workerLauncher?: WorkflowWorkerLauncher
+  workerFilePath?: string
 }
 
 export type WorkflowRun = {
@@ -119,10 +125,13 @@ export class WorkflowExecutionError extends Error {
 }
 
 const DEFAULT_LIMITS: WorkflowLimits = {
-  // One Codex SDK turn owns a native CLI process. Until the opt-in fan-out benchmark justifies a
-  // larger default, four avoids turning a large Claude workflow into sixteen simultaneous native
-  // processes merely because the host reports many logical CPUs.
-  concurrency: Math.min(4, Math.max(2, availableParallelism() - 2)),
+  // WHY this is a product-level constant rather than derived from logical CPUs: one agent is mostly
+  // waiting on provider/network work, so a CPU heuristic held capable machines to four without
+  // protecting the actual constrained resource. Nine is the Agent Code operating point: enough
+  // fan-out for broad workflows to make progress while keeping native CLI/process pressure bounded.
+  // Explicit `limits.concurrency` and WORKFLOW_MCP_CONCURRENCY still override this when a caller has
+  // a workload-specific reason to choose differently.
+  concurrency: 9,
   maxAgentCalls: 1_000,
   maxCollectionItems: 4_096,
   maxLogCharacters: 10_000,
@@ -139,7 +148,10 @@ const DEFAULT_SANDBOX: AgentSandboxPolicy = {
   network: false,
 }
 
-const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh'])
+// `max` is part of Claude's public Workflow source language. `minimal` remains accepted as a
+// provider-portability extension because older workflow-mcp definitions already used it; rejecting
+// those files would add incompatibility without making a Claude-authored file any safer.
+const VALID_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const BLOCKED_VALUE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 type WorkflowEventDraft = WorkflowEvent extends infer Event
@@ -156,7 +168,7 @@ type Deferred<Value> = {
 
 type AgentAdmission = {
   requestId: string
-  worker: ChildProcess
+  worker: WorkflowWorkerHandle
   agentId: string
   phaseId?: string
   attemptId: string
@@ -167,6 +179,14 @@ type AgentAdmission = {
   journalRun: WorkflowJournalRun
   validateOutput?: ValidateFunction
   depth: number
+}
+
+type PhaseRuntimeState = {
+  title: string
+  entered: boolean
+  sealed: boolean
+  activeAgents: number
+  terminal: boolean
 }
 
 function deferred<Value>(): Deferred<Value> {
@@ -180,35 +200,61 @@ function deferred<Value>(): Deferred<Value> {
 }
 
 class WorkflowEventStream implements AsyncIterable<WorkflowEvent> {
-  readonly #events: WorkflowEvent[] = []
-  readonly #waiters = new Set<() => void>()
+  readonly #subscribers = new Set<{
+    queue: WorkflowEvent[]
+    wake: (() => void) | undefined
+  }>()
   #closed = false
 
   publish(event: WorkflowEvent): void {
     if (this.#closed) return
-    this.#events.push(event)
-    for (const wake of this.#waiters) wake()
-    this.#waiters.clear()
+    for (const subscriber of this.#subscribers) {
+      subscriber.queue.push(event)
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
   }
 
   close(): void {
     this.#closed = true
-    for (const wake of this.#waiters) wake()
-    this.#waiters.clear()
+    for (const subscriber of this.#subscribers) {
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
   }
 
   [Symbol.asyncIterator](): AsyncIterator<WorkflowEvent> {
-    let cursor = 0
+    // WHY events are queued per active iterator instead of retained globally: WorkflowService uses
+    // the durable eventSink and intentionally never consumes this convenience stream. The old
+    // replay array therefore held every activity for the lifetime of every app-owned run even
+    // though no reader could observe it. Direct runWorkflow/CLI callers attach synchronously (all
+    // publishing is serialized through a promise turn) and retain lossless live delivery, while an
+    // unused stream now costs constant memory.
+    const subscriber: { queue: WorkflowEvent[]; wake: (() => void) | undefined } = {
+      queue: [],
+      wake: undefined,
+    }
+    this.#subscribers.add(subscriber)
+    const remove = (): void => {
+      this.#subscribers.delete(subscriber)
+      subscriber.queue.length = 0
+      subscriber.wake?.()
+      subscriber.wake = undefined
+    }
     return {
       next: async (): Promise<IteratorResult<WorkflowEvent>> => {
-        while (cursor >= this.#events.length && !this.#closed) {
-          await new Promise<void>((resolveWait) => this.#waiters.add(resolveWait))
+        while (subscriber.queue.length === 0 && !this.#closed) {
+          await new Promise<void>((resolveWait) => { subscriber.wake = resolveWait })
         }
-        const event = this.#events[cursor]
+        const event = subscriber.queue.shift()
         if (event !== undefined) {
-          cursor += 1
           return { done: false, value: event }
         }
+        remove()
+        return { done: true, value: undefined }
+      },
+      return: async (): Promise<IteratorResult<WorkflowEvent>> => {
+        remove()
         return { done: true, value: undefined }
       },
     }
@@ -275,7 +321,7 @@ class Semaphore {
 }
 
 class WorkflowRuntime {
-  readonly id = `run_${randomUUID()}`
+  readonly id: string
   readonly #options: RunWorkflowOptions
   readonly #limits: WorkflowLimits
   readonly #sandbox: AgentSandboxPolicy
@@ -286,11 +332,15 @@ class WorkflowRuntime {
   readonly #journal: WorkflowJournal
   readonly #journalRun: WorkflowJournalRun
   readonly #ajv = new Ajv({ allErrors: true, strict: false })
-  readonly #workers = new Set<ChildProcess>()
+  readonly #workers = new Set<WorkflowWorkerHandle>()
   readonly #tasks = new Set<Promise<void>>()
   readonly #phaseByTitle = new Map<string, string>()
+  readonly #phaseRuntime = new Map<string, PhaseRuntimeState>()
+  readonly #agentPhase = new Map<string, string>()
+  readonly #terminalAgents = new Set<string>()
   readonly #childCounts = new Map<string, number>()
-  readonly #pendingWorkerRequests = new Map<ChildProcess, Set<string>>()
+  readonly #pendingWorkerRequests = new Map<WorkflowWorkerHandle, Set<string>>()
+  readonly #warnedModelAliases = new Set<string>()
   #eventSequence = 0
   #phaseSequence = 0
   #agentSequence = 0
@@ -303,8 +353,14 @@ class WorkflowRuntime {
   #wallClockTimer: NodeJS.Timeout | undefined
 
   constructor(options: RunWorkflowOptions) {
+    this.id = options.runId ?? `run_${randomUUID()}`
     this.#options = options
     this.#limits = normalizeLimits(options.limits)
+    // Large Claude workflows legitimately park more than Node's default ten cancellation
+    // listeners on one run signal (semaphore waiters, providers, and timers). Bound the diagnostic
+    // threshold by the already-enforced admission limit so Node 20 does not report a false leak
+    // while still warning if listener growth somehow exceeds the maximum logical work of the run.
+    setMaxListeners(this.#limits.maxAgentCalls + 10, this.#controller.signal)
     validateBudget(options.budgetTokens)
     this.#sandbox = normalizeSandbox(options.sandbox)
     this.#scheduler = new Semaphore(this.#limits.concurrency)
@@ -449,6 +505,8 @@ class WorkflowRuntime {
     ])
     await this.#killWorkers()
 
+    await this.#failOpenPhases(new WorkflowCancelledError(reason))
+
     try {
       await this.#emit({
         type: 'run.cancelled',
@@ -480,6 +538,8 @@ class WorkflowRuntime {
     ])
     await this.#killWorkers()
     const reference = errorReference(error)
+
+    await this.#failOpenPhases(error)
 
     try {
       await this.#emit({ type: 'run.failed', payload: { error: reference } })
@@ -515,9 +575,9 @@ class WorkflowRuntime {
   async #killWorkers(): Promise<void> {
     const workers = [...this.#workers]
     await Promise.all(workers.map(async (worker) => {
-      if (worker.exitCode !== null || worker.signalCode !== null) return
-      const exited = new Promise<void>((resolveExit) => worker.once('exit', () => resolveExit()))
-      if (!worker.killed) worker.kill('SIGKILL')
+      if (!worker.isRunning()) return
+      const exited = new Promise<void>((resolveExit) => worker.onExit(() => resolveExit()))
+      worker.terminate()
       // SIGKILL is authoritative on supported local hosts, but a short bound keeps cancellation
       // from hanging forever if a mocked ChildProcess violates Node's lifecycle contract.
       await Promise.race([exited, delay(this.#limits.cancellationGraceMs)])
@@ -528,6 +588,24 @@ class WorkflowRuntime {
   #emit(draft: WorkflowEventDraft): Promise<void> {
     const operation = this.#emitTail.then(async () => {
       if (this.#terminal) return
+      await this.#publishDraft(draft)
+      if (
+        draft.type === 'agent.reused' ||
+        draft.type === 'agent.completed' ||
+        draft.type === 'agent.failed' ||
+        draft.type === 'agent.skipped' ||
+        draft.type === 'agent.cancelled'
+      ) {
+        await this.#recordAgentTerminal(draft.agentId)
+      }
+    })
+    // A failed sink rejects the caller that produced the event, but later failure/cancellation
+    // events still need an ordering chain instead of inheriting the first rejection forever.
+    this.#emitTail = operation.catch(() => undefined)
+    return operation
+  }
+
+  async #publishDraft(draft: WorkflowEventDraft): Promise<void> {
       this.#eventSequence += 1
       const event = {
         ...draft,
@@ -539,11 +617,6 @@ class WorkflowRuntime {
       } as WorkflowEvent
       await this.#options.eventSink?.(event)
       this.#stream.publish(event)
-    })
-    // A failed sink rejects the caller that produced the event, but later failure/cancellation
-    // events still need an ordering chain instead of inheriting the first rejection forever.
-    this.#emitTail = operation.catch(() => undefined)
-    return operation
   }
 
   async #ensurePhase(
@@ -556,6 +629,13 @@ class WorkflowRuntime {
     this.#phaseSequence += 1
     const phaseId = `phase_${this.#phaseSequence}`
     this.#phaseByTitle.set(title, phaseId)
+    this.#phaseRuntime.set(phaseId, {
+      title,
+      entered: false,
+      sealed: false,
+      activeAgents: 0,
+      terminal: false,
+    })
     await this.#emit({
       type: 'phase.discovered',
       phaseId,
@@ -566,6 +646,7 @@ class WorkflowRuntime {
         ...(metadata?.model === undefined ? {} : { model: metadata.model }),
       },
     })
+
     return phaseId
   }
 
@@ -580,13 +661,10 @@ class WorkflowRuntime {
     if (this.#controller.signal.aborted) {
       throw new WorkflowCancelledError(abortReason(this.#controller.signal))
     }
-    const worker = fork(workerFilePath(), [], {
+    const launcher = this.#options.workerLauncher ?? new NodeWorkflowWorkerLauncher()
+    const worker = launcher.launch({
+      workerFilePath: this.#options.workerFilePath ?? workerFilePath(),
       env: minimalWorkerEnvironment(),
-      // Test runners, Electron, and `node --input-type` all add parent exec flags that are invalid
-      // or unsafe for a file-based child. The worker needs no loader or inspector inheritance.
-      execArgv: [],
-      serialization: 'advanced',
-      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
     })
     this.#workers.add(worker)
 
@@ -614,7 +692,7 @@ class WorkflowRuntime {
       outcome.reject(error)
     }
 
-    worker.on('message', (raw: WorkerToParentMessage) => {
+    const removeMessageListener = worker.onMessage((raw: WorkerToParentMessage) => {
       messageTail = messageTail
         .then(async () => {
           if (raw.type === 'ready') {
@@ -639,12 +717,20 @@ class WorkflowRuntime {
 
           if (raw.type === 'phase') {
             if (input.depth > 0) return
-            currentPhaseId = await this.#ensurePhase(raw.title, 'runtime')
-            await this.#emit({
-              type: 'phase.entered',
-              phaseId: currentPhaseId,
-              payload: { title: raw.title },
-            })
+            const nextPhaseId = await this.#ensurePhase(raw.title, 'runtime')
+            if (currentPhaseId !== nextPhaseId) {
+              if (currentPhaseId !== undefined) await this.#sealPhase(currentPhaseId)
+              currentPhaseId = nextPhaseId
+              const phase = this.#phaseRuntime.get(currentPhaseId)
+              if (phase && !phase.entered) {
+                phase.entered = true
+                await this.#emit({
+                  type: 'phase.entered',
+                  phaseId: currentPhaseId,
+                  payload: { title: raw.title },
+                })
+              }
+            }
             return
           }
 
@@ -701,6 +787,7 @@ class WorkflowRuntime {
               )
               return
             }
+            if (currentPhaseId !== undefined) await this.#sealPhase(currentPhaseId)
             settleResolve(raw.value)
             return
           }
@@ -709,39 +796,46 @@ class WorkflowRuntime {
         .catch(settleReject)
     })
 
-    worker.once('error', settleReject)
-    worker.once('exit', (code, signal) => {
+    const removeErrorListener = worker.onError(settleReject)
+    const removeExitListener = worker.onExit(({ code, signal }) => {
       this.#workers.delete(worker)
-      if (settled) return
-      if (this.#controller.signal.aborted) {
-        settleReject(new WorkflowCancelledError(abortReason(this.#controller.signal)))
-        return
-      }
-      const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`
-      settleReject(
-        new WorkflowExecutionError(
-          'worker-exit',
-          `Workflow worker exited with ${detail}${stderr.length === 0 ? '' : `: ${stderr}`}`,
-        ),
-      )
+      // Node can deliver the terminal IPC message and process exit back-to-back. Processing that
+      // message may now await durable phase events, so exit must drain the already-received message
+      // tail before deciding that a clean worker exit lacked a terminal result.
+      void messageTail.then(() => {
+        if (settled) return
+        if (this.#controller.signal.aborted) {
+          settleReject(new WorkflowCancelledError(abortReason(this.#controller.signal)))
+          return
+        }
+        const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`
+        settleReject(
+          new WorkflowExecutionError(
+            'worker-exit',
+            `Workflow worker exited with ${detail}${stderr.length === 0 ? '' : `: ${stderr}`}`,
+          ),
+        )
+      }).catch(settleReject)
     })
 
     try {
       return await outcome.promise
     } finally {
+      removeMessageListener()
+      removeErrorListener()
+      removeExitListener()
       this.#workers.delete(worker)
       this.#pendingWorkerRequests.delete(worker)
-      if (worker.connected) worker.disconnect()
-      if (worker.exitCode === null && worker.signalCode === null) {
-        const exited = new Promise<void>((resolveExit) => worker.once('exit', () => resolveExit()))
-        if (!worker.killed) worker.kill()
+      if (worker.isRunning()) {
+        const exited = new Promise<void>((resolveExit) => worker.onExit(() => resolveExit()))
+        worker.terminate()
         await Promise.race([exited, delay(this.#limits.cancellationGraceMs)])
       }
     }
   }
 
   async #acceptAgentRequest(input: {
-    worker: ChildProcess
+    worker: WorkflowWorkerHandle
     request: Extract<WorkerToParentMessage, { type: 'agent.request' }>
     depth: number
     journalRun: WorkflowJournalRun
@@ -786,6 +880,12 @@ class WorkflowRuntime {
       options: input.request.options,
     })
 
+    if (phaseId !== undefined) {
+      this.#agentPhase.set(agentId, phaseId)
+      const phase = this.#phaseRuntime.get(phaseId)
+      if (phase) phase.activeAgents += 1
+    }
+
     await this.#emit({
       type: 'agent.admitted',
       agentId,
@@ -798,6 +898,29 @@ class WorkflowRuntime {
         cacheKey: decision.key,
       },
     })
+
+    const requestedModel = input.request.options.model
+    if (
+      requestedModel !== undefined &&
+      this.#options.modelAliases !== undefined &&
+      Object.prototype.hasOwnProperty.call(this.#options.modelAliases, requestedModel) &&
+      !this.#warnedModelAliases.has(requestedModel)
+    ) {
+      this.#warnedModelAliases.add(requestedModel)
+      const mapped = this.#options.modelAliases[requestedModel]
+      await this.#emit({
+        type: 'warning',
+        agentId,
+        ...(phaseId === undefined ? {} : { phaseId }),
+        payload: {
+          code: 'model-alias-mapped',
+          message: mapped === null
+            ? `Workflow model ${JSON.stringify(requestedModel)} uses the host provider's configured default`
+            : `Workflow model ${JSON.stringify(requestedModel)} maps to ${JSON.stringify(mapped)}`,
+          details: { requestedModel, mappedModel: mapped },
+        },
+      })
+    }
 
     if (decision.reused) {
       const value = cloneBoundaryValue(decision.result, this.#limits)
@@ -852,20 +975,20 @@ class WorkflowRuntime {
       this.#options.budgetTokens !== null &&
       this.#budgetSpent >= this.#options.budgetTokens
     ) {
-      const reason = 'Workflow token budget is exhausted'
-      input.journalRun.recordResult(decision, null)
+      // Claude exposes this pool as a hard output-token ceiling. Returning null here used to make a
+      // sequential workflow silently continue with missing data, which is materially different
+      // from Claude's catchable throw and made `budget.remaining()` guards impossible to trust.
+      const budgetError = new WorkflowExecutionError(
+        'budget-exhausted',
+        `Workflow output-token budget is exhausted (${this.#budgetSpent}/${this.#options.budgetTokens})`,
+      )
       await this.#emit({
-        type: 'agent.skipped',
+        type: 'agent.failed',
         agentId,
         ...(phaseId === undefined ? {} : { phaseId }),
-        payload: { reason },
+        payload: { error: errorReference(budgetError) },
       })
-      this.#send(input.worker, {
-        type: 'agent.result',
-        requestId: input.request.requestId,
-        result: { type: 'success', value: null },
-        budgetSpent: this.#budgetSpent,
-      })
+      this.#replyAgentError(input.worker, input.request.requestId, budgetError)
       return
     }
 
@@ -982,7 +1105,10 @@ class WorkflowRuntime {
       }
 
       const value = this.#providerValue(result, admission.validateOutput)
-      if (result.usage?.totalTokens !== undefined) this.#budgetSpent += result.usage.totalTokens
+      // Claude's budget pool counts generated output only. Input/context tokens may dwarf the
+      // actual requested work on resumed threads; charging totalTokens caused identical workflows
+      // to stop at wildly different points depending on provider cache state.
+      if (result.usage?.outputTokens !== undefined) this.#budgetSpent += result.usage.outputTokens
       admission.journalRun.recordResult(admission.journalMiss, value)
       const completedSession = result.providerSession ?? providerSession
 
@@ -1068,7 +1194,20 @@ class WorkflowRuntime {
       }
     } finally {
       try {
-        await prepared?.cleanup?.()
+        const cleanup = await prepared?.cleanup?.()
+        if (cleanup?.preservedPath) {
+          await this.#emit({
+            type: 'warning',
+            agentId: admission.agentId,
+            ...(attemptStarted ? { attemptId: admission.attemptId } : {}),
+            ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+            payload: {
+              code: 'working-directory-preserved',
+              message: `Isolated worktree contains changes and was preserved at ${cleanup.preservedPath}`,
+              details: { path: cleanup.preservedPath },
+            },
+          })
+        }
       } catch (error) {
         // Cleanup happens after the provider outcome is already authoritative. Turning a failed
         // best-effort worktree removal into a second agent failure would contradict the event
@@ -1201,7 +1340,7 @@ class WorkflowRuntime {
   }
 
   async #executeNestedWorkflow(
-    worker: ChildProcess,
+    worker: WorkflowWorkerHandle,
     request: Extract<WorkerToParentMessage, { type: 'workflow.request' }>,
     depth: number,
   ): Promise<void> {
@@ -1220,6 +1359,15 @@ class WorkflowRuntime {
     this.#childCounts.set(workflow.meta.name, count)
     const title = `workflow:${workflow.meta.name}${count === 1 ? '' : ` #${count}`}`
     const phaseId = await this.#ensurePhase(title, 'runtime')
+    const phase = this.#phaseRuntime.get(phaseId)
+    if (phase && !phase.entered) {
+      phase.entered = true
+      await this.#emit({
+        type: 'phase.entered',
+        phaseId,
+        payload: { title },
+      })
+    }
     // A child has its own source compatibility boundary. Reusing the parent's chain lets an
     // unchanged parent replay stale child results after the child file changes. The deterministic
     // invocation suffix also keeps two calls to the same child from overwriting each other's run.
@@ -1235,6 +1383,7 @@ class WorkflowRuntime {
       forcedPhaseId: phaseId,
       logPrefix: `[${workflow.meta.name}] `,
     })
+    await this.#sealPhase(phaseId)
     this.#completeWorkerRequest(worker, request.requestId, {
       type: 'workflow.result',
       requestId: request.requestId,
@@ -1243,7 +1392,7 @@ class WorkflowRuntime {
     })
   }
 
-  #replyAgentError(worker: ChildProcess, requestId: string, error: unknown): void {
+  #replyAgentError(worker: WorkflowWorkerHandle, requestId: string, error: unknown): void {
     this.#completeWorkerRequest(worker, requestId, {
       type: 'agent.result',
       requestId,
@@ -1252,14 +1401,14 @@ class WorkflowRuntime {
     })
   }
 
-  #markWorkerRequest(worker: ChildProcess, requestId: string): void {
+  #markWorkerRequest(worker: WorkflowWorkerHandle, requestId: string): void {
     const existing = this.#pendingWorkerRequests.get(worker)
     if (existing) existing.add(requestId)
     else this.#pendingWorkerRequests.set(worker, new Set([requestId]))
   }
 
   #completeWorkerRequest(
-    worker: ChildProcess,
+    worker: WorkflowWorkerHandle,
     requestId: string,
     message: ParentToWorkerMessage,
   ): void {
@@ -1269,13 +1418,57 @@ class WorkflowRuntime {
     this.#send(worker, message)
   }
 
-  #send(worker: ChildProcess, message: ParentToWorkerMessage): void {
-    if (!worker.connected) return
-    try {
-      worker.send(message)
-    } catch {
-      // The worker exit listener owns terminal failure. Treating a send-after-exit as a second
-      // failure here would race that authoritative process-lifecycle signal.
+  #send(worker: WorkflowWorkerHandle, message: ParentToWorkerMessage): void {
+    worker.postMessage(message)
+  }
+
+  async #sealPhase(phaseId: string): Promise<void> {
+    const phase = this.#phaseRuntime.get(phaseId)
+    if (!phase || phase.terminal) return
+    phase.sealed = true
+    await this.#completePhaseIfReady(phaseId, phase)
+  }
+
+  async #recordAgentTerminal(agentId: string): Promise<void> {
+    if (this.#terminalAgents.has(agentId)) return
+    this.#terminalAgents.add(agentId)
+    const phaseId = this.#agentPhase.get(agentId)
+    if (!phaseId) return
+    const phase = this.#phaseRuntime.get(phaseId)
+    if (!phase || phase.terminal) return
+    phase.activeAgents = Math.max(0, phase.activeAgents - 1)
+    if (phase.sealed && phase.activeAgents === 0) {
+      // We are already executing inside the serialized emit tail, so publishing directly preserves
+      // event order without recursively waiting on the tail that currently owns this callback.
+      phase.terminal = true
+      await this.#publishDraft({
+        type: 'phase.completed',
+        phaseId,
+        payload: { title: phase.title },
+      })
+    }
+  }
+
+  async #completePhaseIfReady(phaseId: string, phase: PhaseRuntimeState): Promise<void> {
+    if (!phase.entered || !phase.sealed || phase.activeAgents > 0 || phase.terminal) return
+    phase.terminal = true
+    await this.#emit({
+      type: 'phase.completed',
+      phaseId,
+      payload: { title: phase.title },
+    })
+  }
+
+  async #failOpenPhases(error: unknown): Promise<void> {
+    const reference = errorReference(error)
+    for (const [phaseId, phase] of this.#phaseRuntime) {
+      if (!phase.entered || phase.terminal) continue
+      phase.terminal = true
+      await this.#emit({
+        type: 'phase.failed',
+        phaseId,
+        payload: { title: phase.title, error: reference },
+      })
     }
   }
 
@@ -1364,11 +1557,15 @@ function normalizeAgentOptions(
   const effort = options.effort !== undefined && VALID_EFFORTS.has(options.effort)
     ? options.effort
     : run.defaultEffort
+  const requestedModel = options.model ?? run.defaultModel
+  const mappedModel = requestedModel === undefined
+    ? undefined
+    : Object.prototype.hasOwnProperty.call(run.modelAliases ?? {}, requestedModel)
+      ? run.modelAliases?.[requestedModel] ?? undefined
+      : requestedModel
   return {
     ...(options.schema === undefined ? {} : { schema: cloneBoundaryValue(options.schema, limits) }),
-    ...(options.model ?? run.defaultModel) === undefined
-      ? {}
-      : { model: options.model ?? run.defaultModel },
+    ...(mappedModel === undefined ? {} : { model: mappedModel }),
     ...(effort === undefined ? {} : { effort }),
     ...(options.agentType === undefined ? {} : { agentType: options.agentType }),
     ...(options.isolation === undefined ? {} : { isolation: options.isolation }),
@@ -1472,14 +1669,34 @@ function contentReference(value: unknown, limits: WorkflowLimits = DEFAULT_LIMIT
     : typeof cloned === 'string'
       ? cloned
       : JSON.stringify(cloned, null, 2)
-  const previewLimit = 4_000
+  const previewLimit = Math.min(4_000, limits.maxLogCharacters)
+  const contentWasCapped = full.length > limits.maxLogCharacters
+
+  // WHY the cap belongs here rather than in `cloneBoundaryValue`: boundary cloning also carries
+  // execution values into workers and journals, where truncation would silently change workflow
+  // semantics. A ContentReference is an observability/display record. Retaining a megabyte-scale
+  // command result in it defeats the advertised limit, bloats every durable event replay, and can
+  // make Electron structured-clone plus DOM text layout monopolize the renderer. The exact value
+  // remains available to execution and journal reuse; only this display copy becomes bounded.
+  const retainedContent = contentWasCapped ? full.slice(0, limits.maxLogCharacters) : cloned
   return {
     preview: full.slice(0, previewLimit),
-    lineCount: full.length === 0 ? 0 : full.split('\n').length,
-    ...(cloned === undefined ? {} : { content: cloned }),
-    mediaType: typeof cloned === 'string' || cloned === undefined ? 'text/plain' : 'application/json',
+    lineCount: countLines(full),
+    ...(cloned === undefined ? {} : { content: retainedContent }),
+    mediaType: contentWasCapped || typeof cloned === 'string' || cloned === undefined
+      ? 'text/plain'
+      : 'application/json',
     ...(full.length <= previewLimit ? {} : { truncated: true }),
   }
+}
+
+function countLines(value: string): number {
+  if (value.length === 0) return 0
+  let count = 1
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) === 10) count += 1
+  }
+  return count
 }
 
 function activityDetails(activity: AgentProviderActivity, limits: WorkflowLimits) {

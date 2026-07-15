@@ -123,7 +123,8 @@ export class AgentProviderFailure extends Error {
   readonly providerSession?: ProviderSessionReference
 
   constructor(message: string, options: AgentProviderFailureOptions = {}) {
-    super(message, options.cause === undefined ? undefined : { cause: options.cause })
+    super(message)
+    if (options.cause !== undefined) Object.defineProperty(this, 'cause', { value: options.cause })
     this.name = 'AgentProviderFailure'
     if (options.code !== undefined) this.code = options.code
     this.retryable = options.retryable ?? false
@@ -136,7 +137,8 @@ export class AgentProviderAbortError extends Error {
   readonly reason: unknown
 
   constructor(reason?: unknown) {
-    super(abortMessage(reason), reason instanceof Error ? { cause: reason } : undefined)
+    super(abortMessage(reason))
+    if (reason instanceof Error) Object.defineProperty(this, 'cause', { value: reason })
     this.name = 'AbortError'
     this.reason = reason
   }
