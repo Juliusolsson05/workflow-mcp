@@ -411,7 +411,9 @@ describe('unattended workflow reliability', () => {
       workflow: workflow(`return await agent('long provider call with quiet evaluator')`),
       cwd: process.cwd(),
       provider: new FakeAgentProvider([{
-        delayMs: 250,
+        // Longer than the configured watchdog, so the old fixed 5s heartbeat deterministically
+        // fails; short enough that this remains a focused regression test.
+        delayMs: 1_250,
         outcome: { type: 'result', output: { type: 'text', text: 'worker stayed alive' } },
       }]),
       reliability: {
@@ -420,12 +422,14 @@ describe('unattended workflow reliability', () => {
         // evaluator heartbeat contract. Letting the independent provider-idle watchdog fire first
         // would return null for the right production reason while proving nothing about heartbeat
         // cadence below the old hard-coded five seconds.
-        idleTimeoutMs: 1_000,
-        activeOperationTimeoutMs: 1_000,
-        attemptTimeoutMs: 2_000,
-        workerHeartbeatTimeoutMs: 100,
-        workerIdleTimeoutMs: 2_000,
-        workerStartupTimeoutMs: 2_000,
+        idleTimeoutMs: 3_000,
+        activeOperationTimeoutMs: 3_000,
+        attemptTimeoutMs: 4_000,
+        // One second still proves the cadence is policy-derived and below five seconds, while
+        // allowing a busy CI host to deschedule the evaluator for more than a few dozen ms.
+        workerHeartbeatTimeoutMs: 1_000,
+        workerIdleTimeoutMs: 4_000,
+        workerStartupTimeoutMs: 4_000,
       },
     })
 
@@ -443,6 +447,9 @@ describe('unattended workflow reliability', () => {
       eventSink: async (event) => {
         if (event.type === 'agent.queued') throw new Error('persistent event sink failed')
       },
+      // Make the counterfactual visible without a brittle wall-clock race: the old self-dependency
+      // had to consume this full one-second grace; the fixed path does not wait for it at all.
+      limits: { cancellationGraceMs: 1_000 },
       reliability: {
         ...FAST_RETRY,
         hardTerminationGraceMs: 10,
@@ -451,7 +458,7 @@ describe('unattended workflow reliability', () => {
     })
 
     await expect(run.result).rejects.toThrow('persistent event sink failed')
-    expect(Date.now() - startedAt).toBeLessThan(250)
+    expect(Date.now() - startedAt).toBeLessThan(750)
   })
 
   it('escalates run cancellation through the attempt-addressed termination hook', async () => {
