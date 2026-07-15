@@ -17,9 +17,46 @@ deterministic suite includes a 76-agent state fixture and a 17-agent execution f
 authenticated Codex text and Claude-style structured workflows are covered by the opt-in suite.
 
 The native-process benchmark harness for milestone 8 is implemented as `npm run benchmark:codex`,
-but its 49 real turns are intentionally not run by CI or as a side effect of installation. Until
-those measurements are recorded, default concurrency is the conservative value four. Service-level
-storage/locking, MCP transport, and UI code remain outside this execution change exactly as planned.
+but its 49 real turns are intentionally not run by CI or as a side effect of installation. Default
+concurrency is nine — the Agent Code operating point chosen because one agent is mostly waiting on
+provider work, so the earlier CPU-derived value of four under-used capable machines (see the
+`DEFAULT_LIMITS` comment in `runWorkflow.ts`). Service-level storage/locking, MCP transport, and
+UI code remain outside this execution change exactly as planned.
+
+## Verified against the Claude 2.1.210 binary — 2026-07-15
+
+The installed Claude Code CLI (`~/.local/share/claude/versions/2.1.210`, a Bun binary with the
+JavaScript embedded as searchable text) was used to settle every "what does Claude actually do?"
+question left open by the contract capture in `references/`. Findings, with the runtime behavior
+each one pins:
+
+1. **Budget exhaustion throws.** `agent()` admission runs a guard that throws
+   `WorkflowBudgetExceededError` ("Workflow token budget exceeded (X / Y output tokens). Stopping
+   further agent() calls. In-flight agents will complete; their results are preserved.") once
+   `getTurnSpent() >= total`, *before* the call index increments or a journal key is computed. A
+   `total <= 0` disables the guard entirely. `runWorkflow.ts` now mirrors all three properties.
+2. **Budgets count output tokens** from a turn-wide shared counter — confirmed by the error text
+   and the `getTurnSpent` implementation. The runtime charges `usage.outputTokens`.
+3. **`parallel()`/`pipeline()` match the budget error by name**, convert those slots to `null`,
+   and log one aggregate `N slots dropped — token budget exceeded` line; other failures keep
+   per-slot logs. The realm helpers in `workflowWorker.ts` now do the same.
+4. **`pipeline()` short-circuits on `null` returns** (`if (value === null) break`), not only on
+   thrown errors — the existing realm behavior was already correct.
+5. **Resume invalidates the whole suffix after the first miss** via a one-way flag; later calls
+   run live even when their chained keys match history. The existing stateful
+   `#canReusePrefix = false` behavior was already correct.
+6. **Null results are never journaled** (`if (result !== null) append(...)`), so they are never
+   reused — the existing matcher was already correct.
+7. **The v2 key is** `sha256(previousKey \0 prompt \0 canonicalOptions)` with the option allowlist
+   exactly `["schema","model","effort","isolation","agentType"]`, functions skipped, keys sorted,
+   `__proto__` skipped — matching `workflowJournal.ts` byte for byte.
+8. **Effort vocabulary includes `max`**, and unsupported tiers are silently downgraded (Claude
+   maps `max` → `high` when a model lacks it). The Codex adapter downgrades `max` → `xhigh`, its
+   nearest supported tier.
+
+Claude also accepts `stallMs` and `isolation: "remote"` options this runtime does not implement;
+both are outside the journal-key allowlist except `isolation`, so they remain future work rather
+than resume-compatibility risks.
 
 ## Outcome
 

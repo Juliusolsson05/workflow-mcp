@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
@@ -500,12 +501,21 @@ export class WorkflowService {
   }
 
   #assertScope(scope: WorkflowServiceScope, manifest: WorkflowRunManifest): void {
-    if (resolve(scope.cwd) !== manifest.cwd) {
-      throw new WorkflowServiceError(
-        'scope-forbidden',
-        `Workflow run ${manifest.runId} belongs to another project`,
-      )
+    if (resolve(scope.cwd) === manifest.cwd) return
+    // Manifests store resolve()d paths, but a client may address the same project through a
+    // symlink (common for ~/dev shims and macOS /tmp). The Claude-resume importer already
+    // compares realpaths; without the same tolerance here, that one caller could import a run
+    // this method then refuses to read. realpath only runs on the mismatch path, so the common
+    // exact-match case stays free of filesystem calls.
+    try {
+      if (realpathSync(scope.cwd) === realpathSync(manifest.cwd)) return
+    } catch {
+      // A path that cannot be canonicalized cannot prove scope membership; fall through.
     }
+    throw new WorkflowServiceError(
+      'scope-forbidden',
+      `Workflow run ${manifest.runId} belongs to another project`,
+    )
   }
 
   #assertAvailable(): void {

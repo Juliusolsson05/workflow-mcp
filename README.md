@@ -48,7 +48,7 @@ WORKFLOW_CODEX_INTEGRATION=1 npm run test:integration
 # Expensive and never run by CI: 49 real turns across the planned 1/4/8/16/20 fan-outs.
 WORKFLOW_CODEX_BENCHMARK=1 npm run benchmark:codex
 
-# Operator-only override for a measured machine; the normal default remains four native turns.
+# Operator-only override for a measured machine; the normal default remains nine native turns.
 WORKFLOW_MCP_CONCURRENCY=12 node dist/cli.js resume /path/to/wf_id.json
 
 # Start a normal stdio MCP server scoped to one project.
@@ -165,10 +165,12 @@ journal. The sidecar records completed results and Codex thread IDs after every 
 second interruption resumes the new suffix instead of restarting it. `WorkflowService` is the one
 writer and active-run owner; direct callers must still not point two executors at one journal.
 
-Token budgets charge the explicit provider `totalTokens`; the Codex adapter defines this as input
-plus output tokens (cached input and reasoning are already reported as subsets). Default provider
-concurrency is four pending fan-out measurements; callers can configure it through
-`limits.concurrency`.
+Token budgets charge provider `outputTokens`, matching Claude's observed accounting (its budget
+error reports "output tokens" and its turn counter tracks output spend). The Codex adapter still
+reports full usage — including its input+output `totalTokens` — but only output spend counts
+against the workflow budget. Default provider concurrency is nine (the Agent Code operating
+point; see the `DEFAULT_LIMITS` comment in `runWorkflow.ts`); callers can configure it through
+`limits.concurrency` or `WORKFLOW_MCP_CONCURRENCY`.
 
 ## Why the name
 
@@ -463,6 +465,12 @@ type WorkflowBudget = {
 Without an explicit token target, `total` is `null` and `remaining()` is `Infinity`. Budget checks
 are admission controls: already-running calls are not retroactively killed when another call uses
 the remainder.
+
+Enforcement is Claude-shaped (verified against the 2.1.210 binary): once output-token spend
+reaches the target, `agent()` **throws** `WorkflowBudgetExceededError` at admission — before the
+call receives an index or journal record — and a `total <= 0` target disables enforcement rather
+than refusing every call. `parallel()` and `pipeline()` match that error by name, convert the
+affected slots to `null`, and log one aggregate `N slots dropped — token budget exceeded` line.
 
 The official local `extract-rules` workflow uses `budget.remaining()` to stop a loop-until-dry
 search. Budget behavior is therefore part of the compatibility core, not optional accounting UI.

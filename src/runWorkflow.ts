@@ -124,6 +124,23 @@ export class WorkflowExecutionError extends Error {
   }
 }
 
+/**
+ * The error name and message are part of the portable workflow contract, not cosmetics. Claude
+ * 2.1.210 throws `WorkflowBudgetExceededError` from `agent()` admission, and its realm helpers
+ * (`parallel`/`pipeline`) match that exact name to turn exceeded slots into null results with one
+ * aggregate log line. A workflow written against Claude may therefore catch by `error.name`, so a
+ * different name here would silently change control flow of an unmodified file.
+ */
+export class WorkflowBudgetExceededError extends Error {
+  constructor(spent: number, total: number) {
+    super(
+      `Workflow token budget exceeded (${spent.toLocaleString()} / ${total.toLocaleString()} output tokens). ` +
+        'Stopping further agent() calls. In-flight agents will complete; their results are preserved.',
+    )
+    this.name = 'WorkflowBudgetExceededError'
+  }
+}
+
 const DEFAULT_LIMITS: WorkflowLimits = {
   // WHY this is a product-level constant rather than derived from logical CPUs: one agent is mostly
   // waiting on provider/network work, so a CPU heuristic held capable machines to four without
@@ -341,6 +358,7 @@ class WorkflowRuntime {
   readonly #childCounts = new Map<string, number>()
   readonly #pendingWorkerRequests = new Map<WorkflowWorkerHandle, Set<string>>()
   readonly #warnedModelAliases = new Set<string>()
+  #warnedBudgetExceeded = false
   #eventSequence = 0
   #phaseSequence = 0
   #agentSequence = 0
@@ -853,6 +871,30 @@ class WorkflowRuntime {
       )
       return
     }
+    // WHY the budget gate sits before any identity allocation: Claude 2.1.210 checks the shared
+    // output-token pool before computing the call index or journal key (`I(),P()` precede the v2
+    // lookup in its agent() implementation). Refusing here means an exceeded call leaves no
+    // phantom agent record and no started-only journal entry, and a `total <= 0` target disables
+    // enforcement entirely — both observed Claude behaviors, not choices this runtime gets to make.
+    const budgetTotal = this.#options.budgetTokens
+    if (budgetTotal !== undefined && budgetTotal !== null && budgetTotal > 0 && this.#budgetSpent >= budgetTotal) {
+      if (!this.#warnedBudgetExceeded) {
+        this.#warnedBudgetExceeded = true
+        await this.#emit({
+          type: 'warning',
+          payload: {
+            code: 'workflow-budget-exceeded',
+            message: `Workflow token budget exceeded (${this.#budgetSpent}/${budgetTotal} output tokens); further agent() calls throw`,
+          },
+        })
+      }
+      this.#replyAgentError(
+        input.worker,
+        input.request.requestId,
+        new WorkflowBudgetExceededError(this.#budgetSpent, budgetTotal),
+      )
+      return
+    }
 
     this.#agentSequence += 1
     const agentId = `agent_${this.#agentSequence}`
@@ -968,28 +1010,6 @@ class WorkflowRuntime {
         this.#replyAgentError(input.worker, input.request.requestId, schemaError)
         return
       }
-    }
-
-    if (
-      this.#options.budgetTokens !== undefined &&
-      this.#options.budgetTokens !== null &&
-      this.#budgetSpent >= this.#options.budgetTokens
-    ) {
-      // Claude exposes this pool as a hard output-token ceiling. Returning null here used to make a
-      // sequential workflow silently continue with missing data, which is materially different
-      // from Claude's catchable throw and made `budget.remaining()` guards impossible to trust.
-      const budgetError = new WorkflowExecutionError(
-        'budget-exhausted',
-        `Workflow output-token budget is exhausted (${this.#budgetSpent}/${this.#options.budgetTokens})`,
-      )
-      await this.#emit({
-        type: 'agent.failed',
-        agentId,
-        ...(phaseId === undefined ? {} : { phaseId }),
-        payload: { error: errorReference(budgetError) },
-      })
-      this.#replyAgentError(input.worker, input.request.requestId, budgetError)
-      return
     }
 
     await this.#emit({
