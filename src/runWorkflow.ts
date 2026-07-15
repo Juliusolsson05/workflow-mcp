@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { setMaxListeners } from 'node:events'
 import { existsSync } from 'node:fs'
-import { availableParallelism } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -126,10 +125,13 @@ export class WorkflowExecutionError extends Error {
 }
 
 const DEFAULT_LIMITS: WorkflowLimits = {
-  // One Codex SDK turn owns a native CLI process. Until the opt-in fan-out benchmark justifies a
-  // larger default, four avoids turning a large Claude workflow into sixteen simultaneous native
-  // processes merely because the host reports many logical CPUs.
-  concurrency: Math.min(4, Math.max(2, availableParallelism() - 2)),
+  // WHY this is a product-level constant rather than derived from logical CPUs: one agent is mostly
+  // waiting on provider/network work, so a CPU heuristic held capable machines to four without
+  // protecting the actual constrained resource. Nine is the Agent Code operating point: enough
+  // fan-out for broad workflows to make progress while keeping native CLI/process pressure bounded.
+  // Explicit `limits.concurrency` and WORKFLOW_MCP_CONCURRENCY still override this when a caller has
+  // a workload-specific reason to choose differently.
+  concurrency: 9,
   maxAgentCalls: 1_000,
   maxCollectionItems: 4_096,
   maxLogCharacters: 10_000,
@@ -1622,14 +1624,34 @@ function contentReference(value: unknown, limits: WorkflowLimits = DEFAULT_LIMIT
     : typeof cloned === 'string'
       ? cloned
       : JSON.stringify(cloned, null, 2)
-  const previewLimit = 4_000
+  const previewLimit = Math.min(4_000, limits.maxLogCharacters)
+  const contentWasCapped = full.length > limits.maxLogCharacters
+
+  // WHY the cap belongs here rather than in `cloneBoundaryValue`: boundary cloning also carries
+  // execution values into workers and journals, where truncation would silently change workflow
+  // semantics. A ContentReference is an observability/display record. Retaining a megabyte-scale
+  // command result in it defeats the advertised limit, bloats every durable event replay, and can
+  // make Electron structured-clone plus DOM text layout monopolize the renderer. The exact value
+  // remains available to execution and journal reuse; only this display copy becomes bounded.
+  const retainedContent = contentWasCapped ? full.slice(0, limits.maxLogCharacters) : cloned
   return {
     preview: full.slice(0, previewLimit),
-    lineCount: full.length === 0 ? 0 : full.split('\n').length,
-    ...(cloned === undefined ? {} : { content: cloned }),
-    mediaType: typeof cloned === 'string' || cloned === undefined ? 'text/plain' : 'application/json',
+    lineCount: countLines(full),
+    ...(cloned === undefined ? {} : { content: retainedContent }),
+    mediaType: contentWasCapped || typeof cloned === 'string' || cloned === undefined
+      ? 'text/plain'
+      : 'application/json',
     ...(full.length <= previewLimit ? {} : { truncated: true }),
   }
+}
+
+function countLines(value: string): number {
+  if (value.length === 0) return 0
+  let count = 1
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) === 10) count += 1
+  }
+  return count
 }
 
 function activityDetails(activity: AgentProviderActivity, limits: WorkflowLimits) {

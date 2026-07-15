@@ -1,13 +1,23 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import * as z from 'zod/v4'
 
-import type { WorkflowService, WorkflowServiceScope } from './workflowService.js'
+import type {
+  WorkflowRunStartResult,
+  WorkflowService,
+  WorkflowServiceScope,
+} from './workflowService.js'
+
+export type WorkflowMcpRegistrationHooks = {
+  /** Called after a durable run exists, before its MCP result is returned. */
+  onRunStarted?: (run: WorkflowRunStartResult) => void
+}
 
 /** Register the portable workflow surface on an MCP server owned by the embedding host. */
 export function registerWorkflowMcpTools(
   server: McpServer,
   service: WorkflowService,
   scope: WorkflowServiceScope,
+  hooks: WorkflowMcpRegistrationHooks = {},
 ): void {
   server.registerTool(
     'workflow_list',
@@ -60,14 +70,20 @@ export function registerWorkflowMcpTools(
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async ({ name, args, idempotencyKey }) => result({
-      ok: true,
-      run: await service.start(scope, {
+    async ({ name, args, idempotencyKey }) => {
+      const run = await service.start(scope, {
         name,
         ...(args === undefined ? {} : { args }),
         ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
-      }),
-    }),
+      })
+      // WHY the host learns about the run here instead of scraping its own transcript later:
+      // modern MCP clients are allowed to defer tools behind code-mode orchestrators, which means
+      // the model-visible call may be `functions.exec` even though the wire operation was exactly
+      // `workflow_run`. This hook is still inside the authoritative tools/call handler and therefore
+      // preserves the real client scope without coupling the portable service to Electron.
+      hooks.onRunStarted?.(run)
+      return result({ ok: true, run })
+    },
   )
 
   server.registerTool(
@@ -137,9 +153,8 @@ export function registerWorkflowMcpTools(
       ]),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
-    async (input) => result({
-      ok: true,
-      run: await service.resume(
+    async (input) => {
+      const run = await service.resume(
         scope,
         'runId' in input
           ? {
@@ -151,8 +166,12 @@ export function registerWorkflowMcpTools(
               ...(input.workflowPath === undefined ? {} : { workflowPath: input.workflowPath }),
               ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             },
-      ),
-    }),
+      )
+      // Resume creates a new durable run ID. Publishing the returned reference through the same
+      // hook lets an embedding host keep one stable workflow view while following that lineage.
+      hooks.onRunStarted?.(run)
+      return result({ ok: true, run })
+    },
   )
 }
 
