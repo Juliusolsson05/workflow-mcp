@@ -330,6 +330,42 @@ describe('workflow state projection', () => {
     })
   })
 
+  it('projects and clears the concrete reason an admitted agent is still queued', () => {
+    const fixture = eventFactory()
+    fixture.emit({
+      type: 'run.started',
+      payload: { workflow: { name: 'circuit-wait', description: 'Circuit wait visibility' } },
+    })
+    fixture.emit({
+      type: 'agent.admitted',
+      agentId: 'agent-1',
+      payload: {
+        callIndex: 0,
+        label: 'review',
+        prompt: content('Review the runtime'),
+        options: {},
+        cacheKey: 'review-key',
+      },
+    })
+    fixture.emit({
+      type: 'agent.queued',
+      agentId: 'agent-1',
+      payload: { reason: 'Waiting for codex provider health probe' },
+    })
+
+    let state = projectWorkflowState(runId, fixture.events)
+    expect(state.agents[0]?.queueReason).toBe('Waiting for codex provider health probe')
+
+    fixture.emit({
+      type: 'agent.started',
+      agentId: 'agent-1',
+      attemptId: 'attempt-1',
+      payload: { attemptNumber: 1, source: 'live', provider: 'codex' },
+    })
+    state = projectWorkflowState(runId, fixture.events)
+    expect(state.agents[0]?.queueReason).toBeUndefined()
+  })
+
   it('projects cancellation, warnings, logs, artifacts, and failed activity as data', () => {
     const fixture = eventFactory()
     fixture.emit({

@@ -292,6 +292,8 @@ export type ProviderCircuitLease = {
   readonly probe: boolean
   /** Atomically revalidates a reservation after scheduler capacity has been obtained. */
   startAllowed(): boolean
+  /** Close a half-open outage after durable normalized provider progress. */
+  providerResponsive(): void
   success(): void
   infrastructureFailure(): void
   neutral(): void
@@ -354,6 +356,7 @@ export class ProviderCircuitBreaker {
     let settled = false
     const generation = this.#generation
     let startCommitted = false
+    let probeRecovered = false
     const startAllowed = (): boolean => {
       if (settled) return false
       if (startCommitted) return true
@@ -370,7 +373,14 @@ export class ProviderCircuitBreaker {
       settled = true
       const now = Date.now()
       if (outcome === 'success') {
-        const changedCircuitState = probe || this.#openUntil !== 0
+        // A half-open probe may have already proved the provider responsive on
+        // its first durable event.  In that case queued reservations were
+        // deliberately released immediately.  Advancing the generation again
+        // when the same long-running attempt eventually completes would make
+        // those newly admitted reservations look stale and send them back
+        // through the gate for no new outage.  Completion still closes a
+        // circuit that was reopened by a genuinely later failure.
+        const changedCircuitState = (probe && !probeRecovered) || this.#openUntil !== 0
         this.#failures.length = 0
         this.#openUntil = 0
         this.#halfOpenProbe = false
@@ -380,7 +390,7 @@ export class ProviderCircuitBreaker {
       if (outcome === 'failure') {
         this.#failures.push(now)
         this.#prune(now)
-        if (probe || this.#failures.length >= this.#threshold) {
+        if ((probe && !probeRecovered) || this.#failures.length >= this.#threshold) {
           this.#openUntil = now + this.#cooldownMs
           this.#halfOpenProbe = false
           // Every circuit transition invalidates reservations which passed enter() but were still
@@ -390,7 +400,7 @@ export class ProviderCircuitBreaker {
         }
         return
       }
-      if (probe) {
+      if (probe && !probeRecovered) {
         // A deterministic request/schema failure says nothing about provider availability. Let a
         // different queued call probe immediately instead of holding the circuit half-open forever.
         this.#halfOpenProbe = false
@@ -401,6 +411,19 @@ export class ProviderCircuitBreaker {
     return {
       probe,
       startAllowed,
+      providerResponsive: () => {
+        if (settled || !startCommitted || !probe || probeRecovered) return
+        // WHY one durable event is enough: a model may spend many minutes reading after the
+        // process and transport have demonstrably recovered. Waiting for the final answer made a
+        // healthy five-agent review run at concurrency one despite eight free permits. Keep this
+        // lease unsettled so a later transport failure is recorded as a new failure rather than
+        // being mistaken for continuation of the old outage burst.
+        probeRecovered = true
+        this.#failures.length = 0
+        this.#openUntil = 0
+        this.#halfOpenProbe = false
+        this.#generation += 1
+      },
       success: () => settle('success'),
       infrastructureFailure: () => settle('failure'),
       neutral: () => settle('neutral'),

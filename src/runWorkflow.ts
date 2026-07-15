@@ -1258,10 +1258,25 @@ class WorkflowRuntime {
         let providerLease: SchedulerLease | undefined
         let circuitLease: ProviderCircuitLease | undefined
         let attemptRequest: AgentRequest | undefined
+        let announcedCircuitWait = false
         try {
           // Circuit wait owns no provider capacity. When the provider is globally unavailable,
           // queued work remains visible without nine backoff loops pinning all nine permits.
           while (true) {
+            const circuit = this.#circuitBreaker.snapshot()
+            if (circuit.state !== 'closed' && !announcedCircuitWait) {
+              announcedCircuitWait = true
+              await this.#emit({
+                type: 'agent.queued',
+                agentId: admission.agentId,
+                ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+                payload: {
+                  reason: circuit.state === 'half-open'
+                    ? `Waiting for ${this.#options.provider.name} provider health probe`
+                    : `Waiting for ${this.#options.provider.name} provider circuit cooldown`,
+                },
+              })
+            }
             circuitLease = await this.#circuitBreaker.enter(this.#controller.signal)
             providerLease = await this.#acquireProviderLease(this.#controller.signal)
             this.#observeScheduler(this.#runScheduler.snapshot())
@@ -1321,6 +1336,7 @@ class WorkflowRuntime {
             attemptNumber,
             request: attemptRequest,
             onSession: (session) => { providerSession = session },
+            onProviderProgress: () => circuitLease?.providerResponsive(),
           })
           circuitLease.success()
           if (this.#controller.signal.aborted || this.#terminal) {
@@ -1418,7 +1434,9 @@ class WorkflowRuntime {
           }
 
           if (error instanceof AgentProviderFailure) {
-            if (error.retryable) circuitLease?.infrastructureFailure()
+            if (error.retryable && error.circuitImpact === 'infrastructure') {
+              circuitLease?.infrastructureFailure()
+            }
             else circuitLease?.neutral()
             const replaySafety = this.#replaySafety(
               admission,
@@ -1626,6 +1644,7 @@ class WorkflowRuntime {
     attemptNumber: number
     request: AgentRequest
     onSession(session: ProviderSessionReference): void
+    onProviderProgress(): void
   }): Promise<AgentProviderResult> {
     const attemptController = new AbortController()
     const onRunAbort = (): void => attemptController.abort(this.#controller.signal.reason)
@@ -1668,6 +1687,10 @@ class WorkflowRuntime {
           monitor.progress(event)
           if (event.type === 'session.started') input.onSession(event.session)
           await this.#emitProviderEvent(input.admission, input.attemptId, event, activityIds)
+          // Parent-generated warnings (for example a safe fresh-thread fallback) do not prove that
+          // Codex is healthy. Session/activity events crossed the provider boundary and were
+          // durably recorded, which is sufficient to release a half-open probe immediately.
+          if (event.type !== 'warning') input.onProviderProgress()
         },
         // Provider-host heartbeat is recorded only by process diagnostics. Feeding it to `progress`
         // would let a healthy Node wrapper mask a permanently wedged Codex stream.
