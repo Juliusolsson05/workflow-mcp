@@ -11,6 +11,7 @@ import type {
   WorkflowEvent,
   WorkflowEventType,
 } from './workflowEvents.js'
+import type { AgentReplaySafetyAssessment } from './agentProvider.js'
 
 export type WorkflowRunStatus =
   | 'pending'
@@ -61,6 +62,7 @@ export type WorkflowAttemptSnapshot = {
   absoluteDeadlineAt?: string
   completedAt?: string
   providerSession?: ProviderSessionReference
+  replaySafety?: AgentReplaySafetyAssessment
   usage?: AgentUsage
   error?: WorkflowErrorReference
   stall?: {
@@ -224,7 +226,7 @@ export function createWorkflowState(runId: string): WorkflowSnapshot {
     runId,
     sequence: 0,
     status: 'pending',
-    counts: emptyCounts(),
+    counts: createWorkflowAgentCounts(),
     phases: [],
     agents: [],
     logs: [],
@@ -233,7 +235,8 @@ export function createWorkflowState(runId: string): WorkflowSnapshot {
   }
 }
 
-function emptyCounts(): WorkflowAgentCounts {
+/** One constructor prevents browser lineage projections from omitting newly added statuses. */
+export function createWorkflowAgentCounts(): WorkflowAgentCounts {
   return {
     total: 0,
     admitted: 0,
@@ -336,7 +339,7 @@ function applyAgentOutcome(
 }
 
 function deriveCounts(agents: WorkflowAgentSnapshot[]): WorkflowAgentCounts {
-  const counts = emptyCounts()
+  const counts = createWorkflowAgentCounts()
   counts.total = agents.length
 
   for (const agent of agents) {
@@ -666,6 +669,9 @@ export function reduceWorkflowState(
           ...(event.payload.providerSession === undefined
             ? {}
             : { providerSession: event.payload.providerSession }),
+          ...(event.payload.replaySafety === undefined
+            ? {}
+            : { replaySafety: event.payload.replaySafety }),
         }
         const {
           retry: _scheduledRetry,

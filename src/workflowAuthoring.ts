@@ -1,5 +1,6 @@
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
-import { extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { constants } from 'node:fs'
+import { lstat, mkdir, open, readFile, realpath } from 'node:fs/promises'
+import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import { findWorkflows, resolveWorkflowSearchLayout } from './findWorkflows.js'
 import type { FoundWorkflow } from './findWorkflows.js'
@@ -33,7 +34,8 @@ export async function loadScopedWorkflowPath(cwd: string, requestedPath: string)
   let location: FoundWorkflow['location'] | undefined
 
   for (const directory of allowed) {
-    const boundary = await realpath(directory).catch(() => resolve(directory))
+    const boundary = await confinedWorkflowDirectory(directory).catch(() => undefined)
+    if (boundary === undefined) continue
     if (!isInside(boundary, candidate)) continue
     location = directory === layout.userDirectory ? 'user' : 'project'
     break
@@ -72,16 +74,35 @@ export async function persistInlineWorkflow(cwd: string, source: string): Promis
 
   const layout = await resolveWorkflowSearchLayout({ cwd })
   await mkdir(layout.authoredDirectory, { recursive: true })
+  await confinedWorkflowDirectory(layout.authoredDirectory)
   const baseName = workflowFileName(parsed.meta.name)
   const preferred = join(layout.authoredDirectory, `${baseName}.js`)
   const filePath = await availablePath(preferred, parsed.sourceHash, source)
 
+  let file
   try {
-    await writeFile(filePath, source, { encoding: 'utf8', flag: 'wx', mode: 0o644 })
+    // O_EXCL prevents a final-component symlink race and O_NOFOLLOW documents the invariant for
+    // platforms which implement it. The parent is revalidated after opening because recursive
+    // mkdir alone will happily traverse a concurrently substituted `.claude` symlink.
+    file = await open(
+      filePath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o644,
+    )
+    await confinedWorkflowDirectory(layout.authoredDirectory)
+    await file.writeFile(source, { encoding: 'utf8' })
+    await file.sync()
   } catch (cause) {
     if ((cause as NodeJS.ErrnoException).code !== 'EEXIST') throw cause
     // Two MCP calls can author the same source concurrently. Treat byte-identical creation as one
     // idempotent definition, but never let the loser overwrite bytes selected by the winner.
+    if ((await lstat(filePath)).isSymbolicLink()) {
+      throw new WorkflowAuthoringError(
+        'path-forbidden',
+        `Workflow destination must not be a symbolic link: ${filePath}`,
+        { cause },
+      )
+    }
     const existing = await readFile(filePath, 'utf8').catch(() => undefined)
     if (existing !== source) {
       throw new WorkflowAuthoringError(
@@ -90,6 +111,8 @@ export async function persistInlineWorkflow(cwd: string, source: string): Promis
         { cause },
       )
     }
+  } finally {
+    await file?.close()
   }
 
   return {
@@ -100,6 +123,16 @@ export async function persistInlineWorkflow(cwd: string, source: string): Promis
 }
 
 async function availablePath(preferred: string, sourceHash: string, source: string): Promise<string> {
+  const info = await lstat(preferred).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  })
+  if (info?.isSymbolicLink()) {
+    throw new WorkflowAuthoringError(
+      'path-forbidden',
+      `Workflow destination must not be a symbolic link: ${preferred}`,
+    )
+  }
   const existing = await readFile(preferred, 'utf8').catch((error: NodeJS.ErrnoException) => {
     if (error.code === 'ENOENT') return undefined
     throw error
@@ -109,6 +142,20 @@ async function availablePath(preferred: string, sourceHash: string, source: stri
   // A sanitized filename is merely presentation; meta.name is the workflow identity. A short hash
   // avoids clobbering an unrelated definition whose name happens to sanitize to the same basename.
   return preferred.replace(/\.js$/, `-${sourceHash.slice(0, 10)}.js`)
+}
+
+async function confinedWorkflowDirectory(directory: string): Promise<string> {
+  const scope = dirname(dirname(resolve(directory)))
+  const canonicalScope = await realpath(scope)
+  const expected = resolve(canonicalScope, '.claude', 'workflows')
+  const actual = resolve(await realpath(directory))
+  if (actual !== expected) {
+    throw new WorkflowAuthoringError(
+      'path-forbidden',
+      `Workflow directory is redirected outside its project boundary: ${directory}`,
+    )
+  }
+  return actual
 }
 
 function workflowFileName(name: string): string {

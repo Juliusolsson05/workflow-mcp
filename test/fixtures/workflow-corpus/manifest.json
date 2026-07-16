@@ -1,0 +1,11 @@
+{
+  "provenance": "Synthetic fixtures authored for workflow-mcp conformance testing",
+  "license": "MIT (same as workflow-mcp)",
+  "review": "Contains no private prompts, identities, credentials, or machine-specific paths",
+  "expectation": "Every .js file is a positive parse fixture",
+  "coverage": [
+    "minimal metadata and args",
+    "phases plus parallel agent admission",
+    "nested workflow call syntax"
+  ]
+}

@@ -19,6 +19,7 @@ import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 
 import { parseWorkflowSource } from './loadWorkflow.js'
+import { writeInitialWorkflowJournal } from './persistentWorkflowJournal.js'
 import type { WorkflowEvent } from './workflowEvents.js'
 import { createWorkflowState, reduceWorkflowState } from './workflowState.js'
 import type {
@@ -44,7 +45,7 @@ const RUN_STATUSES = new Set<WorkflowRunStatus>([
   'cancellation_requested',
   ...TERMINAL_STATUSES,
 ])
-const MAX_EVENT_FILE_BYTES = 512 * 1024 * 1024
+const DEFAULT_MAX_EVENT_FILE_BYTES = 512 * 1024 * 1024
 const EVENT_INDEX_STRIDE = 256
 const OWNER_LOCK_DIRECTORY = 'service-owner.lock'
 const OWNER_METADATA_FILE = 'owner.json'
@@ -52,7 +53,7 @@ const OWNER_ACQUIRE_ATTEMPTS = 16
 const execFileAsync = promisify(execFile)
 
 export class WorkflowStoreError extends Error {
-  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'io-error' | 'owner-conflict'
+  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'event-log-full' | 'lineage-active' | 'io-error' | 'owner-conflict'
 
   constructor(code: WorkflowStoreError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
@@ -75,12 +76,19 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
   readonly #eventOffsets = new Map<string, Map<number, number>>()
   readonly #appendTails = new Map<string, Promise<void>>()
+  #createTail: Promise<void> = Promise.resolve()
+  readonly #quarantinedRuns = new Map<string, WorkflowStoreError>()
+  readonly #maxEventFileBytes: number
   #leaseToken: string | undefined
   #leaseWasAcquired = false
 
-  constructor(rootDirectory: string) {
+  constructor(rootDirectory: string, options: { maxEventFileBytes?: number } = {}) {
     this.rootDirectory = resolve(rootDirectory)
     this.runsDirectory = join(this.rootDirectory, 'runs')
+    this.#maxEventFileBytes = options.maxEventFileBytes ?? DEFAULT_MAX_EVENT_FILE_BYTES
+    if (!Number.isSafeInteger(this.#maxEventFileBytes) || this.#maxEventFileBytes <= 0) {
+      throw new TypeError('maxEventFileBytes must be a positive safe integer')
+    }
   }
 
   async initialize(): Promise<void> {
@@ -92,11 +100,33 @@ export class FileWorkflowStore implements WorkflowStore {
     await chmod(this.rootDirectory, 0o700).catch(() => undefined)
     await chmod(this.runsDirectory, 0o700)
 
+    this.#quarantinedRuns.clear()
     const entries = await readdir(this.runsDirectory, { withFileTypes: true })
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
-      await this.#recoverEventTail(entry.name)
+      try {
+        await this.#recoverEventTail(entry.name)
+      } catch (cause) {
+        const error = cause instanceof WorkflowStoreError
+          ? cause
+          : new WorkflowStoreError(
+              'corrupt-store',
+              `Cannot recover workflow run ${entry.name}`,
+              { cause },
+            )
+        // One historical run is not the service's availability boundary. Remembering the exact
+        // failure keeps direct access fail-closed while allowing healthy lineages to initialize.
+        this.#quarantinedRuns.set(entry.name, error)
+      }
     }
+  }
+
+  listQuarantinedRuns(): readonly { runId: string; code: string; message: string }[] {
+    return [...this.#quarantinedRuns].map(([runId, error]) => ({
+      runId,
+      code: error.code,
+      message: error.message,
+    }))
   }
 
   async acquireLease(ownerId: string): Promise<WorkflowStoreLease> {
@@ -210,7 +240,36 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest> {
+    const previous = this.#createTail
+    let release!: () => void
+    this.#createTail = new Promise<void>((resolveCreate) => { release = resolveCreate })
+    await previous.catch(() => undefined)
+    try {
+      return await this.#createRun(input)
+    } finally {
+      release()
+    }
+  }
+
+  async #createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest> {
     await this.#assertLease()
+    if (input.resumedFromRunId !== undefined) {
+      const lineageId = input.lineageId ?? input.resumedFromRunId
+      const active = (await this.listManifests()).find((manifest) => (
+        manifest.runId !== input.resumedFromRunId &&
+        (manifest.lineageId ?? manifest.runId) === lineageId &&
+        !TERMINAL_STATUSES.has(manifest.status)
+      ))
+      if (active !== undefined) {
+        // Store ownership serializes creators, making this check plus manifest publication one
+        // durable uniqueness boundary. Idempotency keys are request-local and cannot prevent two
+        // clients from supplying different keys for the same recovery lineage.
+        throw new WorkflowStoreError(
+          'lineage-active',
+          `Workflow lineage ${lineageId} already has active successor ${active.runId}`,
+        )
+      }
+    }
     const directory = this.#runDirectory(input.runId)
     try {
       await mkdir(directory, { mode: 0o700 })
@@ -247,9 +306,17 @@ export class FileWorkflowStore implements WorkflowStore {
       ...(input.automaticReplaySafe === undefined
         ? {}
         : { automaticReplaySafe: input.automaticReplaySafe }),
+      ...(input.providerRecoveryFingerprint === undefined
+        ? {}
+        : { providerRecoveryFingerprint: input.providerRecoveryFingerprint }),
     }
 
     try {
+      // Publish the manifest last. Startup treats a manifest as a recoverable run, so every file it
+      // references -- especially inherited journal history -- must already be durable before that
+      // publication point. The old order exposed a queued successor before transcripts/ existed.
+      await mkdir(join(directory, 'artifacts'), { mode: 0o700 })
+      await mkdir(join(directory, 'transcripts'), { mode: 0o700 })
       await writePrivateFile(join(directory, 'workflow.js'), input.workflow.source)
       await writePrivateFile(
         join(directory, 'args.json'),
@@ -260,9 +327,10 @@ export class FileWorkflowStore implements WorkflowStore {
         )}\n`,
       )
       await writePrivateFile(join(directory, 'events.jsonl'), '')
+      if (input.journalSnapshots !== undefined && input.journalSnapshots.length > 0) {
+        writeInitialWorkflowJournal(this.journalPath(input.runId), input.journalSnapshots)
+      }
       await this.#writeManifest(manifest)
-      await mkdir(join(directory, 'artifacts'), { mode: 0o700 })
-      await mkdir(join(directory, 'transcripts'), { mode: 0o700 })
       return manifest
     } catch (cause) {
       await rm(directory, { recursive: true, force: true })
@@ -273,6 +341,8 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async getManifest(runId: string): Promise<WorkflowRunManifest | undefined> {
+    const quarantined = this.#quarantinedRuns.get(runId)
+    if (quarantined !== undefined) throw quarantined
     const path = this.#manifestPath(runId)
     try {
       return parseManifest(JSON.parse(await readFile(path, 'utf8')) as unknown, path)
@@ -288,6 +358,7 @@ export class FileWorkflowStore implements WorkflowStore {
     const manifests: WorkflowRunManifest[] = []
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
+      if (this.#quarantinedRuns.has(entry.name)) continue
       const manifest = await this.getManifest(entry.name)
       if (manifest) manifests.push(manifest)
     }
@@ -340,12 +411,21 @@ export class FileWorkflowStore implements WorkflowStore {
       recordedAt: new Date().toISOString(),
       event,
     }
+    const serialized = `${JSON.stringify(stored)}\n`
     const path = this.#eventsPath(runId)
     const handle = await open(path, 'a', 0o600)
     let eventOffset = 0
     try {
       eventOffset = (await handle.stat()).size
-      await handle.writeFile(`${JSON.stringify(stored)}\n`, 'utf8')
+      if (eventOffset + Buffer.byteLength(serialized, 'utf8') > this.#maxEventFileBytes) {
+        // Reject before the append reaches disk. Once an acknowledged cursor crosses the reader's
+        // ceiling, every future replay calls the valid log "corrupt" and can strand the run.
+        throw new WorkflowStoreError(
+          'event-log-full',
+          `Workflow event log would exceed ${this.#maxEventFileBytes} bytes: ${path}`,
+        )
+      }
+      await handle.writeFile(serialized, 'utf8')
       // Persist-before-publish is a user-visible guarantee: renderer replay after a crash must
       // include every event that IPC or MCP ever acknowledged. Awaiting fsync is intentionally
       // more conservative than relying on the OS page cache.
@@ -476,7 +556,7 @@ export class FileWorkflowStore implements WorkflowStore {
   ): AsyncGenerator<StoredWorkflowEvent> {
     const path = this.#eventsPath(runId)
     const info = await stat(path)
-    if (info.size > MAX_EVENT_FILE_BYTES) {
+    if (info.size > this.#maxEventFileBytes) {
       throw new WorkflowStoreError('corrupt-store', `Workflow event log is too large: ${path}`)
     }
     const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()

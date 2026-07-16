@@ -171,6 +171,12 @@ export type AgentProvider = {
    */
   readonly automaticReplaySafety?: 'safe' | 'unsafe-or-unknown'
   /**
+   * Stable digest of the executable and complete effective capability policy used to justify
+   * automatic replay. Recovery compares this exact value with the current provider; absence means
+   * a provider-wide `safe` flag is useful for same-process retries only, never crash recovery.
+   */
+  readonly recoveryFingerprint?: string
+  /**
    * Request-aware replay classification supersedes the legacy provider-wide flag when present.
    * Filesystem policy, worktree isolation, network access, and exposed MCP capabilities are known
    * only after a concrete request exists, so one global boolean cannot describe them honestly.
@@ -212,6 +218,13 @@ export type AgentProviderFailureOptions = {
    * neutral while transport/process/rate-limit failures retain the infrastructure default.
    */
   circuitImpact?: 'infrastructure' | 'neutral'
+  /**
+   * Claude compatibility historically turns ordinary terminal provider failures into a null slot.
+   * Contract failures are different: treating malformed schema output as success lets a top-level
+   * workflow complete with a value which never satisfied its declared API. Providers must opt in
+   * explicitly so transport/rate-limit failures retain the portable null-slot behavior.
+   */
+  terminalDisposition?: 'null-slot' | 'reject'
   providerSession?: ProviderSessionReference
   cause?: unknown
 }
@@ -225,6 +238,7 @@ export class AgentProviderFailure extends Error {
   readonly code?: string
   readonly retryable: boolean
   readonly circuitImpact: 'infrastructure' | 'neutral'
+  readonly terminalDisposition: 'null-slot' | 'reject'
   readonly providerSession?: ProviderSessionReference
 
   constructor(message: string, options: AgentProviderFailureOptions = {}) {
@@ -234,6 +248,7 @@ export class AgentProviderFailure extends Error {
     if (options.code !== undefined) this.code = options.code
     this.retryable = options.retryable ?? false
     this.circuitImpact = options.circuitImpact ?? (this.retryable ? 'infrastructure' : 'neutral')
+    this.terminalDisposition = options.terminalDisposition ?? 'null-slot'
     if (options.providerSession !== undefined) this.providerSession = options.providerSession
   }
 }

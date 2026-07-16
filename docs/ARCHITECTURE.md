@@ -181,9 +181,11 @@ The in-memory journal implements exact-source sparse reuse, edited-source longes
 interrupted provider-session resume. The
 `resume` command imports Claude's saved source and v2 JSONL, then atomically persists the combined
 Claude-plus-Codex run under `~/.workflow-mcp/journals/`. It never rewrites Claude's metadata or
-journal. The sidecar records completed results and Codex thread IDs after every mutation, so a
-second interruption resumes the new suffix instead of restarting it. `WorkflowService` is the one
-writer and active-run owner; direct callers must still not point two executors at one journal.
+journal. Sidecar format 2 stores a bounded map of root and nested workflow identities, completed
+results, and Codex thread IDs after every mutation. A successor receives that complete map during
+run creation, before its manifest is visible, so a second crash cannot lose inherited history.
+`WorkflowService` is the one writer and active-run owner; direct callers must still not point two
+executors at one journal.
 
 Token budgets charge provider `outputTokens`, matching Claude's observed accounting (its budget
 error reports "output tokens" and its turn counter tracks output spend). The Codex adapter still
@@ -222,11 +224,11 @@ counts, last progress, lineage, and the successor run ID.
 There are two deliberate safety boundaries:
 
 - Mutable shared sandboxes are not automatically resumed unless the host explicitly opts in with
-  `recovery.allowMutableSandbox`. A provider adapter with a real process tree should implement
-  `terminateAttempt`; the Codex adapter now does so through one provider-host process group per
-  attempt on POSIX. If hard termination cannot be confirmed, its permit is quarantined instead of
-  starting a potentially overlapping retry. Windows currently uses awaited `taskkill /T /F`; a
-  native Job Object remains the stronger creation-time ownership boundary.
+  `recovery.allowMutableSandbox`. A provider adapter with a real containment boundary should
+  implement `terminateAttempt`. The Codex adapter currently has useful process-group/taskkill
+  escalation, but advertises `unconfirmed-descendants` on every platform because POSIX descendants
+  can call `setsid()` and Windows lacks a creation-time Job Object. Its permit and store ownership
+  remain quarantined after ambiguous termination; production Codex restart replay is disabled.
 - Automatic continuation begins when `WorkflowService.initialize()` runs after a host restart. The
   current package does not install a separate always-on daemon, so it cannot keep agents executing
   during the interval in which its owning application process is down. The daemon/provider-host

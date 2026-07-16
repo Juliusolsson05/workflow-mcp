@@ -92,6 +92,8 @@ export type JournalReuseMode = 'longest-prefix' | 'exact-source-sparse'
 export interface WorkflowJournal {
   beginRun(identity: JournalIdentity, options?: { reuseMode?: JournalReuseMode }): WorkflowJournalRun
   getSnapshot(workflowId: string): JournalSnapshot | undefined
+  /** Return every workflow identity in this lineage, including nested workflows. */
+  getSnapshots(): readonly JournalSnapshot[]
 }
 
 function canonicalize(value: unknown, ancestors: Set<object>): CanonicalValue | typeof OMIT {
@@ -438,6 +440,10 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
   getSnapshot(workflowId: string): JournalSnapshot | undefined {
     const snapshot = this.#snapshots.get(workflowId)
     return snapshot ? copySnapshot(snapshot) : undefined
+  }
+
+  getSnapshots(): readonly JournalSnapshot[] {
+    return [...this.#snapshots.values()].map(copySnapshot)
   }
 }
 

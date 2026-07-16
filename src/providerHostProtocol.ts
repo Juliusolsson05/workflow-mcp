@@ -57,6 +57,7 @@ export type SerializedProviderHostError = {
   code?: string
   retryable?: boolean
   circuitImpact?: 'infrastructure' | 'neutral'
+  terminalDisposition?: 'null-slot' | 'reject'
   providerSession?: ProviderSessionReference
 }
 

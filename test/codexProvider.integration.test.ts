@@ -51,6 +51,7 @@ describe.skipIf(process.env.WORKFLOW_CODEX_INTEGRATION !== '1')('Codex SDK integ
       configurationIsolation: {
         codexHome: isolatedHome,
         authenticationFile: join(normalCodexHome, 'auth.json'),
+        effectiveConfigurationFingerprint: 'integration-fixture-reviewed-config',
       },
       capabilities: { inheritedMcpServers: 'disabled' },
     })

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -37,6 +37,80 @@ phase('Verify')
 return await agent('verify it', { label: 'verifier' })`
 
 describe('WorkflowService', () => {
+  it('requires source-hash approval before worker launch and invalidates it after an edit', async () => {
+    const fixture = await project(`export const meta = { name: 'approved', description: 'Approval fixture' }
+      return null`)
+    const approved = new Set<string>()
+    const requests: string[] = []
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+      authorizeWorkflowSource: (request) => {
+        const key = `${request.canonicalIdentity}:${request.sourceHash}`
+        requests.push(key)
+        return approved.has(key)
+      },
+    })
+    await service.initialize()
+
+    await expect(service.start({ cwd: fixture.cwd }, { name: 'approved' })).rejects.toMatchObject({
+      code: 'source-approval-required',
+    })
+    approved.add(requests.at(-1)!)
+    const accepted = await service.start({ cwd: fixture.cwd }, { name: 'approved' })
+    await terminal(service, fixture.cwd, accepted.runId)
+
+    await writeFile(
+      join(fixture.cwd, '.claude', 'workflows', 'test.js'),
+      `export const meta = { name: 'approved', description: 'Approval fixture edited' }\nreturn null`,
+    )
+    await expect(service.start({ cwd: fixture.cwd }, { name: 'approved' })).rejects.toMatchObject({
+      code: 'source-approval-required',
+    })
+    expect(requests.at(-1)).not.toBe(requests[1])
+    await service.stop()
+  })
+
+  it('rejects an absolute external nested script target before child worker launch', async () => {
+    const fixture = await project(`export const meta = { name: 'parent', description: 'Nested scope fixture' }
+      return await workflow({ scriptPath: args.child })`)
+    const external = join(fixture.cwd, '..', `external-child-${Date.now()}.js`)
+    await writeFile(external, `export const meta = { name: 'child', description: 'External child' }\nreturn null`)
+    const authorizations: string[] = []
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+      authorizeWorkflowSource: (request) => {
+        authorizations.push(request.origin)
+        return true
+      },
+    })
+    await service.initialize()
+
+    const run = await service.start({ cwd: fixture.cwd }, { name: 'parent', args: { child: external } })
+    await expect(terminal(service, fixture.cwd, run.runId)).resolves.toMatchObject({ status: 'failed' })
+    expect(authorizations).toEqual(['root'])
+    await service.stop()
+  })
+
+  it('does not author inline source through a symlinked .claude directory', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-inline-symlink-'))
+    const external = await mkdtemp(join(tmpdir(), 'workflow-inline-external-'))
+    await mkdir(join(cwd, '.git'))
+    await mkdir(join(external, 'workflows'))
+    await symlink(external, join(cwd, '.claude'))
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(cwd, 'state')),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+
+    await expect(service.start({ cwd }, {
+      script: `export const meta = { name: 'escaped', description: 'Must not write outside' }\nreturn null`,
+    })).rejects.toMatchObject({ code: 'scope-forbidden' })
+    await service.stop()
+  })
+
   it('persists inline source in project .claude/workflows and returns its editable path', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-inline-project-'))
     await mkdir(join(cwd, '.git'))
@@ -162,6 +236,36 @@ describe('WorkflowService', () => {
     expect(snapshot.state.agents[0]?.attempts[0]?.source).toBe('provider-resume')
     expect(snapshot.state.agents[0]?.outcome?.result.content).toBe('resumed result')
     await second.stop()
+  })
+
+  it('coalesces different resume idempotency keys onto one live lineage successor', async () => {
+    const fixture = await project(`export const meta = { name: 'one-successor', description: 'Lineage uniqueness' }
+      return await agent('continue once')`)
+    const provider = new FakeAgentProvider([
+      { outcome: { type: 'wait-for-abort' } },
+      { outcome: { type: 'wait-for-abort' } },
+    ])
+    const store = new FileWorkflowStore(fixture.storeRoot)
+    const service = new WorkflowService({ store, provider })
+    await service.initialize()
+    const original = await service.start({ cwd: fixture.cwd }, { name: 'one-successor' })
+    while ((await service.status({ cwd: fixture.cwd }, original.runId)).cursor < 5) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+    await service.cancel({ cwd: fixture.cwd }, original.runId, 'prepare resume race')
+
+    const [first, second] = await Promise.all([
+      service.resume({ cwd: fixture.cwd }, { runId: original.runId, idempotencyKey: 'client-a' }),
+      service.resume({ cwd: fixture.cwd }, { runId: original.runId, idempotencyKey: 'client-b' }),
+    ])
+    expect(second.runId).toBe(first.runId)
+    const activeLineage = (await store.listManifests()).filter((manifest) => (
+      (manifest.lineageId ?? manifest.runId) === original.runId &&
+      !['completed', 'failed', 'cancelled', 'interrupted'].includes(manifest.status)
+    ))
+    expect(activeLineage).toHaveLength(1)
+    await service.cancel({ cwd: fixture.cwd }, first.runId, 'finish uniqueness fixture')
+    await service.stop()
   })
 
   it('marks an abandoned queued manifest interrupted on service initialization', async () => {

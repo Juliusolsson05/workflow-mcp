@@ -1,16 +1,18 @@
 # Workflow reliability and continuous-utilization implementation plan
 
-Status: in progress; in-process supervision and POSIX provider-process ownership implemented on 2026-07-15
+Status: in progress; fail-closed audit hardening implemented on 2026-07-16, native creation-time containment still outstanding
 Date: 2026-07-15
 Scope: `workflow-mcp` runtime, service, persistence, provider lifecycle, worktree lifecycle, MCP
 health surface, and the narrow Agent Code host callbacks required to make those guarantees real.
 
 ## Implementation status
 
-This document intentionally remains the full end-state plan. Two implementation slices now cover
-the work-conserving runtime and a process-owning Codex attempt host. The remaining milestones stay
-explicit instead of turning a tested same-process recovery boundary into a claim that execution
-survives an absent application or every platform-specific process model.
+This document intentionally remains the full end-state plan. The runtime now supervises attempts,
+but the 2026-07-16 audit proved that a POSIX process group is not a complete ownership boundary:
+real Codex shell tools can call `setsid()` and leave it. Both POSIX and Windows therefore advertise
+`unconfirmed-descendants`; automatic replay remains disabled for the production Codex provider
+until cgroup/supervisor or Job Object containment exists. This correction is deliberately explicit
+instead of turning useful kill escalation into a false exactly-once guarantee.
 
 Implemented in the first reliability slice:
 
@@ -32,13 +34,13 @@ Implemented in the first reliability slice:
 - deterministic tests for utilization, limits, stalls, retries, cancellation, circuit breaking,
   workspace reuse, owner fencing, automatic recovery, and the "call five of nine" crash case.
 
-Still architectural follow-up rather than silently implied by this PR:
+Still architectural follow-up rather than silently implied by the implementation:
 
 - a separately installed persistent supervisor/daemon, so execution continues while Electron or the
   parent CLI process is absent;
-- a native Windows Job Object host. POSIX attempts now run in dedicated process groups and are
-  verified reaped; Windows currently uses awaited `taskkill /T /F`, which is useful but not the
-  same ownership guarantee as assigning the child to a Job Object at creation;
+- creation-time containment on every supported platform: a cgroup or equivalent process-owning
+  supervisor on POSIX and a kill-on-close Job Object on Windows. Current process-group/taskkill
+  escalation is best effort and never reported as authoritative descendant ownership;
 - a durable capability/idempotency ledger for externally mutating tools. Mutable sandbox recovery is
   therefore opt-in, and unknown external side effects must not be described as exactly-once;
 - append-log/SQLite compaction and bounded ingestion queues for histories materially larger than the
@@ -65,6 +67,23 @@ Implemented in the process-ownership/self-healing slice:
   silent attempt is replaced while eight siblings continue;
 - exact-source sparse manual recovery across a journal gap, while edited source/arguments retain
   longest-prefix compatibility.
+
+Implemented in the 2026-07-16 audit-hardening slice:
+
+- fail-closed Codex ownership and replay evidence: a private CODEX_HOME alone no longer attests
+  that system/managed MCP configuration is absent, and restart recovery requires a matching
+  provider fingerprint plus each unresolved attempt's concrete persisted replay assessment;
+- storage-independent cancellation escalation, bounded event-sink delivery, best-effort worker
+  IPC, and an admission fence after ambiguous external effects;
+- journal format v2 containing every root/nested workflow identity, with inherited lineage seeded
+  before a successor manifest is published and version-1 migration on open;
+- canonical top-level/nested source confinement, symlink-root rejection, no-follow authoring, and
+  an app-owned source-hash approval callback;
+- one live successor per recovery lineage, per-run corruption quarantine, projected event-log size
+  rejection, fair rotation across three or more runs, and schema-contract rejection instead of a
+  fabricated successful null;
+- explicit remaining limitation: no automatic Codex replay is safe until native process
+  containment, effective-config inspection, executable evidence, and authentication brokering land.
 
 ## Executive summary
 

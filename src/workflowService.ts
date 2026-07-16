@@ -13,7 +13,7 @@ import type { LoadedWorkflow } from './loadWorkflow.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 import type { JournalReuseMode } from './workflowJournal.js'
 import { runWorkflow } from './runWorkflow.js'
-import type { RunWorkflowOptions, WorkflowLimits, WorkflowRun } from './runWorkflow.js'
+import type { RunWorkflowOptions, WorkflowLimits, WorkflowResolver, WorkflowRun } from './runWorkflow.js'
 import { normalizeReliabilityPolicy, ProviderCircuitBreaker } from './executionReliability.js'
 import type { ProviderCircuitSnapshot, WorkflowReliabilityPolicy } from './executionReliability.js'
 import {
@@ -52,6 +52,23 @@ export type WorkflowServiceScope = {
 export type WorkflowServiceOptions = {
   store: WorkflowStore
   provider: AgentProvider | ((context: WorkflowProviderFactoryContext) => AgentProvider)
+  /**
+   * Side-effect-free recovery evidence for lazy provider factories. Initialization must compare
+   * persisted capability evidence without constructing a run-scoped provider twice. Static
+   * providers expose the same values directly and do not need this callback.
+   */
+  providerRecoveryEvidence?(context: WorkflowProviderFactoryContext): {
+    fingerprint?: string
+    automaticReplaySafe: boolean
+  }
+  /**
+   * App-owned source approval keyed by canonical identity plus immutable bytes.
+   *
+   * The portable runtime cannot decide whether repository-controlled JavaScript is trusted for a
+   * particular signed-in user. Embedders can display or persist approval here; returning false
+   * prevents worker creation. A one-byte edit changes sourceHash and therefore requires a new grant.
+   */
+  authorizeWorkflowSource?(request: WorkflowSourceAuthorizationRequest): boolean | Promise<boolean>
   workerLauncher?: WorkflowWorkerLauncher
   workerFilePath?: string
   limits?: Partial<WorkflowLimits>
@@ -92,6 +109,15 @@ export type WorkflowProviderFactoryContext = {
   clientId?: string
 }
 
+export type WorkflowSourceAuthorizationRequest = {
+  cwd: string
+  clientId?: string
+  origin: 'root' | 'nested'
+  canonicalIdentity: string
+  sourceHash: string
+  workflowName: string
+}
+
 export type WorkflowRunStartResult = {
   runId: string
   /** Normally queued/running; an idempotent retry reports the existing run's honest status. */
@@ -109,6 +135,11 @@ export type WorkflowRunStartResult = {
   resumedFromRunId?: string
   lineageId?: string
   recoveryMode?: 'manual' | 'automatic'
+}
+
+export type WorkflowStoredRunReference = WorkflowRunStartResult & {
+  cwd: string
+  clientId?: string
 }
 
 export type WorkflowRunHealth = {
@@ -142,6 +173,7 @@ export type WorkflowServiceErrorCode =
   | 'run-not-resumable'
   | 'service-stopped'
   | 'unsafe-provider-active'
+  | 'source-approval-required'
   | 'invalid-request'
 
 export class WorkflowServiceError extends Error {
@@ -265,6 +297,12 @@ export class WorkflowService {
       )
       const recoverable: WorkflowRunManifest[] = []
       for (const manifest of manifests) {
+        const needsReplayDecision =
+          manifest.status === 'running' ||
+          (manifest.status === 'interrupted' && !continuedRuns.has(manifest.runId))
+        const automaticRecoveryIsSafe = needsReplayDecision
+          ? await this.#automaticRecoveryIsSafe(manifest)
+          : false
         if (TERMINAL_STATUSES.has(manifest.status)) {
           // WHY interrupted runs are reconsidered: the previous host may have durably written the
           // terminal marker and died before creating its successor manifest. A successor is the
@@ -273,7 +311,7 @@ export class WorkflowService {
             manifest.status === 'interrupted' &&
             !continuedRuns.has(manifest.runId) &&
             (
-              this.#automaticRecoveryIsSafe(manifest) ||
+              automaticRecoveryIsSafe ||
               // A lone run.interrupted event is the recovery record for a cursor-zero queued run.
               // No evaluator or provider was ever admitted, so continuing it cannot repeat a tool
               // side effect even when the provider correctly refuses general automatic replay.
@@ -285,7 +323,7 @@ export class WorkflowService {
         const shouldRecover =
           this.#recovery.autoResumeOnInitialize &&
           (
-            (manifest.status === 'running' && this.#automaticRecoveryIsSafe(manifest)) ||
+            (manifest.status === 'running' && automaticRecoveryIsSafe) ||
             // WHY cursor zero makes this queued state unambiguous: createRun durably reserves the
             // identity before runWorkflow can emit run.started. A process death in that narrow
             // window performed no workflow call, so provider replay safety is irrelevant.
@@ -407,6 +445,25 @@ export class WorkflowService {
   async list(scope: WorkflowServiceScope) {
     this.#assertAvailable()
     return findWorkflows({ cwd: resolve(scope.cwd) })
+  }
+
+  /**
+   * App-host recovery inventory. This is intentionally not registered as an MCP tool: an embedding
+   * main process needs to rebuild UI/session ownership after restart, while project-scoped clients
+   * must continue using status with an explicit cwd capability.
+   */
+  async listStoredRunReferences(): Promise<readonly WorkflowStoredRunReference[]> {
+    this.#assertAvailable()
+    return (await this.#options.store.listManifests()).map((manifest) => ({
+      cwd: manifest.cwd,
+      ...(manifest.clientId === undefined ? {} : { clientId: manifest.clientId }),
+      ...startResult(manifest, this.#options.store),
+    }))
+  }
+
+  /** Synchronous process lease used by hosts which must not replace a provider executable mid-run. */
+  hasActiveRuns(): boolean {
+    return this.#active.size > 0 || this.#ownedRuns.size > 0
   }
 
   async describe(scope: WorkflowServiceScope, input: { name: string }): Promise<FoundWorkflow> {
@@ -589,6 +646,15 @@ export class WorkflowService {
       const existing = await this.#options.store.findByIdempotencyKey(resolve(scope.cwd), input.idempotencyKey)
       if (existing) return startResult(existing, this.#options.store)
     }
+    const lineageId = original.lineageId ?? original.runId
+    const existingSuccessor = await this.#findActiveLineageSuccessor(lineageId, original.runId)
+    if (existingSuccessor !== undefined) {
+      // Recovery identity belongs to the lineage, not the caller's arbitrary idempotency key. A
+      // renderer which missed automatic startup must attach to that live successor instead of
+      // creating a second physical execution of the same inherited journal.
+      this.#assertScope(scope, existingSuccessor)
+      return startResult(existingSuccessor, this.#options.store)
+    }
 
     const originalWorkflow = await this.#options.store.loadWorkflow(input.runId)
     const hasSourceOverride = overrides?.scriptPath !== undefined || overrides?.script !== undefined || overrides?.name !== undefined
@@ -602,28 +668,33 @@ export class WorkflowService {
     const priorJournal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(input.runId),
     )
-    // WHY the old identity is used to retrieve the snapshot: `scriptPath` may point at edited
-    // bytes, but its stable path is precisely what allows beginRun to compare the prior source hash
-    // and invalidate only when the source actually changed. Looking up with a newly selected name
-    // would silently discard resumable history before the journal can make that decision.
-    const workflowId = originalWorkflow.filePath ?? originalWorkflow.meta.name
-    const priorSnapshot = priorJournal.getSnapshot(workflowId)
+    const priorSnapshots = priorJournal.getSnapshots()
     const exactSourceAndArgs =
       workflow.sourceHash === originalWorkflow.sourceHash &&
       isDeepStrictEqual(args, originalArgs)
-    return this.#startLoaded(scope, workflow, {
-      ...(args.provided ? { args: args.value } : {}),
-      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
-      resumedFromRunId: input.runId,
-      lineageId: original.lineageId ?? original.runId,
-      recoveryMode,
-      // Manual recovery should be sparse when the operator is resuming the exact same logical
-      // program. Claude's longest-prefix rule remains the compatibility fallback for edited source
-      // or changed args, where reusing a later sibling could smuggle an obsolete control-flow path
-      // into the new run.
-      journalReuseMode: exactSourceAndArgs ? 'exact-source-sparse' : 'longest-prefix',
-      ...(priorSnapshot === undefined ? {} : { journalSnapshots: [priorSnapshot] }),
-    })
+    try {
+      return await this.#startLoaded(scope, workflow, {
+        ...(args.provided ? { args: args.value } : {}),
+        ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+        resumedFromRunId: input.runId,
+        lineageId,
+        recoveryMode,
+        // Manual recovery should be sparse when the operator is resuming the exact same logical
+        // program. Claude's longest-prefix rule remains the compatibility fallback for edited source
+        // or changed args, where reusing a later sibling could smuggle an obsolete control-flow path
+        // into the new run.
+        journalReuseMode: exactSourceAndArgs ? 'exact-source-sparse' : 'longest-prefix',
+        // Nested workflow identities share the run sidecar. Passing only the top-level snapshot made
+        // a successfully completed child disappear at each successor boundary and rerun after crash.
+        ...(priorSnapshots.length === 0 ? {} : { journalSnapshots: priorSnapshots }),
+      })
+    } catch (cause) {
+      if (!hasErrorCode(cause, 'lineage-active')) throw cause
+      const winner = await this.#findActiveLineageSuccessor(lineageId, original.runId)
+      if (winner === undefined) throw cause
+      this.#assertScope(scope, winner)
+      return startResult(winner, this.#options.store)
+    }
   }
 
   async #resolveStartWorkflow(
@@ -687,14 +758,13 @@ export class WorkflowService {
     const imported = await loadClaudeWorkflowResume(metadataPath, {
       ...(workflowPath === undefined ? {} : { workflowPath }),
     })
-    const workflowId = imported.workflow.filePath ?? imported.workflow.meta.name
-    const journalSnapshot = imported.journal.getSnapshot(workflowId)
+    const journalSnapshots = imported.journal.getSnapshots()
     return this.#startLoaded(scope, imported.workflow, {
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       resumedFromRunId: imported.metadata.runId,
       lineageId: imported.metadata.runId,
       recoveryMode: 'manual',
-      ...(journalSnapshot === undefined ? {} : { journalSnapshots: [journalSnapshot] }),
+      ...(journalSnapshots.length === 0 ? {} : { journalSnapshots }),
     })
   }
 
@@ -718,6 +788,7 @@ export class WorkflowService {
   ): Promise<WorkflowRunStartResult> {
     const runId = `run_${randomUUID()}`
     const cwd = resolve(scope.cwd)
+    await this.#authorizeWorkflowSource(scope, workflow, 'root')
     const providerContext: WorkflowProviderFactoryContext = {
       runId,
       cwd,
@@ -729,6 +800,18 @@ export class WorkflowService {
     const provider = typeof this.#options.provider === 'function'
       ? this.#options.provider(providerContext)
       : this.#options.provider
+    const recoveryEvidence = typeof this.#options.provider === 'function'
+      ? this.#options.providerRecoveryEvidence?.(providerContext)
+      : {
+          fingerprint: provider.recoveryFingerprint,
+          automaticReplaySafe: provider.automaticReplaySafety === 'safe',
+        }
+    const durableRecoveryFingerprint =
+      recoveryEvidence?.automaticReplaySafe === true &&
+      recoveryEvidence.fingerprint !== undefined &&
+      recoveryEvidence.fingerprint === provider.recoveryFingerprint
+        ? recoveryEvidence.fingerprint
+        : undefined
     let manifest = await this.#options.store.createRun({
       runId,
       cwd,
@@ -745,8 +828,14 @@ export class WorkflowService {
       // attempt after a crash. The manifest records the effective host policy that every agent in
       // this service inherits; per-agent capability expansion must likewise become durable before
       // such expansion is added to the workflow language.
-      automaticReplaySafe: provider.automaticReplaySafety === 'safe'
+      automaticReplaySafe: durableRecoveryFingerprint !== undefined
         && (this.#options.sandbox?.network ?? false) === false,
+      ...(durableRecoveryFingerprint === undefined
+        ? {}
+        : { providerRecoveryFingerprint: durableRecoveryFingerprint }),
+      ...(input.journalSnapshots === undefined
+        ? {}
+        : { journalSnapshots: [...input.journalSnapshots] }),
     })
     const journal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(runId),
@@ -791,6 +880,10 @@ export class WorkflowService {
       ...(this.#options.resolveAgentType === undefined
         ? {}
         : { resolveAgentType: (name: string) => this.#options.resolveAgentType!(name, cwd) }),
+      // Nested object targets used to bypass WorkflowService and call loadWorkflowFile() directly.
+      // Keep every executable source behind the same project confinement and source-hash approval
+      // boundary as the root, regardless of which workflow helper selected it.
+      resolveWorkflow: (target) => this.#resolveNestedWorkflow(scope, target),
       ...(this.#options.prepareWorkingDirectory === undefined
         ? {}
         : { prepareWorkingDirectory: this.#options.prepareWorkingDirectory }),
@@ -858,6 +951,65 @@ export class WorkflowService {
     return workflow
   }
 
+  async #findActiveLineageSuccessor(
+    lineageId: string,
+    predecessorRunId: string,
+  ): Promise<WorkflowRunManifest | undefined> {
+    return (await this.#options.store.listManifests())
+      .filter((manifest) => (
+        manifest.runId !== predecessorRunId &&
+        (manifest.lineageId ?? manifest.runId) === lineageId &&
+        !TERMINAL_STATUSES.has(manifest.status)
+      ))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .at(-1)
+  }
+
+  async #resolveNestedWorkflow(
+    scope: WorkflowServiceScope,
+    target: Parameters<WorkflowResolver>[0],
+  ): Promise<LoadedWorkflow> {
+    let workflow: LoadedWorkflow
+    try {
+      workflow = typeof target === 'string'
+        ? await this.#resolveVisibleWorkflow(scope, target)
+        : await loadScopedWorkflowPath(resolve(scope.cwd), target.scriptPath)
+    } catch (cause) {
+      if (cause instanceof WorkflowAuthoringError) {
+        const code = cause.code === 'path-forbidden' ? 'scope-forbidden' : 'invalid-request'
+        throw new WorkflowServiceError(code, cause.message, { cause })
+      }
+      throw cause
+    }
+    await this.#authorizeWorkflowSource(scope, workflow, 'nested')
+    return workflow
+  }
+
+  async #authorizeWorkflowSource(
+    scope: WorkflowServiceScope,
+    workflow: LoadedWorkflow,
+    origin: WorkflowSourceAuthorizationRequest['origin'],
+  ): Promise<void> {
+    if (this.#options.authorizeWorkflowSource === undefined) return
+    const canonicalIdentity = workflow.filePath === undefined
+      ? `inline:${workflow.meta.name}`
+      : await realpath(workflow.filePath).catch(() => resolve(workflow.filePath!))
+    const authorized = await this.#options.authorizeWorkflowSource({
+      cwd: resolve(scope.cwd),
+      ...(scope.clientId === undefined ? {} : { clientId: scope.clientId }),
+      origin,
+      canonicalIdentity,
+      sourceHash: workflow.sourceHash,
+      workflowName: workflow.meta.name,
+    })
+    if (!authorized) {
+      throw new WorkflowServiceError(
+        'source-approval-required',
+        `Workflow source approval is required for ${canonicalIdentity} at ${workflow.sourceHash}`,
+      )
+    }
+  }
+
   async #requiredManifest(runId: string): Promise<WorkflowRunManifest> {
     const manifest = await this.#options.store.getManifest(runId)
     if (!manifest) throw new WorkflowServiceError('run-not-found', `Workflow run not found: ${runId}`)
@@ -889,14 +1041,40 @@ export class WorkflowService {
     }
   }
 
-  #automaticRecoveryIsSafe(manifest: WorkflowRunManifest): boolean {
+  async #automaticRecoveryIsSafe(manifest: WorkflowRunManifest): Promise<boolean> {
     if (!this.#recovery.autoResumeOnInitialize || manifest.automaticReplaySafe !== true) return false
+    if (manifest.providerRecoveryFingerprint === undefined) return false
     const mode = this.#options.sandbox?.mode ?? 'read-only'
     // Re-check the current host policy as well as the persisted decision. An operator can restart
     // the service with broader capabilities than the crashed process had; recovery must become
     // more conservative across that transition, never less.
     if ((this.#options.sandbox?.network ?? false) !== false) return false
-    return mode === 'read-only' || this.#recovery.allowMutableSandbox
+    if (!(mode === 'read-only' || this.#recovery.allowMutableSandbox)) return false
+
+    const context: WorkflowProviderFactoryContext = {
+      runId: manifest.runId,
+      cwd: manifest.cwd,
+      ...(manifest.clientId === undefined ? {} : { clientId: manifest.clientId }),
+    }
+    const evidence = typeof this.#options.provider === 'function'
+      ? this.#options.providerRecoveryEvidence?.(context)
+      : {
+          fingerprint: this.#options.provider.recoveryFingerprint,
+          automaticReplaySafe: this.#options.provider.automaticReplaySafety === 'safe',
+        }
+    if (
+      evidence?.automaticReplaySafe !== true ||
+      evidence.fingerprint !== manifest.providerRecoveryFingerprint
+    ) return false
+
+    const snapshot = await this.#options.store.snapshot(manifest.runId)
+    const unresolvedAttempts = snapshot.state.agents.flatMap((agent) => (
+      agent.attempts.filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+    ))
+    // WHY legacy attempts without request evidence fail closed: provider-wide safety cannot prove
+    // that this particular call had no network access, shared-worktree mutation, or expanded tool
+    // capability. New runs persist the concrete assessment in agent.started before dispatch.
+    return unresolvedAttempts.every((attempt) => attempt.replaySafety?.automatic === true)
   }
 
   async #releaseStoreLease(): Promise<void> {
@@ -1022,4 +1200,8 @@ function claudeProjectKey(cwd: string): string {
 function isInside(parent: string, candidate: string): boolean {
   const child = relative(resolve(parent), resolve(candidate))
   return child.length > 0 && !child.startsWith('..') && !isAbsolute(child)
+}
+
+function hasErrorCode(value: unknown, code: string): boolean {
+  return typeof value === 'object' && value !== null && 'code' in value && value.code === code
 }
