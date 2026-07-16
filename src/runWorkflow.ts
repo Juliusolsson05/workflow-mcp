@@ -2196,9 +2196,8 @@ class WorkflowRuntime {
     }
     this.#completedWithErrors = true
     // Terminal casualties must never leave a provider thread pointer that restart recovery can
-    // accidentally resume. The result remains durable and audit-visible; only the active resume
-    // credential is discarded because the physical attempt is now disposable by contract.
-    admission.journalRun.discardProviderSession(admission.journalMiss)
+    // accidentally resume. recordResult invalidates that pointer and stores the coverage gap in
+    // one journal mutation, so a crash cannot observe only half of the terminal disposition.
     admission.journalRun.recordResult(admission.journalMiss, placeholder, {
       successful: false,
       coverageGap: true,

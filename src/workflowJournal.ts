@@ -429,6 +429,19 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     }
 
     pending.completed = true
+    if (options.coverageGap === true) {
+      // WHY terminal disposition and session invalidation share one journal mutation: a durable
+      // adapter persists recordResult only after this method returns. Performing a separate
+      // discard first leaves a crash window containing an unfinished call with no session, which
+      // automatic recovery would replay even though policy had already classified it unsafe.
+      // Mutating both pieces here makes one persistent snapshot the linearization point.
+      for (let index = this.#sessions.length - 1; index >= 0; index -= 1) {
+        const record = this.#sessions[index]
+        if (record?.key === pending.key && record.agentId === pending.agentId) {
+          this.#sessions.splice(index, 1)
+        }
+      }
+    }
     this.#records.push({
       type: 'result',
       key: pending.key,
