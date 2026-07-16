@@ -89,6 +89,7 @@ export type {
   CodexClientLike,
   CodexConfigurationIsolation,
   CodexExecutionCapabilities,
+  CodexExecutableEvidence,
   CodexExternalCapabilityEffect,
   CodexProviderOptions,
   CodexThreadLike,

@@ -173,7 +173,6 @@ describe('CodexAgentProvider', () => {
       diagnostics: {
         sdk: '@openai/codex-sdk',
         sdkVersion: '0.144.4',
-        bundledCliVersion: '0.144.4',
       },
     })
   })
