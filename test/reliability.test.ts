@@ -106,6 +106,26 @@ describe('unattended workflow reliability', () => {
     expect(order).toEqual(['run-b', 'run-a', 'run-b', 'run-a'])
   })
 
+  it('does not starve a third fairness key behind two queued bursts', async () => {
+    const scheduler = new WorkConservingScheduler(1)
+    const controller = new AbortController()
+    const held = await scheduler.acquire(controller.signal, 'run-a')
+    const order: string[] = []
+    const queued = ['run-a', 'run-a', 'run-a', 'run-b', 'run-b', 'run-b', 'run-c']
+      .map(async (runId) => {
+        const lease = await scheduler.acquire(controller.signal, runId)
+        order.push(runId)
+        lease.release()
+      })
+
+    held.release()
+    await Promise.all(queued)
+
+    // run-a owns the held grant, so the next complete rotation is B, C, A. The old
+    // "anything except the last key" selector produced B, A, B and starved C.
+    expect(order.slice(0, 3)).toEqual(['run-b', 'run-c', 'run-a'])
+  })
+
   it('enforces one global ceiling across concurrent runs', async () => {
     let maximumGlobalActive = 0
     const scheduler = new WorkConservingScheduler(3, (snapshot) => {
@@ -261,6 +281,7 @@ describe('unattended workflow reliability', () => {
       `),
       cwd: process.cwd(),
       provider,
+      sandbox: { mode: 'read-only' },
       limits: { concurrency: 1 },
       reliability: {
         ...FAST_RETRY,
@@ -301,6 +322,25 @@ describe('unattended workflow reliability', () => {
     await expect(run.result).resolves.toBeNull()
     expect(provider.calls).toHaveLength(2)
     expect((await events).filter((event) => event.type === 'agent.retry_scheduled')).toHaveLength(1)
+  })
+
+  it('rejects provider contract failures instead of reporting a successful null slot', async () => {
+    const provider: AgentProvider = {
+      name: 'contract-provider',
+      execute: async () => {
+        throw new AgentProviderFailure('structured output was invalid', {
+          code: 'structured-output-invalid',
+          terminalDisposition: 'reject',
+        })
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('return structured output', { schema: { type: 'object' } })`),
+      cwd: process.cwd(),
+      provider,
+    })
+
+    await expect(run.result).rejects.toMatchObject({ code: 'structured-output-invalid' })
   })
 
   it('reserves one shared retry slot atomically across concurrent failures', async () => {
@@ -347,7 +387,9 @@ describe('unattended workflow reliability', () => {
       cwd: process.cwd(),
       provider,
       sandbox: { mode: 'read-only' },
-      reliability: FAST_RETRY,
+      // The ambiguity must remain visible even when policy says no retry would be admitted. This
+      // catches the historical coupling that converted an unsafe final attempt to successful null.
+      reliability: { ...FAST_RETRY, automaticRetry: 'never' },
     })
 
     const events = collect(run)
@@ -357,6 +399,40 @@ describe('unattended workflow reliability', () => {
     expect(state.agents[0]?.status).toBe('recovery_required')
     expect(state.agents[0]?.attempts[0]?.status).toBe('recovery_required')
     expect(state.counts.running).toBe(0)
+  })
+
+  it('closes agent and nested-workflow admission after an ambiguous effect', async () => {
+    let calls = 0
+    let nestedResolutions = 0
+    const provider: AgentProvider = {
+      name: 'unknown-effects',
+      execute: async () => {
+        calls += 1
+        throw new AgentProviderFailure('lost response after possible mutation', { retryable: true })
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`
+        await agent('ambiguous first call').catch(() => null)
+        await agent('must never be admitted').catch(() => null)
+        await workflow('must-never-resolve').catch(() => null)
+        return 'unreachable success'
+      `),
+      cwd: process.cwd(),
+      provider,
+      sandbox: { mode: 'read-only' },
+      reliability: FAST_RETRY,
+      resolveWorkflow: async () => {
+        nestedResolutions += 1
+        return workflow(`return 'child'`, 'must-never-resolve')
+      },
+    })
+    const events = collect(run)
+
+    await expect(run.result).rejects.toMatchObject({ code: 'agent-recovery-required' })
+    expect(calls).toBe(1)
+    expect(nestedResolutions).toBe(0)
+    expect(projectWorkflowState(run.id, await events).counts.total).toBe(1)
   })
 
   it('preserves an isolated workspace when an ambiguous attempt requires recovery', async () => {
@@ -624,6 +700,54 @@ describe('unattended workflow reliability', () => {
     expect(Date.now() - startedAt).toBeLessThan(750)
   })
 
+  it('escalates provider termination while cancellation diagnostics are permanently blocked', async () => {
+    let markStarted!: () => void
+    const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted })
+    let rejectExecution!: (error: unknown) => void
+    let terminatedAt: number | undefined
+    const provider: AgentProvider = {
+      name: 'blocked-storage-fixture',
+      execute: async (_request, context): Promise<AgentProviderResult> => {
+        await context.emit({
+          type: 'session.started',
+          session: { provider: 'blocked-storage-fixture', id: 'session-1' },
+        })
+        markStarted()
+        return new Promise<AgentProviderResult>((_resolve, reject) => { rejectExecution = reject })
+      },
+      terminateAttempt: async () => {
+        terminatedAt = Date.now()
+        rejectExecution(new AgentProviderAbortError('terminated despite blocked diagnostics'))
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('must terminate')`),
+      cwd: process.cwd(),
+      provider,
+      eventSink: (event) => event.type === 'run.cancellation_requested'
+        ? new Promise<void>(() => undefined)
+        : Promise.resolve(),
+      limits: { cancellationGraceMs: 5 },
+      reliability: {
+        ...FAST_RETRY,
+        hardTerminationGraceMs: 10,
+        cleanupTimeoutMs: 10,
+        eventSinkTimeoutMs: 250,
+      },
+    })
+    await started
+    const cancelledAt = Date.now()
+    const cancelling = run.cancel('blocked storage cancellation')
+
+    while (terminatedAt === undefined && Date.now() - cancelledAt < 150) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 2))
+    }
+    expect(terminatedAt).toBeDefined()
+    expect(terminatedAt! - cancelledAt).toBeLessThan(150)
+    await expect(cancelling).rejects.toMatchObject({ code: 'workflow-storage-degraded' })
+    await expect(run.result).rejects.toThrow('blocked storage cancellation')
+  })
+
   it('escalates run cancellation through the attempt-addressed termination hook', async () => {
     let rejectExecution!: (error: unknown) => void
     let terminatedAttempt: string | undefined
@@ -736,6 +860,18 @@ describe('unattended workflow reliability', () => {
     let activePreparations = 0
     let maxActivePreparations = 0
     let lateCleanups = 0
+    const fake = new FakeAgentProvider([
+      { outcome: { type: 'result', output: { type: 'text', text: 'second prepared' } } },
+    ])
+    const provider: AgentProvider = {
+      name: fake.name,
+      automaticReplaySafety: fake.automaticReplaySafety,
+      recoveryFingerprint: fake.recoveryFingerprint,
+      // Preparation happens before provider admission. Its ownership fence must therefore settle
+      // even when the eventual provider cannot prove descendant termination.
+      terminationBoundary: 'unconfirmed-descendants',
+      execute: (request, context) => fake.execute(request, context),
+    }
     const run = runWorkflow({
       workflow: workflow(`
         return await parallel([0, 1].map((index) => async () => {
@@ -747,9 +883,7 @@ describe('unattended workflow reliability', () => {
         }))
       `),
       cwd: process.cwd(),
-      provider: new FakeAgentProvider([
-        { outcome: { type: 'result', output: { type: 'text', text: 'second prepared' } } },
-      ]),
+      provider,
       prepareWorkingDirectory: async () => {
         const index = preparationStarts.length
         preparationStarts.push(Date.now())
@@ -818,6 +952,7 @@ describe('unattended workflow reliability', () => {
       cwd,
       workflow: source,
       automaticReplaySafe: true,
+      providerRecoveryFingerprint: 'fake-provider:fake:v1',
     })
     await seed.appendEvent('run_crashed', {
       schemaVersion: 1,
@@ -899,6 +1034,39 @@ describe('unattended workflow reliability', () => {
     await service.stop()
   })
 
+  it('honors initialization recovery opt-out for an unstarted interrupted run', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-recovery-opt-out-'))
+    const storeRoot = join(cwd, 'state')
+    const source = workflow(`return await agent('must remain stopped')`, 'recovery-opt-out')
+    const seed = new FileWorkflowStore(storeRoot)
+    const lease = await seed.acquireLease('recovery-opt-out-seed')
+    await seed.initialize()
+    await seed.createRun({ runId: 'run_recovery_opt_out', cwd, workflow: source })
+    await seed.appendEvent('run_recovery_opt_out', {
+      schemaVersion: 1,
+      runId: 'run_recovery_opt_out',
+      sequence: 1,
+      eventId: 'event_recovery_opt_out_interrupted',
+      timestamp: new Date().toISOString(),
+      type: 'run.interrupted',
+      payload: { reason: 'fixture stopped before evaluator admission' },
+    })
+    await lease.release()
+
+    const provider = new FakeAgentProvider([])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(storeRoot),
+      provider,
+      recovery: { autoResumeOnInitialize: false },
+    })
+    await service.initialize()
+
+    const manifests = await new FileWorkflowStore(storeRoot).listManifests()
+    expect(manifests.some((manifest) => manifest.resumedFromRunId === 'run_recovery_opt_out')).toBe(false)
+    expect(provider.calls).toHaveLength(0)
+    await service.stop()
+  })
+
   it('recovers an interrupted handoff exactly once and preserves its MCP client scope', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-handoff-recovery-'))
     const storeRoot = join(cwd, 'state')
@@ -912,6 +1080,7 @@ describe('unattended workflow reliability', () => {
       workflow: source,
       clientId: 'renderer-client-7',
       automaticReplaySafe: true,
+      providerRecoveryFingerprint: 'fake-provider:fake:v1',
     })
     await seed.appendEvent('run_handoff_crash', {
       schemaVersion: 1,
@@ -936,6 +1105,10 @@ describe('unattended workflow reliability', () => {
     const contexts: Array<{ clientId?: string }> = []
     const first = new WorkflowService({
       store: new FileWorkflowStore(storeRoot),
+      providerRecoveryEvidence: () => ({
+        fingerprint: 'fake-provider:fake:v1',
+        automaticReplaySafe: true,
+      }),
       provider: (context) => {
         contexts.push({ ...(context.clientId === undefined ? {} : { clientId: context.clientId }) })
         return new FakeAgentProvider([
@@ -1055,6 +1228,7 @@ describe('unattended workflow reliability', () => {
       cwd,
       workflow: source,
       automaticReplaySafe: true,
+      providerRecoveryFingerprint: 'fake-provider:fake:v1',
     })
     await seed.appendEvent('run_sparse_crashed', {
       schemaVersion: 1,

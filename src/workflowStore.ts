@@ -1,5 +1,6 @@
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import type { WorkflowEvent } from './workflowEvents.js'
+import type { JournalSnapshot } from './workflowJournal.js'
 import type {
   StoredWorkflowEvent,
   WorkflowEventPage,
@@ -25,6 +26,12 @@ export type CreateWorkflowRunInput = {
   lineageId?: string
   recoveryMode?: 'manual' | 'automatic'
   automaticReplaySafe?: boolean
+  providerRecoveryFingerprint?: string
+  /**
+   * Resume history is part of run creation, not a later runtime convenience. A successor manifest
+   * must never become visible without the journal bytes that justify its cached/replayed calls.
+   */
+  journalSnapshots?: readonly JournalSnapshot[]
 }
 
 export type WorkflowStoreLease = {
@@ -36,6 +43,8 @@ export type WorkflowStoreLease = {
 
 export interface WorkflowStore {
   initialize(): Promise<void>
+  /** Corrupt histories are isolated per run so one cannot make the whole service unavailable. */
+  listQuarantinedRuns?(): readonly { runId: string; code: string; message: string }[]
   /** Optional cross-process single-writer fence. It may be acquired before initialize(). */
   acquireLease?(ownerId: string): Promise<WorkflowStoreLease>
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>

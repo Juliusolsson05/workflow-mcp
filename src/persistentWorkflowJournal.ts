@@ -19,14 +19,20 @@ import {
 } from './workflowJournal.js'
 
 const FORMAT = 'workflow-mcp-journal'
-const VERSION = 1
+const VERSION = 2
+const LEGACY_VERSION = 1
 const MAX_FILE_BYTES = 256 * 1024 * 1024
 const MAX_RECORDS = 100_000
 
 type StoredJournal = {
   format: typeof FORMAT
   version: typeof VERSION
-  snapshot: JournalSnapshot
+  snapshots: readonly JournalSnapshot[]
+}
+
+type ReadStoredJournal = {
+  version: typeof VERSION | typeof LEGACY_VERSION
+  snapshots: readonly JournalSnapshot[]
 }
 
 export class PersistentJournalError extends Error {
@@ -40,13 +46,13 @@ export class PersistentJournalError extends Error {
 }
 
 /**
- * A crash-safe single-workflow journal layered over the exact in-memory resume semantics.
+ * A crash-safe workflow-lineage journal layered over the exact in-memory resume semantics.
  *
  * WHY the file is an atomic snapshot rather than another subtly different call matcher: matching,
  * prefix invalidation, and provider-session reuse remain owned by InMemoryWorkflowJournal. This
- * class only commits that state after each mutation. The data set is deliberately bounded and one
- * workflow wide, so an atomic replace buys a much simpler recovery rule than replaying partially
- * appended custom records alongside Claude's JSONL.
+ * class only commits that state after each mutation. One sidecar contains the root and every nested
+ * workflow identity in the run. An atomic replace buys a much simpler recovery rule than replaying
+ * partially appended custom records alongside Claude's JSONL.
  */
 export class PersistentWorkflowJournal implements WorkflowJournal {
   readonly filePath: string
@@ -62,25 +68,38 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
     fallbackSnapshots: Iterable<JournalSnapshot> = [],
   ): Promise<PersistentWorkflowJournal> {
     const fallback = [...fallbackSnapshots]
-    const stored = await readStoredSnapshot(resolve(filePath))
-    if (stored === undefined) return new PersistentWorkflowJournal(filePath, fallback)
+    const stored = await readStoredSnapshots(resolve(filePath))
+    const snapshots = new Map<string, JournalSnapshot>()
+    for (const snapshot of stored?.snapshots ?? []) snapshots.set(snapshot.workflowId, snapshot)
 
-    const expected = fallback.find((snapshot) => snapshot.workflowId === stored.workflowId)
-    if (expected !== undefined && expected.sourceHash !== stored.sourceHash) {
-      // A deterministic sidecar path can survive workflow edits. Silently preferring its old source
-      // would discard a valid Claude fallback and could resume provider sessions against new code.
-      throw new PersistentJournalError(
-        'source-mismatch',
-        `Persistent journal source does not match the workflow: ${resolve(filePath)}`,
+    for (const candidate of fallback) {
+      const existing = snapshots.get(candidate.workflowId)
+      if (existing !== undefined && existing.sourceHash !== candidate.sourceHash) {
+        // A deterministic sidecar path can survive workflow edits. Silently preferring its old
+        // source would discard a valid imported fallback and could resume provider sessions against
+        // different code. This comparison is per nested identity, not merely the root workflow.
+        throw new PersistentJournalError(
+          'source-mismatch',
+          `Persistent journal source does not match workflow ${candidate.workflowId}: ${resolve(filePath)}`,
+        )
+      }
+      // A process can stop while replaying an imported prefix. At that point the sidecar only
+      // contains calls admitted so far, while the immutable fallback may contain later valid
+      // results. Unioning both histories preserves that tail; chained keys still invalidate the
+      // suffix after the first real miss.
+      snapshots.set(
+        candidate.workflowId,
+        existing === undefined ? candidate : mergeSnapshots(existing, candidate),
       )
     }
-    const snapshots = fallback.filter((snapshot) => snapshot.workflowId !== stored.workflowId)
-    // A process can stop while replaying an imported Claude prefix. At that point the sidecar only
-    // contains calls admitted so far, while the immutable Claude fallback may contain later valid
-    // results. Unioning both histories by record preserves that tail; the in-memory matcher resolves
-    // duplicates by chained key and still invalidates everything after the first real miss.
-    snapshots.push(expected === undefined ? stored : mergeSnapshots(stored, expected))
-    return new PersistentWorkflowJournal(filePath, snapshots)
+
+    const journal = new PersistentWorkflowJournal(filePath, snapshots.values())
+    if (fallback.length > 0 || stored?.version === LEGACY_VERSION) {
+      // Imported lineage must be durable before run.started can be published. This also migrates a
+      // version-1 root-only file on first open instead of waiting for the next agent admission.
+      journal.#persistAll()
+    }
+    return journal
   }
 
   beginRun(identity: JournalIdentity, options: { reuseMode?: JournalReuseMode } = {}): WorkflowJournalRun {
@@ -88,32 +107,59 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
     // Do not replace a complete durable prefix with an empty current run. `admit()` is the first
     // actual mutation and persists immediately; if the process dies between beginRun and admit,
     // retaining the previous snapshot is the only state that can still resume useful work.
-    return new PersistentWorkflowJournalRun(run, () => this.#persist(identity.workflowId))
+    return new PersistentWorkflowJournalRun(run, () => this.#persistAll())
   }
 
   getSnapshot(workflowId: string): JournalSnapshot | undefined {
     return this.#inner.getSnapshot(workflowId)
   }
 
-  #persist(workflowId: string): void {
-    const snapshot = this.#inner.getSnapshot(workflowId)
-    if (snapshot === undefined) return
-    if (snapshot.records.length > MAX_RECORDS) {
-      throw new PersistentJournalError(
-        'too-many-records',
-        `Persistent journal exceeds ${MAX_RECORDS} records`,
-      )
-    }
-    persistAtomically(this.filePath, { format: FORMAT, version: VERSION, snapshot })
+  getSnapshots(): readonly JournalSnapshot[] {
+    return this.#inner.getSnapshots()
+  }
+
+  #persistAll(): void {
+    persistAtomically(this.filePath, this.#inner.getSnapshots())
   }
 }
 
+/**
+ * Seed a successor's complete lineage before its manifest becomes visible to startup recovery.
+ *
+ * WHY this is exported instead of calling `open()` after createRun: that ordering creates a crash
+ * window where startup sees a queued successor but no inherited journal, then reruns completed
+ * siblings. FileWorkflowStore calls this while the run directory is still unpublished.
+ */
+export function writeInitialWorkflowJournal(
+  filePath: string,
+  snapshots: readonly JournalSnapshot[],
+): void {
+  if (snapshots.length === 0) return
+  persistAtomically(resolve(filePath), snapshots)
+}
+
 function mergeSnapshots(primary: JournalSnapshot, fallback: JournalSnapshot): JournalSnapshot {
+  const primaryKeys = new Set(primary.records.map((record) => record.key))
+  const sessionIdentity = (record: JournalSessionRecord): string => (
+    `${record.key}\0${record.agentId}\0${record.session.provider}\0${record.session.id}`
+  )
+  const primarySessions = new Set((primary.sessions ?? []).map(sessionIdentity))
   return {
     workflowId: primary.workflowId,
     sourceHash: primary.sourceHash,
-    records: [...primary.records, ...fallback.records],
-    sessions: [...(primary.sessions ?? []), ...(fallback.sessions ?? [])],
+    // WHY merge by call key instead of concatenating whole generations: createRun seeds the
+    // successor sidecar before publishing its manifest, then startLoaded opens that same sidecar
+    // with the inherited snapshot as a crash fallback. Blind concatenation doubled every record on
+    // every recovery. A key already present in the primary is the newer generation's authority;
+    // only untouched fallback keys are needed to preserve a sparse tail after a partial replay.
+    records: [
+      ...primary.records,
+      ...fallback.records.filter((record) => !primaryKeys.has(record.key)),
+    ],
+    sessions: [
+      ...(primary.sessions ?? []),
+      ...(fallback.sessions ?? []).filter((record) => !primarySessions.has(sessionIdentity(record))),
+    ],
   }
 }
 
@@ -147,17 +193,26 @@ class PersistentWorkflowJournalRun implements WorkflowJournalRun {
   }
 }
 
-function persistAtomically(filePath: string, journal: StoredJournal): void {
+function persistAtomically(filePath: string, snapshots: readonly JournalSnapshot[]): void {
   const directory = dirname(filePath)
   mkdirSync(directory, { recursive: true, mode: 0o700 })
   const temporary = `${filePath}.tmp-${process.pid}-${randomUUID()}`
   try {
+    validateSnapshotCollection(snapshots, filePath)
+    const journal: StoredJournal = { format: FORMAT, version: VERSION, snapshots }
+    const content = `${JSON.stringify(journal)}\n`
+    if (Buffer.byteLength(content, 'utf8') > MAX_FILE_BYTES) {
+      throw new PersistentJournalError(
+        'file-too-large',
+        `Workflow journal exceeds ${MAX_FILE_BYTES} bytes: ${filePath}`,
+      )
+    }
     // Results can contain source fragments or business data. 0600 is intentional even when a user's
     // umask is permissive; standalone resume state should have the same privacy posture as provider
     // transcripts, not ordinary checked-in project files.
     const file = openSync(temporary, 'wx', 0o600)
     try {
-      writeFileSync(file, `${JSON.stringify(journal)}\n`, { encoding: 'utf8' })
+      writeFileSync(file, content, { encoding: 'utf8' })
       // WHY rename alone is not a durable checkpoint: an OS may acknowledge the replace while the
       // new bytes remain only in page cache. Resume correctness depends on a reported tool result
       // surviving sudden power loss, so flush the bytes before publishing the new name.
@@ -179,13 +234,14 @@ function persistAtomically(filePath: string, journal: StoredJournal): void {
     }
   } catch (cause) {
     rmSync(temporary, { force: true })
+    if (cause instanceof PersistentJournalError) throw cause
     throw new PersistentJournalError('write-failed', `Cannot persist workflow journal: ${filePath}`, {
       cause,
     })
   }
 }
 
-async function readStoredSnapshot(filePath: string): Promise<JournalSnapshot | undefined> {
+async function readStoredSnapshots(filePath: string): Promise<ReadStoredJournal | undefined> {
   let info
   try {
     info = await stat(filePath)
@@ -216,14 +272,33 @@ async function readStoredSnapshot(filePath: string): Promise<JournalSnapshot | u
   return parseStoredJournal(value, filePath)
 }
 
-function parseStoredJournal(value: unknown, filePath: string): JournalSnapshot {
-  if (!isObject(value) || value.format !== FORMAT || value.version !== VERSION) {
+function parseStoredJournal(value: unknown, filePath: string): ReadStoredJournal {
+  if (!isObject(value) || value.format !== FORMAT) {
     throw new PersistentJournalError('invalid-format', `Workflow journal has an unknown format: ${filePath}`)
   }
-  if (!isObject(value.snapshot)) {
-    throw new PersistentJournalError('invalid-snapshot', `Workflow journal snapshot is invalid: ${filePath}`)
+  if (value.version === LEGACY_VERSION) {
+    if (!isObject(value.snapshot)) {
+      throw new PersistentJournalError('invalid-snapshot', `Workflow journal snapshot is invalid: ${filePath}`)
+    }
+    const snapshot = parseSnapshot(value.snapshot, filePath, 'snapshot')
+    validateSnapshotCollection([snapshot], filePath)
+    return { version: LEGACY_VERSION, snapshots: [snapshot] }
   }
-  const snapshot = value.snapshot
+  if (value.version !== VERSION || !Array.isArray(value.snapshots)) {
+    throw new PersistentJournalError('invalid-format', `Workflow journal has an unknown format: ${filePath}`)
+  }
+  const snapshots = value.snapshots.map((snapshot, index) => (
+    parseSnapshot(snapshot, filePath, `snapshot ${index + 1}`)
+  ))
+  validateSnapshotCollection(snapshots, filePath)
+  return { version: VERSION, snapshots }
+}
+
+function parseSnapshot(value: unknown, filePath: string, label: string): JournalSnapshot {
+  if (!isObject(value)) {
+    throw new PersistentJournalError('invalid-snapshot', `Workflow journal ${label} is invalid: ${filePath}`)
+  }
+  const snapshot = value
   if (
     typeof snapshot.workflowId !== 'string' ||
     snapshot.workflowId.length === 0 ||
@@ -232,7 +307,10 @@ function parseStoredJournal(value: unknown, filePath: string): JournalSnapshot {
     !Array.isArray(snapshot.records) ||
     snapshot.records.length > MAX_RECORDS
   ) {
-    throw new PersistentJournalError('invalid-snapshot', `Workflow journal identity is invalid: ${filePath}`)
+    throw new PersistentJournalError(
+      'invalid-snapshot',
+      `Workflow journal ${label} identity is invalid: ${filePath}`,
+    )
   }
 
   const records = snapshot.records.map((record, index) => parseRecord(record, filePath, index))
@@ -244,6 +322,43 @@ function parseStoredJournal(value: unknown, filePath: string): JournalSnapshot {
     sourceHash: snapshot.sourceHash,
     records,
     ...(sessions === undefined ? {} : { sessions }),
+  }
+}
+
+function validateSnapshotCollection(
+  snapshots: readonly JournalSnapshot[],
+  filePath: string,
+): void {
+  const workflowIds = new Set<string>()
+  let entries = 0
+  for (const snapshot of snapshots) {
+    if (
+      snapshot.workflowId.length === 0 ||
+      snapshot.sourceHash.length === 0 ||
+      snapshot.records.length > MAX_RECORDS ||
+      (snapshot.sessions?.length ?? 0) > MAX_RECORDS
+    ) {
+      throw new PersistentJournalError(
+        'invalid-snapshot',
+        `Workflow journal snapshot identity or size is invalid: ${filePath}`,
+      )
+    }
+    if (workflowIds.has(snapshot.workflowId)) {
+      throw new PersistentJournalError(
+        'duplicate-workflow',
+        `Workflow journal contains duplicate identity ${snapshot.workflowId}: ${filePath}`,
+      )
+    }
+    workflowIds.add(snapshot.workflowId)
+    entries += snapshot.records.length + (snapshot.sessions?.length ?? 0)
+    if (entries > MAX_RECORDS) {
+      // The cap is lineage-wide. Capping each child independently would let a deeply nested
+      // workflow multiply the sidecar without bound and turn every admission into a huge sync write.
+      throw new PersistentJournalError(
+        'too-many-records',
+        `Persistent journal exceeds ${MAX_RECORDS} aggregate records`,
+      )
+    }
   }
 }
 

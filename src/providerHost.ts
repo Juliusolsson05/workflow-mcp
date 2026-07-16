@@ -21,6 +21,7 @@ import type {
 } from './providerHostProtocol.js'
 
 const DEFAULT_HEARTBEAT_MS = 5_000
+const PARENT_LOSS_SELF_DESTRUCT_MS = 5_000
 
 /**
  * Start the credentialed Codex provider host in the current Node process.
@@ -127,12 +128,27 @@ export function startCodexProviderHost(): void {
   })
 
   process.on('disconnect', () => {
+    if (terminal) return
     controller?.abort('Provider host parent disconnected')
     stopHeartbeat()
     for (const acknowledgement of eventAcknowledgements.values()) {
       acknowledgement.reject(new Error('Provider host parent disconnected before acknowledging event'))
     }
     eventAcknowledgements.clear()
+
+    // WHY parent loss has a hard local deadline: Electron was the only process able to address
+    // this attempt. Merely aborting the SDK leaves a provider host alive forever when Codex or a
+    // tool ignores cooperative cancellation. This timer does not pretend to contain descendants
+    // which escaped the process group (the public boundary remains unconfirmed), but it does make
+    // the host itself fail-stop instead of becoming an immortal credentialed orphan.
+    const selfDestruct = setTimeout(() => {
+      try {
+        process.kill(process.pid, 'SIGKILL')
+      } catch {
+        process.exit(1)
+      }
+    }, PARENT_LOSS_SELF_DESTRUCT_MS)
+    selfDestruct.unref?.()
   })
 }
 
@@ -145,6 +161,7 @@ function serializeProviderError(error: unknown): SerializedProviderHostError {
       ...(error.code === undefined ? {} : { code: error.code }),
       retryable: error.retryable,
       circuitImpact: error.circuitImpact,
+      terminalDisposition: error.terminalDisposition,
       ...(error.providerSession === undefined ? {} : { providerSession: error.providerSession }),
     }
   }
@@ -171,6 +188,9 @@ export function deserializeProviderHostError(error: SerializedProviderHostError)
       ...(error.code === undefined ? {} : { code: error.code }),
       retryable: error.retryable ?? false,
       ...(error.circuitImpact === undefined ? {} : { circuitImpact: error.circuitImpact }),
+      ...(error.terminalDisposition === undefined
+        ? {}
+        : { terminalDisposition: error.terminalDisposition }),
       ...(error.providerSession === undefined ? {} : { providerSession: error.providerSession }),
     })
     if (error.stack !== undefined) failure.stack = error.stack

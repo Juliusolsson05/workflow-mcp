@@ -101,14 +101,17 @@ export class WorkConservingScheduler implements AgentScheduler {
 
   #drain(): void {
     while (this.#active < this.#capacity && this.#waiters.length > 0) {
-      // WHY shared service capacity rotates by run: one workflow can enqueue hundreds of agents in
-      // a single JavaScript turn. Plain FIFO then leaves a later two-agent run waiting behind the
-      // entire burst even though both are equally runnable. Rotation applies only to queued work;
-      // it never preempts an active provider call or leaves a permit idle.
-      const alternateIndex = this.#lastGrantedKey === undefined
-        ? 0
-        : this.#waiters.findIndex((candidate) => candidate.fairnessKey !== this.#lastGrantedKey)
-      const index = alternateIndex < 0 ? 0 : alternateIndex
+      // WHY this chooses the next *key* in queue order instead of merely the first key different
+      // from the previous grant: with A,A,A,B,B,B,C, "different from last" alternates A/B until
+      // both bursts drain and never gives C a round-robin turn. Rebuilding the small unique-key
+      // ring from live waiters also makes aborted/emptied keys disappear without a second mutable
+      // queue whose bookkeeping could drift from the actual waiter authority.
+      const keys = [...new Set(this.#waiters.map((candidate) => candidate.fairnessKey))]
+      const previousKeyIndex = this.#lastGrantedKey === undefined
+        ? -1
+        : keys.indexOf(this.#lastGrantedKey)
+      const nextKey = keys[(previousKeyIndex + 1) % keys.length]
+      const index = this.#waiters.findIndex((candidate) => candidate.fairnessKey === nextKey)
       const [waiter] = this.#waiters.splice(index, 1)
       if (!waiter) break
       waiter.signal.removeEventListener('abort', waiter.onAbort)

@@ -13,9 +13,59 @@ const fixture = join(
   'fixtures',
   'stubbornProviderHost.cjs',
 )
+const successfulFixture = join(
+  dirname(fileURLToPath(import.meta.url)),
+  'fixtures',
+  'successfulProviderHost.cjs',
+)
+
+async function readCompleteJson<T>(path: string): Promise<T | undefined> {
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as T
+  } catch (error) {
+    // The fixture writes synchronously, but filesystem notification/read visibility can expose the
+    // new inode before all bytes are observable on loaded macOS runners. ENOENT and partial JSON
+    // both mean "poll again"; a persistent malformed file still fails the final assertion.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) {
+      return undefined
+    }
+    throw error
+  }
+}
 
 describe('ProcessOwnedCodexHost', () => {
-  it('reaps a host and SIGTERM-ignoring grandchild before the provider attempt settles', async () => {
+  it('reports the exact host executable evidence instead of labelling it as the SDK CLI', async () => {
+    const host = new ProcessOwnedCodexHost({
+      hostFilePath: successfulFixture,
+      codexOptions: {},
+      modelAliases: {},
+      executableEvidence: {
+        path: '/opt/agent-code/codex',
+        sha256: 'a'.repeat(64),
+        version: 'codex-cli 9.9.9',
+      },
+    })
+
+    await expect(host.execute({
+      prompt: 'complete',
+      workingDirectory: process.cwd(),
+      sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+    }, {
+      signal: new AbortController().signal,
+      emit: async () => undefined,
+    })).resolves.toMatchObject({
+      diagnostics: {
+        fixture: true,
+        executable: {
+          path: '/opt/agent-code/codex',
+          sha256: 'a'.repeat(64),
+          version: 'codex-cli 9.9.9',
+        },
+      },
+    })
+  })
+
+  it('reaps a host and SIGTERM-ignoring original-process-group grandchild before the provider attempt settles', async () => {
     if (process.platform === 'win32') return
     const directory = await mkdtemp(join(tmpdir(), 'workflow-provider-tree-'))
     const pidPath = join(directory, 'grandchild.pid')
@@ -65,7 +115,7 @@ describe('ProcessOwnedCodexHost', () => {
     const pidPath = join(directory, 'grandchild.pid')
     const codexHome = join(directory, 'codex-home')
     const authenticationFile = join(directory, 'source-auth.json')
-    await writeFile(authenticationFile, '{"tokens":{"access_token":"fixture"}}', 'utf8')
+    let preparationCalls = 0
     const identity: AgentProviderAttemptIdentity = {
       runId: 'run_configuration_isolation',
       agentId: 'agent_1',
@@ -76,7 +126,16 @@ describe('ProcessOwnedCodexHost', () => {
       hostFilePath: fixture,
       codexOptions: { env: { PATH: process.env.PATH ?? '' } },
       modelAliases: {},
-      configurationIsolation: { codexHome, authenticationFile },
+      configurationIsolation: {
+        codexHome,
+        authenticationFile,
+        prepareAuthentication: async () => {
+          preparationCalls += 1
+          if (preparationCalls === 1) {
+            await writeFile(authenticationFile, '{"tokens":{"access_token":"fixture"}}', 'utf8')
+          }
+        },
+      },
     })
     const execution = host.execute({
       prompt: pidPath,
@@ -90,15 +149,13 @@ describe('ProcessOwnedCodexHost', () => {
 
     let options: { env?: Record<string, string> } | undefined
     for (let index = 0; index < 100; index += 1) {
-      const serialized = await readFile(`${pidPath}.options.json`, 'utf8').catch(() => undefined)
-      if (serialized !== undefined) {
-        options = JSON.parse(serialized) as { env?: Record<string, string> }
-        break
-      }
+      options = await readCompleteJson(`${pidPath}.options.json`)
+      if (options !== undefined) break
       await new Promise((resolveWait) => setTimeout(resolveWait, 10))
     }
 
     expect(options?.env).toMatchObject({ CODEX_HOME: codexHome })
+    expect(preparationCalls).toBe(1)
     expect(await readFile(join(codexHome, 'auth.json'), 'utf8')).toContain('fixture')
     const config = await readFile(join(codexHome, 'config.toml'), 'utf8')
     expect(config).toContain('apps = false')
@@ -187,11 +244,8 @@ describe('ProcessOwnedCodexHost', () => {
 
     let hostedRequest: AgentRequest | undefined
     for (let index = 0; index < 100; index += 1) {
-      const serialized = await readFile(`${pidPath}.request.json`, 'utf8').catch(() => undefined)
-      if (serialized !== undefined) {
-        hostedRequest = JSON.parse(serialized) as AgentRequest
-        break
-      }
+      hostedRequest = await readCompleteJson(`${pidPath}.request.json`)
+      if (hostedRequest !== undefined) break
       await new Promise((resolveWait) => setTimeout(resolveWait, 10))
     }
 
@@ -241,11 +295,8 @@ describe('ProcessOwnedCodexHost', () => {
 
     let hostedRequest: AgentRequest | undefined
     for (let index = 0; index < 100; index += 1) {
-      const serialized = await readFile(`${pidPath}.request.json`, 'utf8').catch(() => undefined)
-      if (serialized !== undefined) {
-        hostedRequest = JSON.parse(serialized) as AgentRequest
-        break
-      }
+      hostedRequest = await readCompleteJson(`${pidPath}.request.json`)
+      if (hostedRequest !== undefined) break
       await new Promise((resolveWait) => setTimeout(resolveWait, 10))
     }
 

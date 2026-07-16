@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { fileURLToPath } from 'node:url'
 
 import type { ThreadEvent, ThreadOptions, TurnOptions } from '@openai/codex-sdk'
 
@@ -61,6 +62,18 @@ function mockClient(events: readonly ThreadEvent[]) {
 }
 
 describe('CodexAgentProvider', () => {
+  it('does not advertise process-tree ownership for hosted Codex attempts', () => {
+    const provider = new CodexAgentProvider({
+      codexPathOverride: '/tmp/codex',
+      providerHostFilePath: fileURLToPath(new URL('../dist/providerHost.js', import.meta.url)),
+    })
+
+    // A real Codex shell tool may call setsid() and leave the provider-host process group. Until a
+    // creation-time supervisor owns that descendant, both replay and ownership must fail closed.
+    expect(provider.terminationBoundary).toBe('unconfirmed-descendants')
+    expect(provider.automaticReplaySafety).toBe('unsafe-or-unknown')
+  })
+
   it('maps thread policy, streamed activities, final text, session, and raw usage', async () => {
     const { client, calls } = mockClient([
       { type: 'thread.started', thread_id: 'thread-1' },
@@ -160,7 +173,6 @@ describe('CodexAgentProvider', () => {
       diagnostics: {
         sdk: '@openai/codex-sdk',
         sdkVersion: '0.144.4',
-        bundledCliVersion: '0.144.4',
       },
     })
   })
@@ -181,6 +193,11 @@ describe('CodexAgentProvider', () => {
     })
     expect(() => new CodexAgentProvider({
       codexPathOverride: '/tmp/codex',
+      capabilities: { inheritedMcpServers: 'disabled' },
+    })).toThrow(expect.objectContaining({ code: 'codex-capability-attestation-invalid' }))
+    expect(() => new CodexAgentProvider({
+      codexPathOverride: '/tmp/codex',
+      configurationIsolation: { codexHome: '/tmp/private-codex-home' },
       capabilities: { inheritedMcpServers: 'disabled' },
     })).toThrow(expect.objectContaining({ code: 'codex-capability-attestation-invalid' }))
   })
@@ -409,7 +426,10 @@ describe('CodexAgentProvider', () => {
         signal: new AbortController().signal,
         emit: async () => undefined,
       }),
-    ).rejects.toMatchObject({ code: 'codex-structured-output-invalid' })
+    ).rejects.toMatchObject({
+      code: 'codex-structured-output-invalid',
+      terminalDisposition: 'reject',
+    })
   })
 
   it('normalizes stream failures and AbortSignal cancellation', async () => {

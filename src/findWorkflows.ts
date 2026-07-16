@@ -1,4 +1,4 @@
-import { readdir, stat } from 'node:fs/promises'
+import { readdir, realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 
@@ -142,6 +142,23 @@ async function readDirectory(
   issues: WorkflowIssue[],
   nearMisses: string[],
 ): Promise<void> {
+  const canonicalDirectory = await confinedWorkflowDirectory(directory).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    issues.push(issue(directory, error))
+    return undefined
+  })
+  if (canonicalDirectory === undefined) return
+  if (canonicalDirectory !== await resolveExpectedWorkflowDirectory(directory)) {
+    // Workflow source executes as code. Letting `.claude` or `workflows` redirect through a
+    // symlink turns repository discovery into execution from an unrelated filesystem location.
+    // Individual file symlinks remain usable only when their canonical target stays in this root.
+    issues.push({
+      filePath: directory,
+      code: 'path-forbidden',
+      message: `Workflow directory is redirected outside its project boundary: ${directory}`,
+    })
+    return
+  }
   let entries
   try {
     entries = await readdir(directory, { withFileTypes: true })
@@ -162,7 +179,16 @@ async function readDirectory(
     if (extension !== '.js' || (!entry.isFile() && !entry.isSymbolicLink())) continue
 
     try {
-      const loaded = await loadWorkflowFile(filePath)
+      const canonicalFile = await realpath(filePath)
+      if (!isInside(canonicalDirectory, canonicalFile)) {
+        issues.push({
+          filePath,
+          code: 'path-forbidden',
+          message: `Workflow file symlink leaves its visible workflow directory: ${filePath}`,
+        })
+        continue
+      }
+      const loaded = await loadWorkflowFile(canonicalFile)
       if (namesInDirectory.has(loaded.meta.name)) {
         // Claude lets readdir order decide this ambiguous case. Reporting it is important because
         // sorting filenames here would create a deterministic but incompatible winner.
@@ -175,6 +201,8 @@ async function readDirectory(
       namesInDirectory.add(loaded.meta.name)
       workflows.set(loaded.meta.name, {
         ...loaded,
+        // Preserve the user-visible definition path. Execution approval separately canonicalizes
+        // this identity, so a harmless /tmp -> /private/tmp alias does not churn returned paths.
         filePath,
         location,
       })
@@ -182,6 +210,23 @@ async function readDirectory(
       issues.push(issue(filePath, error))
     }
   }
+}
+
+async function confinedWorkflowDirectory(directory: string): Promise<string> {
+  return resolve(await realpath(directory))
+}
+
+async function resolveExpectedWorkflowDirectory(directory: string): Promise<string> {
+  // `directory` always has the shape <scope>/.claude/workflows. Canonicalizing only <scope> keeps
+  // legitimate project aliases working while making any redirect in the security-sensitive final
+  // two components observable as a mismatch.
+  const scope = dirname(dirname(resolve(directory)))
+  return resolve(await realpath(scope), '.claude', 'workflows')
+}
+
+function isInside(parent: string, candidate: string): boolean {
+  const child = relative(resolve(parent), resolve(candidate))
+  return child.length > 0 && !child.startsWith('..') && !isAbsolute(child)
 }
 
 export async function findWorkflows(options: FindWorkflowsOptions = {}): Promise<FindWorkflowsResult> {

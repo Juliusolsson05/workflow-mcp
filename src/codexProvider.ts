@@ -58,6 +58,14 @@ export type CodexProviderOptions = Omit<CodexOptions, 'env'> & {
    * boundary, and must classify every server it intentionally exposes.
    */
   capabilities?: CodexExecutionCapabilities
+  /** Exact host-resolved CLI identity; unlike the SDK version this describes what is executed. */
+  executableEvidence?: CodexExecutableEvidence
+}
+
+export type CodexExecutableEvidence = {
+  path: string
+  sha256: string
+  version?: string
 }
 
 export type CodexExternalCapabilityEffect = 'read-only' | 'idempotent' | 'mutating' | 'unknown'
@@ -76,10 +84,24 @@ export type CodexConfigurationIsolation = {
   /** Optional login copied into the isolated home before each host starts. */
   authenticationFile?: string
   /**
+   * App-owned credential broker hook run immediately before each attempt snapshots auth.
+   *
+   * WHY this is a callback instead of teaching workflow-mcp OAuth/keyring policy: the embedding
+   * application owns interactive account state. The hook lets it serialize refresh and write an
+   * access-only snapshot while this package continues to own process/config isolation.
+   */
+  prepareAuthentication?(): void | Promise<void>
+  /**
    * Optional pre-isolation Codex home from which the exact requested rollout may be imported.
    * Configuration, plugins, apps, and unrelated sessions are never copied.
    */
   sessionSourceHome?: string
+  /**
+   * Digest produced after inspecting every effective Codex configuration layer for the exact
+   * executable and host policy. A private CODEX_HOME alone is insufficient because system/admin
+   * and managed layers are loaded independently of that directory.
+   */
+  effectiveConfigurationFingerprint?: string
 }
 
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
@@ -110,6 +132,7 @@ export class CodexAgentProvider implements AgentProvider {
       providerHostFilePath,
       configurationIsolation,
       capabilities = { inheritedMcpServers: 'unknown' },
+      executableEvidence,
       env,
       ...codexOptions
     } = options
@@ -126,13 +149,19 @@ export class CodexAgentProvider implements AgentProvider {
       this.#client = client
       this.#host = undefined
     } else {
-      if (capabilities.inheritedMcpServers === 'disabled' && configurationIsolation === undefined) {
+      if (
+        capabilities.inheritedMcpServers === 'disabled' &&
+        (
+          configurationIsolation?.effectiveConfigurationFingerprint === undefined ||
+          configurationIsolation.effectiveConfigurationFingerprint.length === 0
+        )
+      ) {
         // A declaration is not an isolation boundary. Without a dedicated CODEX_HOME, the CLI
         // still reads ~/.codex/config.toml, project .codex/config.toml, plugins, and apps. Refusing
         // this combination prevents a host from accidentally converting "we did not pass an MCP
         // server" into the much stronger—and false—claim that no mutating server is reachable.
         throw new AgentProviderFailure(
-          'Codex inherited MCP servers can be marked disabled only with configurationIsolation',
+          'Codex inherited MCP servers can be marked disabled only with a verified effective-configuration fingerprint',
           { code: 'codex-capability-attestation-invalid' },
         )
       }
@@ -140,6 +169,7 @@ export class CodexAgentProvider implements AgentProvider {
       this.#host = new ProcessOwnedCodexHost({
         ...(providerHostFilePath === undefined ? {} : { hostFilePath: providerHostFilePath }),
         ...(configurationIsolation === undefined ? {} : { configurationIsolation }),
+        ...(executableEvidence === undefined ? {} : { executableEvidence }),
         codexOptions: {
           ...codexOptions,
           env: safeCodexEnvironment(env),
@@ -157,11 +187,15 @@ export class CodexAgentProvider implements AgentProvider {
 
   get terminationBoundary(): 'settlement' | 'process-tree' | 'unconfirmed-descendants' {
     // Production turns always use the process owner. Injected clients deliberately retain the
-    // weaker settlement boundary because no OS process exists for workflow-mcp to reap. Windows
-    // taskkill is useful escalation, but unlike a Job Object it does not bind future descendants
-    // at creation time, so advertising the POSIX guarantee there would be stronger than reality.
+    // weaker settlement boundary because no OS process exists for workflow-mcp to reap.
+    //
+    // WHY POSIX is also unconfirmed: a process group is an escalation mechanism, not a containment
+    // boundary. Real Codex shell tools call setsid(), and therefore leave the provider host's group
+    // before this adapter can signal `-hostPid`. Windows taskkill has the equivalent creation-time
+    // race without a Job Object. Returning `process-tree` on either platform would let the runtime
+    // overlap a successor with a command which the OS boundary never owned.
     if (this.#host === undefined) return 'settlement'
-    return process.platform === 'win32' ? 'unconfirmed-descendants' : 'process-tree'
+    return 'unconfirmed-descendants'
   }
 
   assessReplaySafety(request: AgentRequest): AgentReplaySafetyAssessment {
@@ -396,7 +430,6 @@ export async function executeCodexTurn(
       diagnostics: {
         sdk: '@openai/codex-sdk',
         sdkVersion: CODEX_SDK_VERSION,
-        bundledCliVersion: CODEX_SDK_VERSION,
         ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
       },
     }
@@ -483,6 +516,7 @@ function parseStructuredOutput(
   } catch (cause) {
     throw new AgentProviderFailure('Codex structured output was not valid JSON', {
       code: 'codex-structured-output-invalid',
+      terminalDisposition: 'reject',
       ...(providerSession === undefined ? {} : { providerSession }),
       cause,
     })

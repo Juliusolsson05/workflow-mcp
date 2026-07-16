@@ -79,6 +79,7 @@ export class FakeAgentProvider implements AgentProvider {
   readonly completionOrder: number[] = []
   readonly providerName: string
   readonly automaticReplaySafety = 'safe' as const
+  readonly recoveryFingerprint: string
 
   #scripts: readonly FakeProviderScript[]
   #nextScript = 0
@@ -87,6 +88,7 @@ export class FakeAgentProvider implements AgentProvider {
 
   constructor(scripts: readonly FakeProviderScript[], options: { providerName?: string } = {}) {
     this.providerName = options.providerName ?? 'fake'
+    this.recoveryFingerprint = `fake-provider:${this.providerName}:v1`
     if (this.providerName.length === 0) throw new FakeProviderSetupError('providerName must not be empty')
     scripts.forEach(validateScript)
     // Copy the outer queue so a test cannot reorder future outcomes while calls are in flight.

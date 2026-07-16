@@ -15,7 +15,7 @@ type PendingRequest = {
 }
 
 type RealmResolve = (json: string, isUndefined: boolean) => void
-type RealmReject = (name: string, message: string, stack?: string) => void
+type RealmReject = (name: string, message: string, stack?: string, code?: string) => void
 
 const BLOCKED_VALUE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
@@ -101,7 +101,12 @@ function pendingRealmRequest(resolveRealm: RealmResolve, rejectRealm: RealmRejec
     reject(error: Error): void {
       // The same rule applies to failures: a host Error must never become a workflow rejection.
       // The realm callback creates its own Error from these primitive fields.
-      rejectRealm(error.name, error.message, error.stack)
+      rejectRealm(
+        error.name,
+        error.message,
+        error.stack,
+        'code' in error && typeof error.code === 'string' ? error.code : undefined,
+      )
     },
   }
 }
@@ -335,10 +340,11 @@ const INITIALIZE_REALM = `
   const request = (start) => new RealmPromise((resolve, reject) => {
     start(
       (json, isUndefined) => resolve(isUndefined ? undefined : parseJson(json)),
-      (name, message, stack) => {
+      (name, message, stack, code) => {
         const error = new RealmError(message)
         error.name = name
         if (stack !== undefined) error.stack = stack
+        if (code !== undefined) error.code = code
         reject(error)
       },
     )
@@ -567,6 +573,7 @@ function receive(message: ParentToWorkerMessage): void {
       const error = new Error(message.result.error.message)
       error.name = message.result.error.name
       if (message.result.error.stack !== undefined) error.stack = message.result.error.stack
+      if (message.result.error.code !== undefined) Object.assign(error, { code: message.result.error.code })
       pending.reject(error)
     }
     return
@@ -581,6 +588,7 @@ function receive(message: ParentToWorkerMessage): void {
     const error = new Error(message.result.error.message)
     error.name = message.result.error.name
     if (message.result.error.stack !== undefined) error.stack = message.result.error.stack
+    if (message.result.error.code !== undefined) Object.assign(error, { code: message.result.error.code })
     pending.reject(error)
   }
 }

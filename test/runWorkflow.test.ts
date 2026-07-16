@@ -495,6 +495,30 @@ describe('cancellation, journal, and composition', () => {
     expect(snapshot.agents[0]?.outcome).toMatchObject({ source: 'journal', structured: true })
   })
 
+  it('revalidates historical structured output before returning a journal hit', async () => {
+    const schema = {
+      type: 'object',
+      properties: { ok: { type: 'boolean' } },
+      required: ['ok'],
+      additionalProperties: false,
+    }
+    const source = workflow(`return await agent('cached', { schema: ${JSON.stringify(schema)} })`, 'journal-schema-validation')
+    const key = createJournalKey('', 'cached', { schema })
+    const journal = new InMemoryWorkflowJournal([{
+      workflowId: source.meta.name,
+      sourceHash: source.sourceHash,
+      records: [
+        { type: 'started', key, agentId: 'legacy-agent' },
+        { type: 'result', key, agentId: 'legacy-agent', result: { ok: 'not-boolean' }, successful: true },
+      ],
+    }])
+
+    const run = start(source, [], { journal })
+    await expect(run.run.result).rejects.toThrow(/reused agent output failed schema validation/i)
+    expect(run.provider.calls).toHaveLength(0)
+    expect(projectWorkflowState(run.run.id, await run.events).status).toBe('failed')
+  })
+
   it('records an interrupted provider session and resumes it on the next matching run', async () => {
     const source = workflow(`return await agent('resume me')`, 'provider-resume')
     const journal = new InMemoryWorkflowJournal()

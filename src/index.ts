@@ -89,6 +89,7 @@ export type {
   CodexClientLike,
   CodexConfigurationIsolation,
   CodexExecutionCapabilities,
+  CodexExecutableEvidence,
   CodexExternalCapabilityEffect,
   CodexProviderOptions,
   CodexThreadLike,
@@ -135,6 +136,7 @@ export type {
 } from './workflowEvents.js'
 
 export {
+  createWorkflowAgentCounts,
   createWorkflowState,
   projectWorkflowState,
   reduceWorkflowState,
@@ -187,6 +189,7 @@ export type {
 export { WorkflowService, WorkflowServiceError } from './workflowService.js'
 export type {
   WorkflowRunStartResult,
+  WorkflowStoredRunReference,
   WorkflowRunHealth,
   WorkflowStartInput,
   WorkflowResumeInput,
@@ -196,6 +199,7 @@ export type {
   WorkflowServiceScope,
   WorkflowRecoveryPolicy,
   WorkflowProviderFactoryContext,
+  WorkflowSourceAuthorizationRequest,
 } from './workflowService.js'
 
 export { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'

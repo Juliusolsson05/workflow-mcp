@@ -27,6 +27,7 @@ import type {
   AgentRequest,
 } from './agentProvider.js'
 import type { CodexConfigurationIsolation } from './codexProvider.js'
+import type { CodexExecutableEvidence } from './codexProvider.js'
 import { deserializeProviderHostError } from './providerHost.js'
 import {
   isProviderHostToParentMessage,
@@ -47,6 +48,7 @@ export type ProcessOwnedCodexHostOptions = {
   codexOptions: SerializedCodexHostOptions
   modelAliases: Readonly<Record<string, string | null>>
   configurationIsolation?: CodexConfigurationIsolation
+  executableEvidence?: CodexExecutableEvidence
 }
 
 export type ProcessOwnedCodexExecutionOptions = {
@@ -72,20 +74,24 @@ type HostExecution = {
 }
 
 /**
- * Own one OS process group per Codex attempt.
+ * Supervise one OS process group per Codex attempt.
  *
  * WHY the provider promise settles on `close`, not on the host's `result` message: the original
  * incident was caused by treating a wrapper promise as proof that every tool descendant had died.
- * A terminal IPC message proves only that JavaScript reached a return statement. This owner waits
- * for the host process to be reaped, verifies the dedicated group has no remaining members, and
- * forcibly clears any residual descendants before handing the scheduler permit back.
+ * A terminal IPC message proves only that JavaScript reached a return statement. This supervisor
+ * waits for the direct host and its original process group to disappear. That is valuable cleanup,
+ * but it is not creation-time containment: a real Codex shell tool can call setsid() and escape.
+ * CodexAgentProvider therefore advertises `unconfirmed-descendants`; callers must quarantine
+ * ambiguous cancellation even when this best-effort group reap succeeds.
  */
 export class ProcessOwnedCodexHost {
   readonly #hostFilePath: string
   readonly #codexOptions: SerializedCodexHostOptions
   readonly #modelAliases: Readonly<Record<string, string | null>>
   readonly #configurationIsolation: CodexConfigurationIsolation | undefined
+  readonly #executableEvidence: CodexExecutableEvidence | undefined
   readonly #executions = new Map<string, HostExecution>()
+  readonly #preparingAttempts = new Set<string>()
 
   constructor(options: ProcessOwnedCodexHostOptions) {
     this.#hostFilePath = resolve(options.hostFilePath ?? defaultProviderHostFilePath())
@@ -94,6 +100,9 @@ export class ProcessOwnedCodexHost {
     this.#configurationIsolation = options.configurationIsolation === undefined
       ? undefined
       : { ...options.configurationIsolation }
+    this.#executableEvidence = options.executableEvidence === undefined
+      ? undefined
+      : { ...options.executableEvidence }
     if (!existsSync(this.#hostFilePath)) {
       throw new AgentProviderFailure(
         `Codex provider host is missing at ${this.#hostFilePath}; build the package/host entry before running workflows`,
@@ -107,6 +116,14 @@ export class ProcessOwnedCodexHost {
     context: AgentProviderExecutionContext,
     executionOptions: ProcessOwnedCodexExecutionOptions = {},
   ): Promise<AgentProviderResult> {
+    return this.#executePrepared(request, context, executionOptions)
+  }
+
+  async #executePrepared(
+    request: AgentRequest,
+    context: AgentProviderExecutionContext,
+    executionOptions: ProcessOwnedCodexExecutionOptions,
+  ): Promise<AgentProviderResult> {
     if (context.signal.aborted) return Promise.reject(new AgentProviderAbortError(context.signal.reason))
     const identity = context.attempt ?? {
       runId: 'direct',
@@ -114,9 +131,17 @@ export class ProcessOwnedCodexHost {
       attemptId: `direct_${randomUUID()}`,
       attemptNumber: 1,
     }
-    if (this.#executions.has(identity.attemptId)) {
-      return Promise.reject(new Error(`Provider attempt already exists: ${identity.attemptId}`))
+    if (this.#executions.has(identity.attemptId) || this.#preparingAttempts.has(identity.attemptId)) {
+      throw new Error(`Provider attempt already exists: ${identity.attemptId}`)
     }
+
+    this.#preparingAttempts.add(identity.attemptId)
+    try {
+      await this.#configurationIsolation?.prepareAuthentication?.()
+    } finally {
+      this.#preparingAttempts.delete(identity.attemptId)
+    }
+    if (context.signal.aborted) throw new AgentProviderAbortError(context.signal.reason)
 
     const prepared = this.#configurationIsolation === undefined
       ? { codexOptions: this.#codexOptions, request, restartedSession: false }
@@ -212,9 +237,9 @@ export class ProcessOwnedCodexHost {
     execution.abortRequested = true
     execution.termination ??= terminateProcessTree(execution.child)
     await execution.termination
-    // `terminateProcessTree` proves the OS boundary is gone. Awaiting the provider promise here is
-    // still useful because it guarantees the close handler has converted that fact into exactly
-    // one runtime-visible settlement before the supervisor returns from escalation.
+    // Awaiting the provider promise guarantees the close handler has converted direct-host/group
+    // exit into exactly one runtime-visible settlement. It deliberately does not upgrade that fact
+    // to proof about descendants which may have escaped the group.
     await execution.result.then(() => undefined, () => undefined)
   }
 
@@ -253,9 +278,10 @@ export class ProcessOwnedCodexHost {
   ): Promise<void> {
     if (execution.settled) return
     try {
-      // A normally completed SDK turn can still leave a detached tool grandchild. Reaping here is
-      // not merely cancellation cleanup; it is what makes every successful permit release obey
-      // the same process-tree invariant as a timed-out one.
+      // A normally completed SDK turn can still leave group members. Clear those best-effort so a
+      // successful host does not leak ordinary descendants; the provider's public termination
+      // boundary remains unconfirmed because session-owning grandchildren are not enumerable from
+      // this process group after they escape.
       execution.termination ??= reapResidualProcessTree(execution.child)
       await execution.termination
       await execution.delivery
@@ -263,7 +289,15 @@ export class ProcessOwnedCodexHost {
       if (execution.deliveryError !== undefined) throw execution.deliveryError
       if (execution.terminal?.type === 'result') {
         execution.settled = true
-        execution.resolve(execution.terminal.result)
+        execution.resolve({
+          ...execution.terminal.result,
+          diagnostics: {
+            ...(execution.terminal.result.diagnostics ?? {}),
+            ...(this.#executableEvidence === undefined
+              ? {}
+              : { executable: this.#executableEvidence }),
+          },
+        })
         return
       }
       if (execution.terminal?.type === 'error') {

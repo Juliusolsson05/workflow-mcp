@@ -93,6 +93,8 @@ export type AgentAttemptStarted = {
   startupDeadlineAt?: string
   absoluteDeadlineAt?: string
   workspaceId?: string
+  /** Persisted before provider dispatch so crash recovery can evaluate the concrete request. */
+  replaySafety?: AgentReplaySafetyAssessment
 }
 
 type EventEnvelope<Type extends string, Payload> = {
