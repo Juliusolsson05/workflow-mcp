@@ -425,11 +425,21 @@ const INITIALIZE_REALM = `
     }
 
     let droppedForBudget = 0
+    const isCoverageGap = (value) => {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+      const marker = value.__workflowAgentFailure
+      return marker !== null && typeof marker === 'object' &&
+        marker.schemaVersion === 1 && marker.coverageGap === true
+    }
     const results = await Promise.all(items.map(async (original, index) => {
       let current = original
       try {
         for (const stage of stages) {
-          if (current === null) break
+          // WHY coverage gaps are terminal pipeline values, not ordinary stage output: feeding a
+          // failed research assignment into later agents wastes budget and can turn supervisor
+          // metadata into prompts a workflow never intended. Keep the typed placeholder in the
+          // result array for synthesis, but stop only this item while healthy siblings advance.
+          if (current === null || isCoverageGap(current)) break
           current = await stage(current, original, index)
         }
         return current

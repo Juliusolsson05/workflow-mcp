@@ -638,7 +638,7 @@ export class WorkflowService {
       )
     }
     const original = await this.status(scope, input.runId)
-    if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
+    if (!['interrupted', 'failed', 'cancelled', 'completed_with_errors'].includes(original.status)) {
       throw new WorkflowServiceError(
         'run-not-resumable',
         `Workflow run ${input.runId} has status ${original.status}`,
@@ -785,6 +785,7 @@ export class WorkflowService {
       lineageId?: string
       recoveryMode?: 'manual' | 'automatic'
       journalReuseMode?: JournalReuseMode
+      reuseCoverageGaps?: boolean
       journalSnapshots?: Parameters<typeof PersistentWorkflowJournal.open>[1]
     },
   ): Promise<WorkflowRunStartResult> {
@@ -860,6 +861,11 @@ export class WorkflowService {
       journalReuseMode: input.journalReuseMode ?? (
         input.recoveryMode === 'automatic' ? 'exact-source-sparse' : 'longest-prefix'
       ),
+      // WHY only automatic recovery reuses coverage gaps: it is repairing an interrupted
+      // supervisor generation and must not silently replay work already classified unsafe or
+      // exhausted. An explicit workflow_resume is the user's request to try those casualties
+      // again, while still reusing every successful sibling from the exact-source sparse journal.
+      reuseCoverageGaps: input.reuseCoverageGaps ?? input.recoveryMode === 'automatic',
       scheduler: this.#scheduler,
       circuitBreaker,
       lineageId: input.lineageId ?? runId,

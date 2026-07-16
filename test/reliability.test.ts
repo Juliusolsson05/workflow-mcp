@@ -12,6 +12,7 @@ import type { FakeProviderScript } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
 import { PersistentWorkflowJournal } from '../src/persistentWorkflowJournal.js'
+import { InMemoryWorkflowJournal } from '../src/workflowJournal.js'
 import { runWorkflow } from '../src/runWorkflow.js'
 import type { WorkflowRun } from '../src/runWorkflow.js'
 import { WorkflowService } from '../src/workflowService.js'
@@ -43,6 +44,20 @@ function expectFailurePlaceholder(status: 'failed' | 'recovery_required' = 'fail
       coverageGap: true,
     }),
   })
+}
+
+function coverageGapValue(agentId = 'casualty') {
+  return {
+    __workflowAgentFailure: {
+      schemaVersion: 1,
+      agentId,
+      label: agentId,
+      status: 'recovery_required',
+      message: 'fixture coverage gap',
+      attempts: 1,
+      coverageGap: true,
+    },
+  }
 }
 
 const FAST_RETRY = {
@@ -167,10 +182,12 @@ describe('unattended workflow reliability', () => {
       },
       { outcome: { type: 'result', output: { type: 'text', text: 'recovered' } } },
     ])
+    const journal = new InMemoryWorkflowJournal()
     const run = runWorkflow({
       workflow: source,
       cwd: process.cwd(),
       provider,
+      journal,
       sandbox: { mode: 'read-only' },
       reliability: FAST_RETRY,
     })
@@ -186,6 +203,53 @@ describe('unattended workflow reliability', () => {
     expect(captured.some((event) => event.type === 'agent.recovery_completed')).toBe(true)
     expect(provider.calls[1]?.request.session).toBeUndefined()
     expect(provider.calls[1]?.request.recovery?.note).toContain('previous turn was interrupted')
+    expect(journal.getSnapshot(source.meta.name)?.sessions).toEqual([
+      expect.objectContaining({ session: { provider: 'fake', id: 'fake-session-2' } }),
+    ])
+  })
+
+  it('treats an unsolicited provider abort as a disposable attempt rather than run cancellation', async () => {
+    let calls = 0
+    const provider: AgentProvider = {
+      name: 'unsolicited-abort-provider',
+      automaticReplaySafety: 'safe',
+      execute: async () => {
+        calls += 1
+        if (calls === 1) throw new AgentProviderAbortError('provider process vanished')
+        return { output: { type: 'text', text: 'fresh attempt completed' } }
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('recover unsolicited abort')`),
+      cwd: process.cwd(),
+      provider,
+      sandbox: { mode: 'read-only' },
+      reliability: FAST_RETRY,
+    })
+
+    await expect(run.result).resolves.toBe('fresh attempt completed')
+    expect(calls).toBe(2)
+  })
+
+  it('fails the complete run when the scheduler authority rejects admission', async () => {
+    const provider = new FakeAgentProvider([{
+      outcome: { type: 'result', output: { type: 'text', text: 'must not execute' } },
+    }])
+    const scheduler = {
+      acquire: async () => { throw new Error('scheduler invariant broken') },
+      snapshot: () => ({ capacity: 1, active: 0, queued: 0, available: 1 }),
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('control-plane admission')`),
+      cwd: process.cwd(),
+      provider,
+      scheduler,
+    })
+    const events = collect(run)
+
+    await expect(run.result).rejects.toThrow('scheduler invariant broken')
+    expect(projectWorkflowState(run.id, await events).status).toBe('failed')
+    expect(provider.calls).toHaveLength(0)
   })
 
   it('opens the provider circuit and admits only a half-open recovery probe', async () => {
@@ -568,9 +632,118 @@ describe('unattended workflow reliability', () => {
         hardTerminationGraceMs: 2,
       },
     })
+    const events = collect(run)
 
     await expect(run.result).resolves.toEqual(expectFailurePlaceholder('recovery_required'))
     expect(run.ownershipReleaseSafe?.()).toBe(false)
+    expect((await events).filter((event) => (
+      event.type === 'agent.failed' && event.agentId === 'agent_1'
+    ))).toHaveLength(0)
+  })
+
+  it('does not overlap an unconfirmed writer with a retry in the same durable worktree', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-unconfirmed-worktree-'))
+    let calls = 0
+    let cleanups = 0
+    const provider: AgentProvider = {
+      name: 'unconfirmed-worktree-writer',
+      terminationBoundary: 'unconfirmed-descendants',
+      assessReplaySafety: () => ({
+        automatic: true,
+        risk: 'read_only',
+        reason: 'External tools are replay-safe',
+      }),
+      execute: () => {
+        calls += 1
+        return new Promise<AgentProviderResult>(() => undefined)
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('write once', { isolation: 'worktree' })`),
+      cwd: process.cwd(),
+      provider,
+      sandbox: { mode: 'workspace-write' },
+      prepareWorkingDirectory: async () => ({
+        path: root,
+        cleanup: async () => { cleanups += 1 },
+      }),
+      limits: { cancellationGraceMs: 2 },
+      reliability: {
+        ...FAST_RETRY,
+        maxAttempts: 2,
+        startupTimeoutMs: 5,
+        hardTerminationGraceMs: 2,
+      },
+    })
+    const events = collect(run)
+
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder('recovery_required'))
+    const captured = await events
+    expect(calls).toBe(1)
+    expect(cleanups).toBe(0)
+    expect(captured.filter((event) => event.type === 'agent.retry_scheduled')).toHaveLength(0)
+    expect(run.ownershipReleaseSafe?.()).toBe(false)
+  })
+
+  it('keeps the ownership fence when cancellation races a timed-out unconfirmed attempt', async () => {
+    let markStarted!: () => void
+    const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted })
+    const provider: AgentProvider = {
+      name: 'unconfirmed-timeout-cancellation-race',
+      terminationBoundary: 'unconfirmed-descendants',
+      execute: async () => {
+        markStarted()
+        return new Promise<AgentProviderResult>(() => undefined)
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('race cancellation')`),
+      cwd: process.cwd(),
+      provider,
+      limits: { cancellationGraceMs: 2 },
+      reliability: {
+        ...FAST_RETRY,
+        startupTimeoutMs: 5,
+        hardTerminationGraceMs: 2,
+      },
+    })
+    await started
+    await new Promise((resolveWait) => setTimeout(resolveWait, 6))
+    const cancelling = run.cancel('cancel during timeout escalation')
+
+    await expect(run.result).rejects.toThrow('cancel during timeout escalation')
+    await expect(cancelling).resolves.toBeUndefined()
+    expect(run.ownershipReleaseSafe?.()).toBe(false)
+  })
+
+  it('charges malformed structured output against the authoritative output-token budget', async () => {
+    const run = runWorkflow({
+      workflow: workflow(`
+        const casualty = await agent('invalid structured turn', {
+          schema: {
+            type: 'object',
+            properties: { ok: { type: 'boolean' } },
+            required: ['ok'],
+            additionalProperties: false,
+          },
+        })
+        return { casualty, spent: budget.spent() }
+      `),
+      cwd: process.cwd(),
+      provider: new FakeAgentProvider([{
+        outcome: {
+          type: 'result',
+          output: { type: 'structured', value: { ok: 'invalid' } },
+          usage: { inputTokens: 100, outputTokens: 7 },
+        },
+      }]),
+      budgetTokens: 100,
+    })
+
+    await expect(run.result).resolves.toEqual({
+      casualty: expectFailurePlaceholder(),
+      spent: 7,
+    })
   })
 
   it('recovers one silent attempt among nine without cancelling its healthy siblings', async () => {
@@ -1337,6 +1510,131 @@ describe('unattended workflow reliability', () => {
     })
     expect(provider.calls).toHaveLength(1)
     provider.assertExhausted()
+    await service.stop()
+  })
+
+  it('preserves a durable coverage gap during automatic crash recovery without replaying it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-automatic-gap-recovery-'))
+    const storeRoot = join(cwd, 'state')
+    const source = workflow(`
+      return await parallel([
+        () => agent('successful sibling'),
+        () => agent('terminal casualty'),
+      ])
+    `, 'automatic-gap-recovery')
+    const seed = new FileWorkflowStore(storeRoot)
+    const lease = await seed.acquireLease('automatic-gap-seed')
+    await seed.initialize()
+    await seed.createRun({
+      runId: 'run_automatic_gap_crashed',
+      cwd,
+      workflow: source,
+      automaticReplaySafe: true,
+      providerRecoveryFingerprint: 'fake-provider:fake:v1',
+    })
+    await seed.appendEvent('run_automatic_gap_crashed', {
+      schemaVersion: 1,
+      runId: 'run_automatic_gap_crashed',
+      sequence: 1,
+      eventId: 'event_automatic_gap_started',
+      timestamp: new Date().toISOString(),
+      type: 'run.started',
+      payload: { workflow: { name: source.meta.name, description: source.meta.description } },
+    })
+    const journal = await PersistentWorkflowJournal.open(seed.journalPath('run_automatic_gap_crashed'))
+    const prior = journal.beginRun({ workflowId: source.meta.name, sourceHash: source.sourceHash })
+    const success = prior.admit({ agentId: 'old-success', prompt: 'successful sibling' })
+    const casualty = prior.admit({ agentId: 'old-gap', prompt: 'terminal casualty' })
+    if (success.reused || casualty.reused) throw new Error('Fresh automatic gap fixture reused work')
+    prior.recordResult(success, 'preserved success', { successful: true })
+    prior.recordResult(casualty, coverageGapValue(), { successful: false, coverageGap: true })
+    await lease.release()
+
+    const provider = new FakeAgentProvider([])
+    const service = new WorkflowService({ store: new FileWorkflowStore(storeRoot), provider })
+    await service.initialize()
+    const recovered = (await new FileWorkflowStore(storeRoot).listManifests())
+      .find((manifest) => manifest.resumedFromRunId === 'run_automatic_gap_crashed')
+    expect(recovered).toBeDefined()
+    if (!recovered) throw new Error('Automatic gap recovery run was not created')
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const status = await service.status({ cwd }, recovered.runId)
+      if (status.status === 'completed_with_errors') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+
+    await expect(service.status({ cwd }, recovered.runId)).resolves.toMatchObject({
+      status: 'completed_with_errors',
+    })
+    expect(provider.calls).toHaveLength(0)
+    await service.stop()
+  })
+
+  it('allows manual resume of completed_with_errors and retries only the coverage gaps', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-manual-gap-retry-'))
+    const storeRoot = join(cwd, 'state')
+    const source = workflow(`
+      return await parallel([
+        () => agent('successful sibling'),
+        () => agent('terminal casualty'),
+      ])
+    `, 'manual-gap-retry')
+    const seed = new FileWorkflowStore(storeRoot)
+    const lease = await seed.acquireLease('manual-gap-seed')
+    await seed.initialize()
+    await seed.createRun({ runId: 'run_completed_with_gap', cwd, workflow: source })
+    await seed.appendEvent('run_completed_with_gap', {
+      schemaVersion: 1,
+      runId: 'run_completed_with_gap',
+      sequence: 1,
+      eventId: 'event_manual_gap_started',
+      timestamp: new Date().toISOString(),
+      type: 'run.started',
+      payload: { workflow: { name: source.meta.name, description: source.meta.description } },
+    })
+    await seed.appendEvent('run_completed_with_gap', {
+      schemaVersion: 1,
+      runId: 'run_completed_with_gap',
+      sequence: 2,
+      eventId: 'event_manual_gap_completed',
+      timestamp: new Date().toISOString(),
+      type: 'run.completed',
+      payload: {
+        result: { preview: 'coverage gap', content: [], mediaType: 'application/json', lineCount: 1 },
+        withErrors: true,
+      },
+    })
+    const journal = await PersistentWorkflowJournal.open(seed.journalPath('run_completed_with_gap'))
+    const prior = journal.beginRun({ workflowId: source.meta.name, sourceHash: source.sourceHash })
+    const success = prior.admit({ agentId: 'old-success', prompt: 'successful sibling' })
+    const casualty = prior.admit({ agentId: 'old-gap', prompt: 'terminal casualty' })
+    if (success.reused || casualty.reused) throw new Error('Fresh manual gap fixture reused work')
+    prior.recordResult(success, 'preserved success', { successful: true })
+    prior.recordResult(casualty, coverageGapValue(), { successful: false, coverageGap: true })
+    await lease.release()
+
+    const provider = new FakeAgentProvider([{
+      expect: { prompt: 'terminal casualty' },
+      outcome: { type: 'result', output: { type: 'text', text: 'repaired casualty' } },
+    }])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(storeRoot),
+      provider,
+      recovery: { autoResumeOnInitialize: false },
+    })
+    await service.initialize()
+    const resumed = await service.resume({ cwd }, { runId: 'run_completed_with_gap' })
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if ((await service.status({ cwd }, resumed.runId)).status === 'completed') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+    const completed = (await new FileWorkflowStore(storeRoot).readEvents(resumed.runId, 0, 1_000))
+      .events.find((stored) => stored.event.type === 'run.completed')
+    expect(completed?.event).toMatchObject({
+      type: 'run.completed',
+      payload: { result: { content: ['preserved success', 'repaired casualty'] } },
+    })
+    expect(provider.calls).toHaveLength(1)
     await service.stop()
   })
 

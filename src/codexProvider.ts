@@ -206,6 +206,17 @@ export class CodexAgentProvider implements AgentProvider {
         reason: 'Network-enabled shell execution can produce external effects outside the workflow journal',
       }
     }
+    if ((request.sandbox.additionalWritableDirectories?.length ?? 0) > 0) {
+      // WHY read-only is not a blanket filesystem claim: Codex may receive explicit writable
+      // directories while its primary workspace remains read-only. A lost response after writing
+      // one of those paths is no safer to replay than workspace-write; omitting this check let the
+      // supervisor duplicate local mutations under a misleading `read_only` classification.
+      return {
+        automatic: false,
+        risk: 'unknown_external',
+        reason: 'The Codex request exposes additional writable directories outside the read-only workspace',
+      }
+    }
     if (!this.#externallyReplaySafe()) {
       return {
         automatic: false,

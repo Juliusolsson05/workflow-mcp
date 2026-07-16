@@ -99,6 +99,53 @@ describe('journal key canonicalization', () => {
 })
 
 describe('InMemoryWorkflowJournal', () => {
+  it('reuses terminal coverage gaps only for automatic crash recovery', () => {
+    const journal = new InMemoryWorkflowJournal()
+    const first = journal.beginRun(identity)
+    const decision = first.admit({ agentId: 'casualty', prompt: 'inspect unsafe state' }) as JournalMiss
+    const placeholder = {
+      __workflowAgentFailure: {
+        schemaVersion: 1,
+        agentId: 'casualty',
+        status: 'recovery_required',
+        coverageGap: true,
+      },
+    }
+    first.recordResult(decision, placeholder, { successful: false, coverageGap: true })
+
+    const automatic = journal.beginRun(identity, { reuseCoverageGaps: true })
+    expect(automatic.admit({ agentId: 'automatic', prompt: 'inspect unsafe state' })).toMatchObject({
+      reused: true,
+      coverageGap: true,
+      result: placeholder,
+    })
+    expect(automatic.snapshot().records.at(-1)).toMatchObject({
+      type: 'result',
+      successful: false,
+      coverageGap: true,
+    })
+
+    const manual = journal.beginRun(identity, {
+      reuseMode: 'exact-source-sparse',
+      reuseCoverageGaps: false,
+    })
+    expect(manual.admit({ agentId: 'manual', prompt: 'inspect unsafe state' }).reused).toBe(false)
+  })
+
+  it('durably discards an abandoned provider session before a fresh retry', () => {
+    const journal = new InMemoryWorkflowJournal()
+    const first = journal.beginRun(identity)
+    const decision = first.admit({ agentId: 'old', prompt: 'retry me' }) as JournalMiss
+    first.recordProviderSession(decision, { provider: 'codex', id: 'poisoned-thread' })
+    first.discardProviderSession(decision)
+
+    expect(first.snapshot().sessions).toBeUndefined()
+    const recovered = journal.beginRun(identity)
+    const recoveredDecision = recovered.admit({ agentId: 'new', prompt: 'retry me' })
+    expect(recoveredDecision.reused).toBe(false)
+    expect('providerSession' in recoveredDecision).toBe(false)
+  })
+
   it('reuses a complete unchanged prefix and materializes it into the new snapshot', () => {
     const journal = new InMemoryWorkflowJournal()
     complete(journal, [

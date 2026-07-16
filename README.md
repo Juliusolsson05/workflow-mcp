@@ -102,8 +102,10 @@ provider-neutral AgentProvider
   only persistence or supervisor faults fail the complete run.
 - **Resume** — continue a managed run, or import-and-resume a real Claude run
   after verifying its source and journal byte-identity. Exact source/arguments
-  reuse completed calls sparsely; edited source retains the longest unchanged
-  prefix. Claude's own files are never rewritten.
+  reuse completed calls sparsely; automatic crash recovery also preserves
+  terminal coverage gaps, while an explicit manual resume retries those gaps.
+  Edited source retains the longest unchanged prefix. Claude's own files are
+  never rewritten.
 - **An embeddable service** — the same `WorkflowService` and tool registrar that
   the CLI uses can be mounted inside another host (this is how
   [Agent Code](https://github.com/Juliusolsson05/agent-code) renders each run as
