@@ -82,8 +82,11 @@ Implemented in the 2026-07-16 audit-hardening slice:
 - one live successor per recovery lineage, per-run corruption quarantine, projected event-log size
   rejection, fair rotation across three or more runs, and schema-contract rejection instead of a
   fabricated successful null;
-- explicit remaining limitation: no automatic Codex replay is safe until native process
-  containment, effective-config inspection, executable evidence, and authentication brokering land.
+- an embedder-owned pre-attempt authentication hook and exact executable evidence in attempt
+  diagnostics. Agent Code uses the hook to single-flight OAuth rotation and hand children an
+  access-only snapshot; standalone hosts must supply equivalent policy if they copy credentials;
+- explicit remaining limitation: no automatic production Codex replay is safe until native
+  process containment and effective-config inspection land.
 
 ## Executive summary
 
@@ -1039,8 +1042,9 @@ Exit criteria:
 
 ### Milestone 5 — Provider host and hard process-tree control
 
-Status: implemented for POSIX in the current slice; Windows Job Object ownership and startup orphan
-reconciliation remain follow-up work.
+Status: provider-host isolation and best-effort escalation implemented; authoritative creation-time
+containment remains outstanding on every platform. POSIX process groups are escapable through
+`setsid()`, and Windows `taskkill /T` has a creation race without a kill-on-close Job Object.
 
 Deliverables:
 

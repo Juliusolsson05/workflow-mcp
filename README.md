@@ -164,6 +164,9 @@ const service = new WorkflowService({
     configurationIsolation: {
       codexHome: '/private/application/state/workflow-codex',
       authenticationFile: '/home/user/.codex/auth.json',
+      // This must come from inspection of the exact executable plus user/project/system/managed
+      // configuration layers. Omit it and use "unknown" below when the host cannot prove that.
+      effectiveConfigurationFingerprint: verifiedCodexPolicyDigest,
     },
     capabilities: { inheritedMcpServers: 'disabled' },
   }),
