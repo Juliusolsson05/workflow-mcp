@@ -37,6 +37,7 @@ import type { AgentScheduler, SchedulerSnapshot } from './workConservingSchedule
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   'completed',
+  'completed_with_errors',
   'failed',
   'cancelled',
   'interrupted',
@@ -637,7 +638,7 @@ export class WorkflowService {
       )
     }
     const original = await this.status(scope, input.runId)
-    if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
+    if (!['interrupted', 'failed', 'cancelled', 'completed_with_errors'].includes(original.status)) {
       throw new WorkflowServiceError(
         'run-not-resumable',
         `Workflow run ${input.runId} has status ${original.status}`,
@@ -784,6 +785,7 @@ export class WorkflowService {
       lineageId?: string
       recoveryMode?: 'manual' | 'automatic'
       journalReuseMode?: JournalReuseMode
+      reuseCoverageGaps?: boolean
       journalSnapshots?: Parameters<typeof PersistentWorkflowJournal.open>[1]
     },
   ): Promise<WorkflowRunStartResult> {
@@ -859,6 +861,11 @@ export class WorkflowService {
       journalReuseMode: input.journalReuseMode ?? (
         input.recoveryMode === 'automatic' ? 'exact-source-sparse' : 'longest-prefix'
       ),
+      // WHY only automatic recovery reuses coverage gaps: it is repairing an interrupted
+      // supervisor generation and must not silently replay work already classified unsafe or
+      // exhausted. An explicit workflow_resume is the user's request to try those casualties
+      // again, while still reusing every successful sibling from the exact-source sparse journal.
+      reuseCoverageGaps: input.reuseCoverageGaps ?? input.recoveryMode === 'automatic',
       scheduler: this.#scheduler,
       circuitBreaker,
       lineageId: input.lineageId ?? runId,
@@ -1069,13 +1076,35 @@ export class WorkflowService {
     ) return false
 
     const snapshot = await this.#options.store.snapshot(manifest.runId)
-    const unresolvedAttempts = snapshot.state.agents.flatMap((agent) => (
-      agent.attempts.filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+    const unresolvedAgents = snapshot.state.agents.filter((agent) => (
+      agent.attempts.some((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
     ))
+    const journal = await PersistentWorkflowJournal.open(
+      this.#options.store.journalPath(manifest.runId),
+    )
+    const terminalJournalCalls = new Set(
+      journal.getSnapshots().flatMap((journalSnapshot) => (
+        journalSnapshot.records.flatMap((record) => (
+          record.type === 'result' ? [`${record.key}\0${record.agentId}`] : []
+        ))
+      )),
+    )
     // WHY legacy attempts without request evidence fail closed: provider-wide safety cannot prove
     // that this particular call had no network access, shared-worktree mutation, or expanded tool
     // capability. New runs persist the concrete assessment in agent.started before dispatch.
-    return unresolvedAttempts.every((attempt) => attempt.replaySafety?.automatic === true)
+    //
+    // WHY a terminal journal result overrides stale event state: result/session disposition is one
+    // atomic recovery commit, but the subsequent agent.completed/recovery_required event is a
+    // separate append. A crash between them leaves projection saying "running" even though the
+    // successor will reuse the durable result and never replay the physical attempt. Requiring
+    // replay safety in that window strands final synthesis, especially for intentionally unsafe
+    // coverage gaps. Only unresolved calls without a terminal journal value need replay authority.
+    return unresolvedAgents.every((agent) => (
+      terminalJournalCalls.has(`${agent.cacheKey}\0${agent.id}`) ||
+      agent.attempts
+        .filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+        .every((attempt) => attempt.replaySafety?.automatic === true)
+    ))
   }
 
   async #releaseStoreLease(): Promise<void> {

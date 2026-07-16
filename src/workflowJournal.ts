@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 
 import type { ProviderSessionReference } from './agentProvider.js'
+import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 
 const EXECUTION_OPTION_KEYS = ['schema', 'model', 'effort', 'isolation', 'agentType'] as const
 const OMIT = Symbol('omit-from-journal-key')
@@ -43,6 +44,16 @@ export type JournalResultRecord = {
   result: unknown
   /** Private recovery evidence; absent legacy/Claude null remains conservatively non-reusable. */
   successful?: boolean
+  /**
+   * A terminal logical assignment which intentionally produced a coverage-gap placeholder.
+   *
+   * WHY this is distinct from `successful`: automatic host-crash recovery must preserve the
+   * casualty instead of replaying an unsafe/disposed physical attempt, while an explicit manual
+   * resume must be allowed to try that logical assignment again. Treating the placeholder as an
+   * ordinary success makes manual repair impossible; treating it as an ordinary failure makes
+   * every post-completion host crash repeat work whose safety policy already said "do not replay".
+   */
+  coverageGap?: boolean
 }
 
 export type JournalSessionRecord = {
@@ -76,6 +87,8 @@ export type JournalHit = JournalDecisionBase & {
   /** The prior run's agent ID is useful for diagnostics, but never replaces this run's logical ID. */
   sourceAgentId: string
   result: unknown
+  /** Present only when automatic recovery deliberately reuses a terminal coverage gap. */
+  coverageGap?: true
 }
 
 export type JournalDecision = JournalMiss | JournalHit
@@ -83,14 +96,23 @@ export type JournalDecision = JournalMiss | JournalHit
 export interface WorkflowJournalRun {
   admit(call: JournalCall): JournalDecision
   recordProviderSession(decision: JournalMiss, session: ProviderSessionReference): void
-  recordResult(decision: JournalMiss, result: unknown, options?: { successful?: boolean }): void
+  /** Remove a poisoned/abandoned provider thread before a fresh physical attempt is scheduled. */
+  discardProviderSession(decision: JournalMiss): void
+  recordResult(
+    decision: JournalMiss,
+    result: unknown,
+    options?: { successful?: boolean; coverageGap?: boolean },
+  ): void
   snapshot(): JournalSnapshot
 }
 
 export type JournalReuseMode = 'longest-prefix' | 'exact-source-sparse'
 
 export interface WorkflowJournal {
-  beginRun(identity: JournalIdentity, options?: { reuseMode?: JournalReuseMode }): WorkflowJournalRun
+  beginRun(
+    identity: JournalIdentity,
+    options?: { reuseMode?: JournalReuseMode; reuseCoverageGaps?: boolean },
+  ): WorkflowJournalRun
   getSnapshot(workflowId: string): JournalSnapshot | undefined
   /** Return every workflow identity in this lineage, including nested workflows. */
   getSnapshots(): readonly JournalSnapshot[]
@@ -191,8 +213,22 @@ type HistoricalCall = {
   agentId: string
   hasResult: boolean
   reusable: boolean
+  coverageGap: boolean
   result?: unknown
   providerSession?: ProviderSessionReference
+}
+
+function assertCoverageGapRecord(record: JournalRecord): void {
+  if (record.type !== 'result' || record.coverageGap !== true) return
+  if (record.successful !== false || !isWorkflowAgentFailurePlaceholder(record.result)) {
+    // WHY this guard also lives in the in-memory implementation: imported snapshots are a public
+    // recovery seam and do not necessarily pass through PersistentWorkflowJournal's JSON parser.
+    // A coverage-gap bit authorizes schema bypass and automatic reuse, so accepting a partial marker
+    // here would make an in-memory fallback less trustworthy than the on-disk source it mirrors.
+    throw new TypeError(
+      'Journal coverage-gap results must be unsuccessful versioned workflow failure placeholders',
+    )
+  }
 }
 
 function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
@@ -200,6 +236,7 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
   const pending = new Map<string, HistoricalCall[]>()
 
   for (const record of snapshot.records) {
+    assertCoverageGapRecord(record)
     const recordId = `${record.key}\0${record.agentId}`
     if (record.type === 'started') {
       const call: HistoricalCall = {
@@ -207,6 +244,7 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
         agentId: record.agentId,
         hasResult: false,
         reusable: false,
+        coverageGap: false,
       }
       calls.push(call)
       const matches = pending.get(recordId)
@@ -223,9 +261,10 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
     if (!call) continue
     call.hasResult = true
     call.result = record.result
+    call.coverageGap = record.coverageGap === true
     // Claude and version-1 sidecars cannot distinguish a successful null from the historical
     // "provider failed => null" sentinel, so absence of the bit preserves conservative behavior.
-    call.reusable = record.successful ?? record.result !== null
+    call.reusable = call.coverageGap ? false : (record.successful ?? record.result !== null)
     if (matches?.length === 0) pending.delete(recordId)
   }
 
@@ -250,6 +289,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
   #canReusePrefix: boolean
   readonly #exactSourceSparse: boolean
   readonly #retainSparseHistory: boolean
+  readonly #reuseCoverageGaps: boolean
 
   constructor(
     identity: JournalIdentity,
@@ -258,6 +298,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     sessions: JournalSessionRecord[],
     reuseMode: JournalReuseMode,
     retainSparseHistory = false,
+    reuseCoverageGaps = false,
   ) {
     this.#identity = identity
     // Claude resumes by the longest unchanged sequence of `(prompt, opts)` calls after the script
@@ -282,6 +323,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       previous !== undefined &&
       previous.sourceHash === identity.sourceHash
     this.#retainSparseHistory = retainSparseHistory
+    this.#reuseCoverageGaps = reuseCoverageGaps
   }
 
   admit(call: JournalCall): JournalDecision {
@@ -296,7 +338,9 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     const candidates = this.#previous.get(key) ?? []
     const mayReuse = this.#canReusePrefix || this.#exactSourceSparse
     const historicalResult = mayReuse
-      ? candidates.find((candidate) => candidate.hasResult && candidate.reusable)
+      ? candidates.find((candidate) => (
+          candidate.hasResult && (candidate.reusable || (this.#reuseCoverageGaps && candidate.coverageGap))
+        ))
       : undefined
     const historicalSession = mayReuse
       ? candidates.find((candidate) => candidate.providerSession !== undefined)
@@ -321,7 +365,8 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
         key,
         agentId: call.agentId,
         result: historicalResult.result,
-        successful: true,
+        successful: !historicalResult.coverageGap,
+        ...(historicalResult.coverageGap ? { coverageGap: true } : {}),
       })
       return {
         callIndex,
@@ -330,6 +375,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
         reused: true,
         sourceAgentId: historicalResult.agentId,
         result: historicalResult.result,
+        ...(historicalResult.coverageGap ? { coverageGap: true as const } : {}),
       }
     }
 
@@ -365,7 +411,28 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     this.#sessions.push({ key: pending.key, agentId: pending.agentId, session: { ...session } })
   }
 
-  recordResult(decision: JournalMiss, result: unknown, options: { successful?: boolean } = {}): void {
+  discardProviderSession(decision: JournalMiss): void {
+    const pending = this.#pending.get(decision.callIndex)
+    if (!pending || pending.completed || pending.key !== decision.key || pending.agentId !== decision.agentId) {
+      throw new Error('Journal provider session does not belong to an unfinished call in this run')
+    }
+    // WHY deletion is keyed by the logical call rather than a provider thread ID: an adapter can
+    // replace its thread reference during one attempt. The current journal pointer is the only
+    // value crash recovery will consume, so removing every pointer for this call is the atomic
+    // statement that the next physical attempt must start fresh.
+    for (let index = this.#sessions.length - 1; index >= 0; index -= 1) {
+      const record = this.#sessions[index]
+      if (record?.key === pending.key && record.agentId === pending.agentId) {
+        this.#sessions.splice(index, 1)
+      }
+    }
+  }
+
+  recordResult(
+    decision: JournalMiss,
+    result: unknown,
+    options: { successful?: boolean; coverageGap?: boolean } = {},
+  ): void {
     const pending = this.#pending.get(decision.callIndex)
     if (
       !pending ||
@@ -376,6 +443,24 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       throw new Error('Journal result does not belong to an unfinished call in this run')
     }
 
+    if (options.coverageGap === true) {
+      if (options.successful !== false || !isWorkflowAgentFailurePlaceholder(result)) {
+        throw new TypeError(
+          'Journal coverage-gap results must be unsuccessful versioned workflow failure placeholders',
+        )
+      }
+      // WHY terminal disposition and session invalidation share one journal mutation: a durable
+      // adapter persists recordResult only after this method returns. Performing a separate
+      // discard first leaves a crash window containing an unfinished call with no session, which
+      // automatic recovery would replay even though policy had already classified it unsafe.
+      // Mutating both pieces here makes one persistent snapshot the linearization point.
+      for (let index = this.#sessions.length - 1; index >= 0; index -= 1) {
+        const record = this.#sessions[index]
+        if (record?.key === pending.key && record.agentId === pending.agentId) {
+          this.#sessions.splice(index, 1)
+        }
+      }
+    }
     pending.completed = true
     this.#records.push({
       type: 'result',
@@ -383,6 +468,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       agentId: pending.agentId,
       result,
       successful: options.successful ?? result !== null,
+      ...(options.coverageGap === true ? { coverageGap: true } : {}),
     })
   }
 
@@ -401,10 +487,16 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
   readonly #snapshots = new Map<string, JournalSnapshot>()
 
   constructor(snapshots: Iterable<JournalSnapshot> = []) {
-    for (const snapshot of snapshots) this.#snapshots.set(snapshot.workflowId, copySnapshot(snapshot))
+    for (const snapshot of snapshots) {
+      for (const record of snapshot.records) assertCoverageGapRecord(record)
+      this.#snapshots.set(snapshot.workflowId, copySnapshot(snapshot))
+    }
   }
 
-  beginRun(identity: JournalIdentity, options: { reuseMode?: JournalReuseMode } = {}): WorkflowJournalRun {
+  beginRun(
+    identity: JournalIdentity,
+    options: { reuseMode?: JournalReuseMode; reuseCoverageGaps?: boolean } = {},
+  ): WorkflowJournalRun {
     if (identity.workflowId.length === 0) throw new TypeError('Journal workflowId must not be empty')
     if (identity.sourceHash.length === 0) throw new TypeError('Journal sourceHash must not be empty')
 
@@ -434,6 +526,7 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
       sessions,
       options.reuseMode ?? 'longest-prefix',
       retainSparseHistory,
+      options.reuseCoverageGaps ?? false,
     )
   }
 

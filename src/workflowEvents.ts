@@ -85,6 +85,16 @@ export type AgentOutcome = {
   diagnostics?: Readonly<Record<string, unknown>>
 }
 
+export type AgentCoverageGapDisposition = {
+  status: WorkflowAgentFailurePlaceholder['__workflowAgentFailure']['status']
+  error: WorkflowErrorReference
+}
+
+export type AgentReusedOutcome = AgentOutcome & {
+  /** Automatic recovery reused a terminal casualty rather than a provider success. */
+  coverageGap?: AgentCoverageGapDisposition
+}
+
 export type AgentAttemptStarted = {
   attemptNumber: number
   source: 'live' | 'provider-resume'
@@ -133,8 +143,66 @@ export type RunCompletedEvent = EventEnvelope<
   'run.completed',
   {
     result: ContentReference
+    /**
+     * WHY this is carried by the existing completion event instead of adding a competing terminal
+     * event: old event readers already understand `run.completed`, and the result is still a valid
+     * best-effort product. The flag lets newer projections distinguish complete coverage from a
+     * synthesis that honestly contains one or more assignment casualties.
+     */
+    withErrors?: boolean
   }
 >
+
+/**
+ * A failed provider attempt is data for synthesis, not an exception which may tear down 199
+ * healthy siblings. Keep the marker deliberately loud and versioned so workflow JavaScript cannot
+ * confuse it with a provider's legitimate null/empty result and future versions can extend it
+ * without guessing which ad-hoc error object a historical run returned.
+ */
+export type WorkflowAgentFailurePlaceholder = {
+  __workflowAgentFailure: {
+    schemaVersion: 1
+    agentId: string
+    label: string
+    status: 'failed' | 'recovery_required' | 'skipped'
+    message: string
+    code?: string
+    attempts: number
+    coverageGap: true
+  }
+}
+
+/**
+ * Recognize the runtime-owned casualty value at every trust boundary.
+ *
+ * WHY this is stricter than the public marker's first two fields: durable recovery deliberately
+ * bypasses a workflow's provider-output schema for coverage gaps. If a corrupt journal could set
+ * `coverageGap: true` beside an arbitrary value, recovery would turn corrupted persistence into a
+ * synthetic success. Keep the complete version-one contract centralized so the disk parser,
+ * in-memory importer, and event projection cannot drift into different definitions of "gap".
+ */
+export function isWorkflowAgentFailurePlaceholder(
+  value: unknown,
+): value is WorkflowAgentFailurePlaceholder {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const marker = (value as Record<string, unknown>).__workflowAgentFailure
+  if (typeof marker !== 'object' || marker === null || Array.isArray(marker)) return false
+  const candidate = marker as Record<string, unknown>
+  return candidate.schemaVersion === 1 &&
+    typeof candidate.agentId === 'string' && candidate.agentId.length > 0 &&
+    typeof candidate.label === 'string' &&
+    (candidate.status === 'failed' ||
+      candidate.status === 'recovery_required' ||
+      candidate.status === 'skipped') &&
+    typeof candidate.message === 'string' &&
+    (candidate.code === undefined || typeof candidate.code === 'string') &&
+    typeof candidate.attempts === 'number' &&
+    Number.isInteger(candidate.attempts) &&
+    // Assignment preparation can fail before a physical provider attempt exists; zero is an
+    // honest terminal count for that casualty, while negatives/fractions indicate corruption.
+    candidate.attempts >= 0 &&
+    candidate.coverageGap === true
+}
 
 export type RunFailedEvent = EventEnvelope<
   'run.failed',
@@ -188,7 +256,7 @@ export type PhaseFailedEvent = PhaseEvent<
 
 export type AgentAdmittedEvent = AgentEvent<'agent.admitted', AgentAdmitted>
 export type AgentQueuedEvent = AgentEvent<'agent.queued', { reason?: string }>
-export type AgentReusedEvent = AgentEvent<'agent.reused', AgentOutcome>
+export type AgentReusedEvent = AgentEvent<'agent.reused', AgentReusedOutcome>
 export type AgentStartedEvent = AttemptEvent<'agent.started', AgentAttemptStarted>
 export type AgentWorkspacePreparedEvent = AgentEvent<
   'agent.workspace.prepared',

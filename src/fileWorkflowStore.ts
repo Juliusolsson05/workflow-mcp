@@ -35,6 +35,7 @@ import type {
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   'completed',
+  'completed_with_errors',
   'failed',
   'cancelled',
   'interrupted',
@@ -826,7 +827,9 @@ function applyEventToManifest(
       status = 'cancellation_requested'
       cancellationReason = event.payload.reason
       break
-    case 'run.completed': status = 'completed'; break
+    case 'run.completed':
+      status = event.payload.withErrors === true ? 'completed_with_errors' : 'completed'
+      break
     case 'run.failed': status = 'failed'; error = event.payload.error.message; break
     case 'run.cancelled':
       status = 'cancelled'

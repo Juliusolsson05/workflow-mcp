@@ -68,10 +68,29 @@ describe('CodexAgentProvider', () => {
       providerHostFilePath: fileURLToPath(new URL('../dist/providerHost.js', import.meta.url)),
     })
 
-    // A real Codex shell tool may call setsid() and leave the provider-host process group. Until a
-    // creation-time supervisor owns that descendant, both replay and ownership must fail closed.
+    // A real Codex shell tool may call setsid() and leave the provider-host process group. This
+    // default-capability fixture also has no MCP effect attestation, so ownership and replay are
+    // independently unknown for two different reasons.
     expect(provider.terminationBoundary).toBe('unconfirmed-descendants')
     expect(provider.automaticReplaySafety).toBe('unsafe-or-unknown')
+  })
+
+  it('separates hosted process containment from proven read-only replay safety', () => {
+    const provider = new CodexAgentProvider({
+      codexPathOverride: '/tmp/codex',
+      providerHostFilePath: fileURLToPath(new URL('../dist/providerHost.js', import.meta.url)),
+      configurationIsolation: {
+        codexHome: '/tmp/private-codex-home',
+        effectiveConfigurationFingerprint: 'read-only-fixture',
+      },
+      capabilities: { inheritedMcpServers: 'disabled', mcpServers: [] },
+    })
+
+    expect(provider.terminationBoundary).toBe('unconfirmed-descendants')
+    expect(provider.automaticReplaySafety).toBe('safe')
+    expect(provider.assessReplaySafety(request({
+      sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+    }))).toMatchObject({ automatic: true, risk: 'read_only' })
   })
 
   it('maps thread policy, streamed activities, final text, session, and raw usage', async () => {
@@ -200,6 +219,37 @@ describe('CodexAgentProvider', () => {
       configurationIsolation: { codexHome: '/tmp/private-codex-home' },
       capabilities: { inheritedMcpServers: 'disabled' },
     })).toThrow(expect.objectContaining({ code: 'codex-capability-attestation-invalid' }))
+  })
+
+  it('does not call a read-only request replay-safe when extra writable directories are exposed', () => {
+    const provider = new CodexAgentProvider({
+      client: mockClient([]).client,
+      capabilities: { inheritedMcpServers: 'disabled', mcpServers: [] },
+    })
+
+    expect(provider.assessReplaySafety(request({
+      sandbox: {
+        mode: 'read-only',
+        approvalPolicy: 'never',
+        network: false,
+        additionalWritableDirectories: ['/tmp/shared-output'],
+      },
+    }))).toMatchObject({ automatic: false, risk: 'unknown_external' })
+  })
+
+  it('never calls danger-full-access replay-safe even inside an isolated worktree', () => {
+    const provider = new CodexAgentProvider({
+      client: mockClient([]).client,
+      capabilities: { inheritedMcpServers: 'disabled', mcpServers: [] },
+    })
+
+    expect(provider.assessReplaySafety(request({
+      sandbox: { mode: 'danger-full-access', approvalPolicy: 'never', network: false },
+    }))).toMatchObject({
+      automatic: false,
+      risk: 'unknown_external',
+      reason: expect.stringMatching(/outside the isolated workspace/i),
+    })
   })
 
   it('resumes a thread, maps a Claude model alias, prepends agent instructions, and parses schema output', async () => {

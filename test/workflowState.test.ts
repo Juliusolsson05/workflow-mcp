@@ -219,7 +219,10 @@ describe('workflow state projection', () => {
 
     fixture.emit({
       type: 'run.completed',
-      payload: { result: content({ report: 'done' }, '{ "report": "done" }') },
+      payload: {
+        result: content({ report: 'done' }, '{ "report": "done" }'),
+        withErrors: true,
+      },
     })
 
     const state = projectWorkflowState(runId, fixture.events)
@@ -232,7 +235,7 @@ describe('workflow state projection', () => {
       title: 'Deep multi-agent hunt',
       description: 'Find, verify, and report bugs',
     })
-    expect(state.status).toBe('completed')
+    expect(state.status).toBe('completed_with_errors')
     expect(state.counts).toEqual({
       total: 76,
       admitted: 0,

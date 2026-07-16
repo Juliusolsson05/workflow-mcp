@@ -4,6 +4,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 import type { ProviderSessionReference } from './agentProvider.js'
+import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 import {
   InMemoryWorkflowJournal,
   type JournalCall,
@@ -102,7 +103,10 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
     return journal
   }
 
-  beginRun(identity: JournalIdentity, options: { reuseMode?: JournalReuseMode } = {}): WorkflowJournalRun {
+  beginRun(
+    identity: JournalIdentity,
+    options: { reuseMode?: JournalReuseMode; reuseCoverageGaps?: boolean } = {},
+  ): WorkflowJournalRun {
     const run = this.#inner.beginRun(identity, options)
     // Do not replace a complete durable prefix with an empty current run. `admit()` is the first
     // actual mutation and persists immediately; if the process dies between beginRun and admit,
@@ -183,7 +187,20 @@ class PersistentWorkflowJournalRun implements WorkflowJournalRun {
     this.#persist()
   }
 
-  recordResult(decision: JournalMiss, result: unknown, options: { successful?: boolean } = {}): void {
+  discardProviderSession(decision: JournalMiss): void {
+    // WHY this mutation is persisted before retry admission: a crash between abandoning a broken
+    // thread and launching its replacement must not resurrect the very thread the retry discarded.
+    // The durable journal is the recovery authority; changing only an in-memory local variable
+    // would make normal retries look correct while restart recovery remained poisoned.
+    this.#inner.discardProviderSession(decision)
+    this.#persist()
+  }
+
+  recordResult(
+    decision: JournalMiss,
+    result: unknown,
+    options: { successful?: boolean; coverageGap?: boolean } = {},
+  ): void {
     this.#inner.recordResult(decision, result, options)
     this.#persist()
   }
@@ -389,12 +406,32 @@ function parseRecord(value: unknown, filePath: string, index: number): JournalRe
       `Workflow journal result ${index + 1} has an invalid success marker: ${filePath}`,
     )
   }
+  if (value.coverageGap !== undefined && typeof value.coverageGap !== 'boolean') {
+    throw new PersistentJournalError(
+      'invalid-record',
+      `Workflow journal result ${index + 1} has an invalid coverage-gap marker: ${filePath}`,
+    )
+  }
+  if (
+    value.coverageGap === true &&
+    (value.successful !== false || !isWorkflowAgentFailurePlaceholder(value.result))
+  ) {
+    // WHY a valid boolean is insufficient: `coverageGap` is a recovery capability bit. It skips
+    // provider-output schema validation and prevents automatic replay, so pairing it with arbitrary
+    // JSON would let a damaged sidecar silently inject data into workflow synthesis. Persistence
+    // corruption is one of the few intentionally run-fatal conditions; reject it at open time.
+    throw new PersistentJournalError(
+      'invalid-record',
+      `Workflow journal result ${index + 1} has an invalid coverage-gap value: ${filePath}`,
+    )
+  }
   return {
     type: 'result',
     key: value.key,
     agentId: value.agentId,
     result: value.result,
     ...(value.successful === undefined ? {} : { successful: value.successful }),
+    ...(value.coverageGap === undefined ? {} : { coverageGap: value.coverageGap }),
   }
 }
 

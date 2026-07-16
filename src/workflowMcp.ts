@@ -14,7 +14,7 @@ To run an existing workflow, call workflow_list, optionally workflow_describe, t
 
 Inline source is saved under the current Git project's .claude/workflows and the run result returns scriptPath. That path is the editable Claude-visible definition. Iterate by editing it and calling workflow_run with scriptPath; existing definitions are never overwritten implicitly. Each execution also keeps a private immutable source snapshot for recovery and returns transcriptDirectory, containing journal.jsonl plus agent-<id>.jsonl mirrors for investigation.
 
-workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId creates a new run linked to a failed, cancelled, or interrupted run; workflow_resume remains a compatibility alias. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status and health. Continue until completed, failed, cancelled, or interrupted. When the provider explicitly declares replay safe, a retryable read-only or worktree-isolated agent failure is retried beneath the same logical agent and provider session; agent.retry_scheduled and agent.stalled events explain that recovery. Unknown remote effects fail closed and require manual resume. An untouched queued run, or a replay-safe run interrupted by a host crash, is automatically continued as a new run in the same lineage.
+workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId creates a new run linked to a failed, cancelled, interrupted, or completed_with_errors run; workflow_resume remains a compatibility alias. A manual resume reuses successful work but retries coverage gaps, while automatic host-crash recovery preserves terminal gaps without unsafe replay. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status and health. Continue until completed, completed_with_errors, failed, cancelled, or interrupted. Retryable replay-safe work starts a fresh provider thread beneath the same logical assignment; the abandoned physical attempt remains in the audit stream. Exhausted or replay-unsafe assignments return a versioned __workflowAgentFailure coverage-gap value, while independent siblings and final synthesis continue. Only persistence or supervisor faults fail the complete run. An untouched queued run, or a replay-safe run interrupted by a host crash, is automatically continued as a new run in the same lineage.
 
 The service has a shared provider capacity of nine by default. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed batches of nine: when only two slow agents remain in such a batch, JavaScript has not admitted the next batch and the scheduler cannot fill the other seven slots. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`
 
@@ -109,7 +109,7 @@ export function registerWorkflowMcpTools(
     'workflow_run_status',
     {
       title: 'Workflow run status',
-      description: 'Read durable status plus scheduler/agent health, retry/stall counts, timestamps, recovery lineage, and latest event cursor. Terminal statuses are completed, failed, cancelled, and interrupted.',
+      description: 'Read durable status plus scheduler/agent health, retry/stall counts, timestamps, recovery lineage, and latest event cursor. Terminal statuses are completed, completed_with_errors, failed, cancelled, and interrupted.',
       inputSchema: { runId: z.string().min(1) },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -158,7 +158,7 @@ export function registerWorkflowMcpTools(
     'workflow_resume',
     {
       title: 'Resume workflow run',
-      description: 'Compatibility alias that starts a new run linked to a failed, cancelled, or interrupted Agent Code run, or imports validated Claude run metadata. New clients may use workflow_run.resumeFromRunId.',
+      description: 'Compatibility alias that starts a new run linked to a failed, cancelled, interrupted, or completed_with_errors Agent Code run, or imports validated Claude run metadata. Successful calls are reused while coverage gaps are retried. New clients may use workflow_run.resumeFromRunId.',
       inputSchema: z.union([
         z.object({
           runId: z.string().min(1),
