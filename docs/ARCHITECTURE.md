@@ -215,10 +215,12 @@ do not occupy provider permits.
 Every logical agent can have multiple supervised attempts. The default host policy distinguishes
 provider startup, idle progress, one active operation, total attempt lifetime, and cancellation
 termination deadlines. When the provider affirmatively declares automatic replay safe, retryable
-failures and stalls resume the same provider session and reuse the same stable workspace identity.
-Unknown providers fail closed because a read-only checkout does not make remote MCP effects safe to
-repeat. Retries are bounded per agent and per run; repeated infrastructure failures open a shared
-circuit breaker so a provider outage cannot turn nine slots into an unbounded retry storm.
+failures and stalls restart the same logical assignment in a fresh provider thread and reuse the
+same stable workspace identity. Unknown or exhausted assignments terminate as explicit versioned
+`__workflowAgentFailure` coverage gaps; they never close admission for independent siblings or final
+synthesis. The run therefore ends `completed_with_errors` rather than `failed`. Repeated
+infrastructure failures open a shared circuit breaker so a provider outage cannot turn nine slots
+into an unbounded retry storm.
 `WorkflowReliabilityPolicy` is public for hosts that need measured overrides.
 
 The service store is single-writer fenced. On restart, an untouched cursor-zero queue reservation is
@@ -233,12 +235,14 @@ counts, last progress, lineage, and the successor run ID.
 
 There are two deliberate safety boundaries:
 
-- Mutable shared sandboxes are not automatically resumed unless the host explicitly opts in with
-  `recovery.allowMutableSandbox`. A provider adapter with a real containment boundary should
-  implement `terminateAttempt`. The Codex adapter currently has useful process-group/taskkill
-  escalation, but advertises `unconfirmed-descendants` on every platform because POSIX descendants
-  can call `setsid()` and Windows lacks a creation-time Job Object. Its permit and store ownership
-  remain quarantined after ambiguous termination; production Codex restart replay is disabled.
+- A provider adapter with a real containment boundary should implement `terminateAttempt`. The
+  Codex adapter currently has useful process-group/taskkill escalation, but advertises
+  `unconfirmed-descendants` on every platform because POSIX descendants can call `setsid()` and
+  Windows lacks a creation-time Job Object. Effect safety is evaluated separately: no-network,
+  read-only/idempotent work can be abandoned and replayed in a fresh thread even when descendant
+  exit is unprovable; mutation-capable ambiguity becomes one assignment's coverage gap. Explicit
+  service cancellation still retains the ownership fence because it is a supervisor handoff, not
+  a logical retry.
 - Automatic continuation begins when `WorkflowService.initialize()` runs after a host restart. The
   current package does not install a separate always-on daemon, so it cannot keep agents executing
   during the interval in which its owning application process is down. The daemon/provider-host

@@ -48,6 +48,7 @@ import type {
   WorkflowErrorReference,
   WorkflowEvent,
   WorkflowEventSink,
+  WorkflowAgentFailurePlaceholder,
 } from './workflowEvents.js'
 import type {
   ParentToWorkerMessage,
@@ -171,11 +172,18 @@ export class WorkflowExecutionError extends Error {
 
 class UnconfirmedProviderTerminationError extends Error {
   readonly execution: Promise<unknown>
+  readonly reason: 'timeout' | 'cancellation'
 
-  constructor(message: string, execution: Promise<unknown>, options?: { cause?: unknown }) {
+  constructor(
+    message: string,
+    execution: Promise<unknown>,
+    reason: 'timeout' | 'cancellation',
+    options?: { cause?: unknown },
+  ) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
     this.name = 'UnconfirmedProviderTerminationError'
     this.execution = execution
+    this.reason = reason
   }
 }
 
@@ -384,7 +392,7 @@ class WorkflowRuntime {
   #underutilizationTimer: NodeJS.Timeout | undefined
   #lastUnderutilizationSignature: string | undefined
   #retryAttemptsScheduled = 0
-  #recoveryRequiredError: WorkflowExecutionError | undefined
+  #completedWithErrors = false
   #storageFailure: WorkflowExecutionError | undefined
 
   constructor(options: RunWorkflowOptions) {
@@ -508,12 +516,14 @@ class WorkflowRuntime {
       // late events appear after run.completed. Drain a stable snapshot until no task remains.
       await this.#drainTasks()
       if (this.#controller.signal.aborted || this.#terminal) return
-      if (this.#recoveryRequiredError !== undefined) throw this.#recoveryRequiredError
       if (!this.#claimTerminal('completion')) return
 
       await this.#emit({
         type: 'run.completed',
-        payload: { result: contentReference(result, this.#limits) },
+        payload: {
+          result: contentReference(result, this.#limits),
+          ...(this.#completedWithErrors ? { withErrors: true } : {}),
+        },
       })
       this.#terminal = true
       this.#clearWallClockTimer()
@@ -528,13 +538,6 @@ class WorkflowRuntime {
         this.#clearWallClockTimer()
         this.#result.reject(error)
         this.#stream.close()
-        return
-      }
-      if (this.#recoveryRequiredError !== undefined && !this.#failing) {
-        // The evaluator necessarily serializes errors across a vm/IPC boundary and can lose custom
-        // fields from an Error created in main. RecoveryRequired is already the run-owned source of
-        // truth, so settle with that exact object rather than the worker's diagnostic wrapper.
-        await this.#fail(this.#recoveryRequiredError).catch(() => undefined)
         return
       }
       if (this.#controller.signal.aborted && !this.#failing) {
@@ -958,15 +961,6 @@ class WorkflowRuntime {
           }
 
           if (raw.type === 'workflow.request') {
-            if (this.#recoveryRequiredError !== undefined) {
-              this.#completeWorkerRequest(worker, raw.requestId, {
-                type: 'workflow.result',
-                requestId: raw.requestId,
-                result: { type: 'error', error: serializeWorkerError(this.#recoveryRequiredError) },
-                budgetSpent: this.#budgetSpent,
-              })
-              return
-            }
             this.#markWorkerRequest(worker, raw.requestId)
             this.#trackTask(
               this.#executeNestedWorkflow(worker, raw, input.depth).catch((error: unknown) => {
@@ -1050,14 +1044,6 @@ class WorkflowRuntime {
     journalRun: WorkflowJournalRun
     forcedPhaseId?: string
   }): Promise<void> {
-    if (this.#recoveryRequiredError !== undefined) {
-      // WHY this gate precedes identity and journal allocation: once an earlier attempt may have
-      // produced an unknown external effect, later workflow decisions no longer have a sound input
-      // state. Recording another admitted call would make recovery_required cosmetic rather than a
-      // capability fence, even if the later provider happened to be read-only.
-      this.#replyAgentError(input.worker, input.request.requestId, this.#recoveryRequiredError)
-      return
-    }
     if (this.#controller.signal.aborted) {
       this.#replyAgentError(input.worker, input.request.requestId, new WorkflowCancelledError(abortReason(this.#controller.signal)))
       return
@@ -1255,6 +1241,7 @@ class WorkflowRuntime {
     let prepared: PreparedWorkingDirectory | undefined
     let preserveWorkspaceForRecovery = false
     let lastAttemptId: string | undefined
+    let lastAttemptNumber = 0
     let lastAttemptOpen = false
     let providerSession = admission.journalMiss.providerSession?.provider === this.#options.provider.name
       ? admission.journalMiss.providerSession
@@ -1418,6 +1405,7 @@ class WorkflowRuntime {
             },
           })
           lastAttemptId = attemptId
+          lastAttemptNumber = attemptNumber
           lastAttemptOpen = true
           if (recovery !== undefined && previousAttemptId !== undefined) {
             await this.#emit({
@@ -1492,32 +1480,74 @@ class WorkflowRuntime {
         } catch (error) {
           if (error instanceof UnconfirmedProviderTerminationError) {
             circuitLease?.infrastructureFailure()
-            // WHY this quarantines the scheduler lease until the detached execution really settles:
-            // the provider may still be consuming credentials or mutating state. Advertising that
-            // slot as available would exceed the real process ceiling and permit overlapping
-            // attempts for one logical call. If it eventually exits, the permit is released and
-            // service ownership becomes transferable without requiring a process restart.
-            const quarantinedLease = providerLease
-            providerLease = undefined
-            if (quarantinedLease) {
-              void error.execution.finally(() => {
-                quarantinedLease.release()
-                this.#observeScheduler(this.#runScheduler.snapshot())
-              }).catch(() => undefined)
+            if (error.reason === 'cancellation' || this.#controller.signal.aborted) {
+              // Explicit run cancellation is an ownership handoff, not a logical retry. Keep the
+              // real provider permit and store lease fenced until the adapter settles so a second
+              // supervisor cannot overlap the cancelled run during shutdown/restart.
+              const quarantinedLease = providerLease
+              providerLease = undefined
+              if (quarantinedLease) {
+                void error.execution.finally(() => {
+                  quarantinedLease.release()
+                  this.#observeScheduler(this.#runScheduler.snapshot())
+                }).catch(() => undefined)
+              }
+              throw new WorkflowCancelledError(abortReason(this.#controller.signal))
             }
-            preserveWorkspaceForRecovery = true
-            await this.#markRecoveryRequired(
-              admission,
+            const replaySafety = this.#replaySafety(admission, attemptRequest!)
+            const failure = new AgentProviderFailure(error.message, {
+              code: 'provider-termination-unconfirmed',
+              retryable: true,
+              circuitImpact: 'infrastructure',
+              cause: error,
+            })
+            const retrying = this.#reserveRetry(admission, failure, attemptNumber, replaySafety)
+            await this.#emit({
+              type: 'agent.failed',
+              agentId: admission.agentId,
               attemptId,
-              error,
-              {
-                automatic: false,
-                risk: 'unknown_external',
-                reason: 'The previous provider process tree could not be proven stopped',
-              },
-            )
+              ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+              payload: { error: errorReference(failure), ...(retrying ? { retrying: true } : {}) },
+            })
             lastAttemptOpen = false
-            return
+            if (!retrying) {
+              preserveWorkspaceForRecovery = true
+              await this.#markRecoveryRequired(
+                admission,
+                attemptId,
+                attemptNumber,
+                failure,
+                replaySafety,
+              )
+              return
+            }
+
+            previousAttemptId = attemptId
+            recovery = recoveryContext(failure, attemptNumber)
+            providerSession = undefined
+            const delayMs = retryDelayMs(this.#reliability, attemptNumber)
+            await this.#emit({
+              type: 'agent.retry_scheduled',
+              agentId: admission.agentId,
+              attemptId,
+              ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
+              payload: {
+                completedAttemptNumber: attemptNumber,
+                nextAttemptNumber: attemptNumber + 1,
+                delayMs,
+                retryAt: new Date(Date.now() + delayMs).toISOString(),
+                reason: errorReference(failure),
+              },
+            })
+            // WHY a timed-out wrapper cannot keep a shared scheduler permit forever: Codex tools
+            // may escape the process group, so settlement is not guaranteed. Effect safety—not OS
+            // containment—is what authorizes this fresh read-only retry. Late callbacks are muted
+            // inside #executeProviderAttempt, and the old physical attempt remains diagnostic-only.
+            providerLease?.release()
+            providerLease = undefined
+            this.#observeScheduler(this.#runScheduler.snapshot())
+            await abortableDelay(delayMs, this.#controller.signal)
+            continue
           }
           if (error instanceof AgentProviderFailure && error.providerSession !== undefined) {
             providerSession = error.providerSession
@@ -1549,12 +1579,12 @@ class WorkflowRuntime {
             const retrying = this.#reserveRetry(admission, error, attemptNumber, replaySafety)
             // WHY replay safety is independent of whether policy would grant another attempt: a
             // retryable provider failure means the prior turn may have produced an effect whose
-            // response was lost. Converting that ambiguity to the legacy successful-null result
-            // when retry admission is disabled or exhausted is data corruption.
+            // response was lost. The typed recovery_required placeholder preserves that ambiguity;
+            // silently treating the assignment as successful data would be corruption.
             const replayWouldBeUnsafe = error.retryable && !replaySafety.automatic
             if (replayWouldBeUnsafe) {
               preserveWorkspaceForRecovery = true
-              await this.#markRecoveryRequired(admission, attemptId, error, replaySafety)
+              await this.#markRecoveryRequired(admission, attemptId, attemptNumber, error, replaySafety)
               lastAttemptOpen = false
               return
             }
@@ -1567,15 +1597,6 @@ class WorkflowRuntime {
             })
             lastAttemptOpen = false
             if (!retrying) {
-              if (error.terminalDisposition === 'reject') {
-                // WHY a contract failure bypasses the historical null-slot compatibility path:
-                // schema-backed output is the workflow's declared API. Reporting success with null
-                // after malformed JSON makes the whole run appear valid and can feed downstream
-                // mutations with a value the provider never produced.
-                this.#replyAgentError(admission.worker, admission.requestId, error)
-                return
-              }
-              admission.journalRun.recordResult(admission.journalMiss, null, { successful: false })
               await this.#emit({
                 type: 'warning',
                 agentId: admission.agentId,
@@ -1586,17 +1607,17 @@ class WorkflowRuntime {
                   ...(error.code === undefined ? {} : { code: error.code }),
                 },
               })
-              this.#completeWorkerRequest(admission.worker, admission.requestId, {
-                type: 'agent.result',
-                requestId: admission.requestId,
-                result: { type: 'success', value: null },
-                budgetSpent: this.#budgetSpent,
-              })
+              this.#completeAgentFailure(admission, error, 'failed', attemptNumber)
               return
             }
 
             previousAttemptId = attemptId
             recovery = recoveryContext(error, attemptNumber)
+            // A retry is a new physical attempt at the same logical assignment. Reusing the
+            // provider thread is precisely what makes a missing/corrupt stream poison every later
+            // attempt. The durable journal retains the old session for audit, while the recovery
+            // note carries the useful logical context into a clean thread.
+            providerSession = undefined
             const delayMs = retryDelayMs(this.#reliability, attemptNumber)
             const retryAt = new Date(Date.now() + delayMs).toISOString()
             await this.#emit({
@@ -1650,7 +1671,7 @@ class WorkflowRuntime {
           ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
           payload: { error: errorReference(error) },
         })
-        this.#replyAgentError(admission.worker, admission.requestId, error)
+        this.#completeAgentFailure(admission, error, 'failed', lastAttemptNumber)
       }
     } finally {
       try {
@@ -1778,6 +1799,7 @@ class WorkflowRuntime {
       },
     )
     const activityIds = new Set<string>()
+    let acceptProviderEvents = true
     const identity: AgentProviderAttemptIdentity = {
       runId: this.id,
       agentId: input.admission.agentId,
@@ -1791,6 +1813,7 @@ class WorkflowRuntime {
         signal: attemptController.signal,
         attempt: identity,
         emit: async (event) => {
+          if (!acceptProviderEvents) return
           monitor.progress(event)
           if (event.type === 'session.started') input.onSession(event.session)
           await this.#emitProviderEvent(input.admission, input.attemptId, event, activityIds)
@@ -1814,6 +1837,7 @@ class WorkflowRuntime {
       return await Promise.race([execution, monitor.timeout, cancellation.promise])
     } catch (error) {
       if (this.#controller.signal.aborted) {
+        acceptProviderEvents = false
         const settlement = await this.#confirmProviderTermination(execution, identity, {
           code: 'cancellation',
           message: abortReason(this.#controller.signal),
@@ -1823,6 +1847,7 @@ class WorkflowRuntime {
           throw new UnconfirmedProviderTerminationError(
             'Cancelled provider attempt could not be confirmed stopped',
             this.#quarantineExecution(execution),
+            'cancellation',
             { cause: error },
           )
         }
@@ -1841,6 +1866,7 @@ class WorkflowRuntime {
         throw new WorkflowCancelledError(abortReason(this.#controller.signal))
       }
       if (!(error instanceof AgentAttemptTimeoutError)) throw error
+      acceptProviderEvents = false
       // Start the diagnostic append without putting it on the process-termination critical path.
       // A stalled fsync is exactly the failure mode in which waiting here would leave a timed-out
       // credentialed process alive indefinitely. Event ordering remains serialized by #emitTail;
@@ -1864,7 +1890,8 @@ class WorkflowRuntime {
         await this.#emitUnconfirmedTermination(input.admission, input.attemptId)
         throw new UnconfirmedProviderTerminationError(
           'Timed-out provider attempt could not be confirmed stopped',
-          this.#quarantineExecution(execution),
+          execution,
+          'timeout',
           { cause: error },
         )
       }
@@ -1924,7 +1951,7 @@ class WorkflowRuntime {
       ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
       payload: {
         code: 'provider-termination-unconfirmed',
-        message: 'The provider execution boundary could not prove that every descendant stopped; capacity is quarantined and automatic retry is suppressed',
+        message: 'The provider execution boundary could not prove that every descendant stopped; replay will use effect-safety policy and a fresh provider thread',
       },
     })
   }
@@ -2010,18 +2037,11 @@ class WorkflowRuntime {
   async #markRecoveryRequired(
     admission: AgentAdmission,
     attemptId: string,
+    attemptNumber: number,
     error: unknown,
     replaySafety: AgentReplaySafetyAssessment,
   ): Promise<void> {
     const reference = errorReference(error)
-    // Close capability admission synchronously, before the diagnostic append. A blocked event
-    // store must not leave a window where workflow JavaScript can submit downstream work after the
-    // runtime already knows the prior external state may be ambiguous.
-    this.#recoveryRequiredError ??= new WorkflowExecutionError(
-      'agent-recovery-required',
-      `Agent ${admission.agentId} requires operator-approved recovery: ${reference.message}`,
-      { cause: error },
-    )
     await this.#emit({
       type: 'agent.recovery_required',
       agentId: admission.agentId,
@@ -2029,14 +2049,38 @@ class WorkflowRuntime {
       ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
       payload: { error: reference, replaySafety },
     })
-    // Already-admitted siblings keep running, but this call rejects instead of fabricating a
-    // successful null. Claude's parallel helper may collapse the rejection at its explicit
-    // compatibility boundary; the run-wide admission fence above ensures that collapse cannot be
-    // used to submit fresh agent or nested-workflow work afterward. No journal result is recorded.
+    // WHY recovery_required is terminal only for this logical assignment: workflows exist so a
+    // 200-agent research job can finish unattended. An honest typed coverage gap gives downstream
+    // synthesis sound input without pretending the uncertain turn succeeded, while a global fence
+    // would discard every independent sibling and make manual resume part of normal operation.
+    this.#completeAgentFailure(admission, error, 'recovery_required', attemptNumber)
+  }
+
+  #completeAgentFailure(
+    admission: AgentAdmission,
+    error: unknown,
+    status: WorkflowAgentFailurePlaceholder['__workflowAgentFailure']['status'],
+    attempts: number,
+  ): void {
+    const reference = errorReference(error)
+    const placeholder: WorkflowAgentFailurePlaceholder = {
+      __workflowAgentFailure: {
+        schemaVersion: 1,
+        agentId: admission.agentId,
+        label: admission.options.label ?? fallbackLabel(admission.prompt),
+        status,
+        message: reference.message.slice(0, this.#limits.maxLogCharacters),
+        ...(reference.code === undefined ? {} : { code: reference.code }),
+        attempts,
+        coverageGap: true,
+      },
+    }
+    this.#completedWithErrors = true
+    admission.journalRun.recordResult(admission.journalMiss, placeholder, { successful: false })
     this.#completeWorkerRequest(admission.worker, admission.requestId, {
       type: 'agent.result',
       requestId: admission.requestId,
-      result: { type: 'error', error: serializeWorkerError(this.#recoveryRequiredError) },
+      result: { type: 'success', value: placeholder },
       budgetSpent: this.#budgetSpent,
     })
   }

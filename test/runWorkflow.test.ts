@@ -119,11 +119,9 @@ describe('workflow realm', () => {
       const result = await pending
       try { result.constructor.constructor('return process')(); checks.push('escaped') }
       catch (error) { checks.push(error.name) }
-      try { await agent('rejection') }
-      catch (rejection) {
-        try { rejection.constructor.constructor('return process')(); checks.push('escaped') }
-        catch (error) { checks.push(error.name) }
-      }
+      const failure = await agent('rejection')
+      try { failure.constructor.constructor('return process')(); checks.push('escaped') }
+      catch (error) { checks.push(error.name) }
       return checks
     `)
     const { run, events } = start(source, [
@@ -223,7 +221,7 @@ describe('agent scheduling and helpers', () => {
     expect(provider.completionOrder.indexOf(3)).toBeLessThan(provider.completionOrder.indexOf(2))
   })
 
-  it('turns provider failures and rejected parallel slots into independent null results', async () => {
+  it('turns provider failures into independent structured coverage gaps', async () => {
     const source = workflow(`
       return await parallel([
         () => agent('provider failure'),
@@ -235,11 +233,13 @@ describe('agent scheduling and helpers', () => {
       { outcome: { type: 'error', error: new Error('adapter bug') } },
     ])
 
-    await expect(run.result).resolves.toEqual([null, null])
+    const result = await run.result as Array<Record<string, unknown>>
+    expect(result).toHaveLength(2)
+    expect(result.every((value) => '__workflowAgentFailure' in value)).toBe(true)
     const snapshot = projectWorkflowState(run.id, await events)
+    expect(snapshot.status).toBe('completed_with_errors')
     expect(snapshot.counts.failed).toBe(2)
     expect(snapshot.warnings.some((warning) => warning.code === 'unavailable')).toBe(true)
-    expect(snapshot.logs.some((log) => String(log.message.content).includes('parallel() entry failed'))).toBe(true)
   })
 
   it('validates schemas before provider execution and validates structured results afterward', async () => {
@@ -264,8 +264,13 @@ describe('agent scheduling and helpers', () => {
     const second = start(invalidResult, [
       { outcome: { type: 'result', output: { type: 'structured', value: { ok: 'no' } } } },
     ])
-    await expect(second.run.result).rejects.toThrow(/schema validation/i)
-    expect(projectWorkflowState(second.run.id, await second.events).status).toBe('failed')
+    await expect(second.run.result).resolves.toEqual(expect.objectContaining({
+      __workflowAgentFailure: expect.objectContaining({
+        message: expect.stringMatching(/schema validation/i),
+        coverageGap: true,
+      }),
+    }))
+    expect(projectWorkflowState(second.run.id, await second.events).status).toBe('completed_with_errors')
   })
 
   it('counts output tokens and throws the Claude-named budget error before allocating identity', async () => {

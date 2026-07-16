@@ -95,6 +95,11 @@ provider-neutral AgentProvider
   `workflow_resume`) over stdio or an authenticated loopback HTTP transport.
 - **Immediate run handles** — `workflow_run` returns a run ID at once; clients
   follow progress by polling a durable cursor, not a transport-specific push.
+- **Unattended best-effort completion** — retryable read-only work restarts in a
+  fresh provider thread. An exhausted or unsafe logical assignment becomes a
+  versioned `__workflowAgentFailure` coverage gap, while independent siblings
+  and final synthesis continue. Such runs finish as `completed_with_errors`;
+  only persistence or supervisor faults fail the complete run.
 - **Resume** — continue a managed run, or import-and-resume a real Claude run
   after verifying its source and journal byte-identity. Exact source/arguments
   reuse completed calls sparsely; edited source retains the longest unchanged

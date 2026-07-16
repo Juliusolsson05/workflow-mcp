@@ -37,6 +37,7 @@ import type { AgentScheduler, SchedulerSnapshot } from './workConservingSchedule
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   'completed',
+  'completed_with_errors',
   'failed',
   'cancelled',
   'interrupted',
