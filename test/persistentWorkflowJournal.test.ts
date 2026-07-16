@@ -45,7 +45,7 @@ describe('PersistentWorkflowJournal', () => {
     })
 
     const stored = JSON.parse(await readFile(filePath, 'utf8')) as Record<string, unknown>
-    expect(stored).toMatchObject({ format: 'workflow-mcp-journal', version: 1 })
+    expect(stored).toMatchObject({ format: 'workflow-mcp-journal', version: 2 })
   })
 
   it('persists an interrupted provider session so the next run resumes that thread', async () => {
@@ -122,6 +122,63 @@ describe('PersistentWorkflowJournal', () => {
     expect(next.admit({ agentId: 'next-three', prompt: 'three' })).toMatchObject({
       reused: true,
       result: 'three-result',
+    })
+  })
+
+  it('persists root and nested workflow histories regardless of their mutation order', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-persistent-lineage-'))
+    const identities = [
+      { workflowId: 'project:root', sourceHash: 'root-source' },
+      { workflowId: 'project:child', sourceHash: 'child-source' },
+    ] as const
+
+    for (const [index, order] of [identities, [...identities].reverse()].entries()) {
+      const filePath = join(root, `lineage-${index}.json`)
+      const journal = await PersistentWorkflowJournal.open(filePath)
+      for (const current of order) {
+        const run = journal.beginRun(current)
+        const decision = run.admit({ agentId: `old-${current.workflowId}`, prompt: current.workflowId }) as JournalMiss
+        run.recordResult(decision, `${current.workflowId}-result`)
+      }
+
+      const reopened = await PersistentWorkflowJournal.open(filePath)
+      expect(reopened.getSnapshots().map((snapshot) => snapshot.workflowId).sort()).toEqual([
+        'project:child',
+        'project:root',
+      ])
+      for (const current of identities) {
+        expect(
+          reopened.beginRun(current).admit({
+            agentId: `new-${current.workflowId}`,
+            prompt: current.workflowId,
+          }),
+        ).toMatchObject({ reused: true, result: `${current.workflowId}-result` })
+      }
+    }
+  })
+
+  it('migrates a version-1 root snapshot before any new admission', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-persistent-v1-'))
+    const filePath = join(root, 'resume.json')
+    const key = createJournalKey('', 'legacy')
+    await writeFile(filePath, `${JSON.stringify({
+      format: 'workflow-mcp-journal',
+      version: 1,
+      snapshot: {
+        ...identity,
+        records: [
+          { type: 'started', key, agentId: 'legacy-agent' },
+          { type: 'result', key, agentId: 'legacy-agent', result: 'legacy-result' },
+        ],
+      },
+    })}\n`)
+
+    const journal = await PersistentWorkflowJournal.open(filePath)
+    expect(journal.getSnapshot(identity.workflowId)).toBeDefined()
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toMatchObject({
+      format: 'workflow-mcp-journal',
+      version: 2,
+      snapshots: [{ workflowId: identity.workflowId }],
     })
   })
 

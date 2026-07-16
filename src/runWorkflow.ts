@@ -379,6 +379,7 @@ class WorkflowRuntime {
   #lastUnderutilizationSignature: string | undefined
   #retryAttemptsScheduled = 0
   #recoveryRequiredError: WorkflowExecutionError | undefined
+  #storageFailure: WorkflowExecutionError | undefined
 
   constructor(options: RunWorkflowOptions) {
     this.id = options.runId ?? `run_${randomUUID()}`
@@ -520,12 +521,24 @@ class WorkflowRuntime {
         this.#stream.close()
         return
       }
+      if (this.#recoveryRequiredError !== undefined && !this.#failing) {
+        // The evaluator necessarily serializes errors across a vm/IPC boundary and can lose custom
+        // fields from an Error created in main. RecoveryRequired is already the run-owned source of
+        // truth, so settle with that exact object rather than the worker's diagnostic wrapper.
+        await this.#fail(this.#recoveryRequiredError).catch(() => undefined)
+        return
+      }
       if (this.#controller.signal.aborted && !this.#failing) {
-        if (!this.#cancelPromise) await this.cancel(abortReason(this.#controller.signal))
+        if (!this.#cancelPromise) {
+          await this.cancel(abortReason(this.#controller.signal)).catch(() => undefined)
+        }
         return
       }
       if (this.#failing) return
-      await this.#fail(error)
+      // #fail settles the public result in its terminal finally block. A storage failure can make
+      // the diagnostic run.failed append reject afterward; swallowing only that supervisor promise
+      // prevents the fire-and-forget #run task from becoming an unhandled rejection.
+      await this.#fail(error).catch(() => undefined)
     }
   }
 
@@ -539,22 +552,27 @@ class WorkflowRuntime {
       this.#controller.abort(new WorkflowCancelledError(reason))
     }
     this.#clearWallClockTimer()
-    for (const worker of this.#workers) this.#send(worker, { type: 'cancel', reason })
+    for (const worker of this.#workers) this.#sendBestEffort(worker, { type: 'cancel', reason })
 
-    try {
-      await this.#emit({
-        type: 'run.cancellation_requested',
-        payload: reason.length === 0 ? {} : { reason },
-      })
-    } catch {
-      // A sink failure must not prevent aborting native provider and worker processes.
-    }
+    // Diagnostic persistence has its own finite deadline, but process shutdown should not spend
+    // even that budget before escalation begins. The serialized emit tail preserves ordering if
+    // storage recovers; the storage-degraded fence closes admission if it does not.
+    void this.#emit({
+      type: 'run.cancellation_requested',
+      payload: reason.length === 0 ? {} : { reason },
+    }).catch(() => undefined)
 
     await Promise.race([
       Promise.allSettled([...this.#tasks]),
       delay(this.#limits.cancellationGraceMs),
     ])
-    await this.#killWorkers()
+    try {
+      await this.#killWorkers()
+    } catch {
+      // Worker lifecycle adapters are not allowed to veto terminal settlement. Provider attempts
+      // already received the run abort; store ownership separately remains fenced while any real
+      // tracked execution is unresolved.
+    }
 
     // WHY shutdown waits for the supervisor's complete escalation budget after killing the
     // evaluator: run.cancel() is also the service's ownership handoff barrier. Releasing the store
@@ -570,7 +588,12 @@ class WorkflowRuntime {
       ),
     ])
 
-    await this.#failOpenPhases(new WorkflowCancelledError(reason))
+    try {
+      await this.#failOpenPhases(new WorkflowCancelledError(reason))
+    } catch {
+      // A storage-degraded run may be unable to persist phase diagnostics. Terminal settlement and
+      // process cleanup remain mandatory even when those explanatory events cannot be appended.
+    }
 
     try {
       await this.#emit({
@@ -593,7 +616,9 @@ class WorkflowRuntime {
     this.#failing = true
     if (!this.#controller.signal.aborted) this.#controller.abort(error)
     this.#clearWallClockTimer()
-    for (const worker of this.#workers) this.#send(worker, { type: 'cancel', reason: 'Workflow failed' })
+    for (const worker of this.#workers) {
+      this.#sendBestEffort(worker, { type: 'cancel', reason: 'Workflow failed' })
+    }
     // Cooperative providers should publish their agent terminal event before run.failed closes the
     // stream. The bound also covers the rare case where this failure originated inside a tracked
     // task and waiting for every task would otherwise include the caller itself.
@@ -601,7 +626,11 @@ class WorkflowRuntime {
       Promise.allSettled([...this.#tasks]),
       delay(this.#limits.cancellationGraceMs),
     ])
-    await this.#killWorkers()
+    try {
+      await this.#killWorkers()
+    } catch {
+      // See cancellation: adapter notification failure must not strand the public run promise.
+    }
     // Failure can originate in the evaluator while provider attempts are still live. The first
     // grace only gives cooperative abort a chance; it is not long enough for the attempt-addressed
     // termination hook and worktree cleanup. Publishing run.failed before that escalation finishes
@@ -617,7 +646,11 @@ class WorkflowRuntime {
     ])
     const reference = errorReference(error)
 
-    await this.#failOpenPhases(error)
+    try {
+      await this.#failOpenPhases(error)
+    } catch {
+      // The original failure remains authoritative when persistence is already degraded.
+    }
 
     try {
       await this.#emit({ type: 'run.failed', payload: { error: reference } })
@@ -687,17 +720,38 @@ class WorkflowRuntime {
   }
 
   async #publishDraft(draft: WorkflowEventDraft): Promise<void> {
-      this.#eventSequence += 1
-      const event = {
-        ...draft,
-        schemaVersion: 1,
-        runId: this.id,
-        sequence: this.#eventSequence,
-        eventId: `event_${randomUUID()}`,
-        timestamp: new Date().toISOString(),
-      } as WorkflowEvent
-      await this.#options.eventSink?.(event)
-      this.#stream.publish(event)
+    if (this.#storageFailure !== undefined) throw this.#storageFailure
+    this.#eventSequence += 1
+    const event = {
+      ...draft,
+      schemaVersion: 1,
+      runId: this.id,
+      sequence: this.#eventSequence,
+      eventId: `event_${randomUUID()}`,
+      timestamp: new Date().toISOString(),
+    } as WorkflowEvent
+    try {
+      if (this.#options.eventSink !== undefined) {
+        await withDeadline(
+          Promise.resolve(this.#options.eventSink(event)),
+          this.#reliability.eventSinkTimeoutMs,
+          `Workflow event persistence exceeded ${this.#reliability.eventSinkTimeoutMs}ms`,
+        )
+      }
+    } catch (cause) {
+      // WHY a timed-out append closes admission instead of letting later sequence numbers race it:
+      // the original fsync may still finish. Starting another append would create two writers to
+      // one logical cursor and make durable replay ambiguous. Cleanup is allowed to continue, but
+      // every subsequent publication fails immediately until startup recovery reconciles the last
+      // acknowledged record.
+      this.#storageFailure ??= new WorkflowExecutionError(
+        'workflow-storage-degraded',
+        `Workflow event persistence failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+        { cause },
+      )
+      throw this.#storageFailure
+    }
+    this.#stream.publish(event)
   }
 
   async #ensurePhase(
@@ -895,6 +949,15 @@ class WorkflowRuntime {
           }
 
           if (raw.type === 'workflow.request') {
+            if (this.#recoveryRequiredError !== undefined) {
+              this.#completeWorkerRequest(worker, raw.requestId, {
+                type: 'workflow.result',
+                requestId: raw.requestId,
+                result: { type: 'error', error: serializeWorkerError(this.#recoveryRequiredError) },
+                budgetSpent: this.#budgetSpent,
+              })
+              return
+            }
             this.#markWorkerRequest(worker, raw.requestId)
             this.#trackTask(
               this.#executeNestedWorkflow(worker, raw, input.depth).catch((error: unknown) => {
@@ -978,6 +1041,14 @@ class WorkflowRuntime {
     journalRun: WorkflowJournalRun
     forcedPhaseId?: string
   }): Promise<void> {
+    if (this.#recoveryRequiredError !== undefined) {
+      // WHY this gate precedes identity and journal allocation: once an earlier attempt may have
+      // produced an unknown external effect, later workflow decisions no longer have a sound input
+      // state. Recording another admitted call would make recovery_required cosmetic rather than a
+      // capability fence, even if the later provider happened to be read-only.
+      this.#replyAgentError(input.worker, input.request.requestId, this.#recoveryRequiredError)
+      return
+    }
     if (this.#controller.signal.aborted) {
       this.#replyAgentError(input.worker, input.request.requestId, new WorkflowCancelledError(abortReason(this.#controller.signal)))
       return
@@ -1302,6 +1373,7 @@ class WorkflowRuntime {
             ...(resumeSession === undefined ? {} : { resumeSession }),
             ...(recovery === undefined ? {} : { recovery }),
           })
+          const replaySafety = this.#replaySafety(admission, attemptRequest)
           const startedAt = Date.now()
           await this.#emit({
             type: 'agent.started',
@@ -1316,6 +1388,7 @@ class WorkflowRuntime {
               absoluteDeadlineAt: new Date(startedAt + this.#reliability.attemptTimeoutMs).toISOString(),
               ...(admission.options.isolation === 'worktree' ? { workspaceId } : {}),
               ...(resumeSession === undefined ? {} : { providerSession: resumeSession }),
+              replaySafety,
             },
           })
           lastAttemptId = attemptId
@@ -1468,6 +1541,14 @@ class WorkflowRuntime {
             })
             lastAttemptOpen = false
             if (!retrying) {
+              if (error.terminalDisposition === 'reject') {
+                // WHY a contract failure bypasses the historical null-slot compatibility path:
+                // schema-backed output is the workflow's declared API. Reporting success with null
+                // after malformed JSON makes the whole run appear valid and can feed downstream
+                // mutations with a value the provider never produced.
+                this.#replyAgentError(admission.worker, admission.requestId, error)
+                return
+              }
               admission.journalRun.recordResult(admission.journalMiss, null, { successful: false })
               await this.#emit({
                 type: 'warning',
@@ -1734,7 +1815,11 @@ class WorkflowRuntime {
         throw new WorkflowCancelledError(abortReason(this.#controller.signal))
       }
       if (!(error instanceof AgentAttemptTimeoutError)) throw error
-      await this.#emit({
+      // Start the diagnostic append without putting it on the process-termination critical path.
+      // A stalled fsync is exactly the failure mode in which waiting here would leave a timed-out
+      // credentialed process alive indefinitely. Event ordering remains serialized by #emitTail;
+      // storage has its own deadline and degradation fence.
+      void this.#emit({
         type: 'agent.stalled',
         agentId: input.admission.agentId,
         attemptId: input.attemptId,
@@ -1744,7 +1829,7 @@ class WorkflowRuntime {
           lastProgressAt: error.lastProgressAt,
           deadlineAt: error.deadlineAt,
         },
-      })
+      }).catch(() => undefined)
       const settlement = await this.#confirmProviderTermination(execution, identity, {
         code: 'timeout',
         message: error.message,
@@ -1893,6 +1978,14 @@ class WorkflowRuntime {
     replaySafety: AgentReplaySafetyAssessment,
   ): Promise<void> {
     const reference = errorReference(error)
+    // Close capability admission synchronously, before the diagnostic append. A blocked event
+    // store must not leave a window where workflow JavaScript can submit downstream work after the
+    // runtime already knows the prior external state may be ambiguous.
+    this.#recoveryRequiredError ??= new WorkflowExecutionError(
+      'agent-recovery-required',
+      `Agent ${admission.agentId} requires operator-approved recovery: ${reference.message}`,
+      { cause: error },
+    )
     await this.#emit({
       type: 'agent.recovery_required',
       agentId: admission.agentId,
@@ -1900,20 +1993,14 @@ class WorkflowRuntime {
       ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
       payload: { error: reference, replaySafety },
     })
-    // Continue already-admitted siblings and let workflow JavaScript cross its current barrier with
-    // a null result. The run itself fails after all tracked work drains, which avoids turning one
-    // uncertain agent into a cancellation storm while still refusing to label the run successful.
-    // Crucially, no null journal result is recorded, so exact-source manual resume revisits only this
-    // unresolved logical call and can reuse completed siblings on either side of it.
-    this.#recoveryRequiredError ??= new WorkflowExecutionError(
-      'agent-recovery-required',
-      `Agent ${admission.agentId} requires operator-approved recovery: ${reference.message}`,
-      { cause: error },
-    )
+    // Already-admitted siblings keep running, but this call rejects instead of fabricating a
+    // successful null. Claude's parallel helper may collapse the rejection at its explicit
+    // compatibility boundary; the run-wide admission fence above ensures that collapse cannot be
+    // used to submit fresh agent or nested-workflow work afterward. No journal result is recorded.
     this.#completeWorkerRequest(admission.worker, admission.requestId, {
       type: 'agent.result',
       requestId: admission.requestId,
-      result: { type: 'success', value: null },
+      result: { type: 'error', error: serializeWorkerError(this.#recoveryRequiredError) },
       budgetSpent: this.#budgetSpent,
     })
   }
@@ -2157,6 +2244,17 @@ class WorkflowRuntime {
 
   #send(worker: WorkflowWorkerHandle, message: ParentToWorkerMessage): void {
     worker.postMessage(message)
+  }
+
+  #sendBestEffort(worker: WorkflowWorkerHandle, message: ParentToWorkerMessage): void {
+    try {
+      worker.postMessage(message)
+    } catch {
+      // WHY cancellation uses a separate send path: an Electron UtilityProcess can exit between
+      // isRunning() and postMessage(). That race is evidence the worker is already gone, not a
+      // reason to reject the cancellation supervisor before provider escalation and result
+      // settlement execute.
+    }
   }
 
   async #sealPhase(phaseId: string): Promise<void> {
@@ -2559,6 +2657,7 @@ function workerError(error: SerializedWorkerError): Error {
   const result = new Error(error.message)
   result.name = error.name
   if (error.stack !== undefined) result.stack = error.stack
+  if (error.code !== undefined) Object.assign(result, { code: error.code })
   return result
 }
 
@@ -2627,6 +2726,21 @@ function abortRejection(signal: AbortSignal): { promise: Promise<never>; dispose
   return {
     promise,
     dispose: () => signal.removeEventListener('abort', onAbort),
+  }
+}
+
+async function withDeadline<T>(operation: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new WorkflowExecutionError('operation-timeout', message))
+    }, milliseconds)
+    timer.unref?.()
+  })
+  try {
+    return await Promise.race([operation, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 

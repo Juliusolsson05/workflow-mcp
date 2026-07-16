@@ -59,3 +59,8 @@ from commit-pinned URLs listed in the main README. The archive currently contain
 about 58 MB; most of that is the 392 workflow-agent transcript/metadata pairs used to understand
 real scheduling and resume behavior. The raw corpus is evidence, not vendored runtime code: it
 must never be imported, built, packaged, or executed automatically.
+
+Release validation does not depend on that private archive. A small synthetic, secret-reviewed,
+MIT-licensed positive corpus is committed under `test/fixtures/workflow-corpus/`; the always-on
+conformance test requires it to be non-empty. Raw evidence remains an optional larger compatibility
+check and must still never be force-added.

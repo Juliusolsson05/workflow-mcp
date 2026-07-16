@@ -25,6 +25,7 @@ export type SerializedWorkerError = {
   name: string
   message: string
   stack?: string
+  code?: string
 }
 
 export type ParentToWorkerMessage =
@@ -91,6 +92,22 @@ export function serializeWorkerError(error: unknown): SerializedWorkerError {
       name: error.name,
       message: error.message,
       ...(error.stack === undefined ? {} : { stack: error.stack }),
+      ...('code' in error && typeof error.code === 'string' ? { code: error.code } : {}),
+    }
+  }
+
+  // Errors created inside node:vm have the realm's Error prototype, so `instanceof Error` is false
+  // in the worker host. Preserve only primitive diagnostic fields; passing the realm object itself
+  // would violate the constructor-isolation boundary enforced for every other capability value.
+  if (typeof error === 'object' && error !== null) {
+    const value = error as Record<string, unknown>
+    if (typeof value.name === 'string' && typeof value.message === 'string') {
+      return {
+        name: value.name,
+        message: value.message,
+        ...(typeof value.stack === 'string' ? { stack: value.stack } : {}),
+        ...(typeof value.code === 'string' ? { code: value.code } : {}),
+      }
     }
   }
 

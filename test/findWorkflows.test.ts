@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -93,5 +93,23 @@ describe('findWorkflows', () => {
     expect([join(workflowDirectory, 'first.js'), join(workflowDirectory, 'second.js')]).toContain(
       result.issues[0]?.filePath,
     )
+  })
+
+  it('rejects a project workflow root redirected through a symlink', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'workflow-discovery-symlink-root-'))
+    const repository = join(directory, 'repo')
+    const external = join(directory, 'external-workflows')
+    await mkdir(join(repository, '.git'), { recursive: true })
+    await mkdir(join(repository, '.claude'), { recursive: true })
+    await put(external, 'outside.js', source('outside', 'Must not execute'))
+    await symlink(external, join(repository, '.claude', 'workflows'))
+
+    const result = await findWorkflows({ cwd: repository, homeDir: join(directory, 'home') })
+
+    expect(result.workflows).toEqual([])
+    expect(result.issues).toContainEqual(expect.objectContaining({
+      filePath: join(repository, '.claude', 'workflows'),
+      code: 'path-forbidden',
+    }))
   })
 })

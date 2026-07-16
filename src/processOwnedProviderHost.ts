@@ -72,13 +72,15 @@ type HostExecution = {
 }
 
 /**
- * Own one OS process group per Codex attempt.
+ * Supervise one OS process group per Codex attempt.
  *
  * WHY the provider promise settles on `close`, not on the host's `result` message: the original
  * incident was caused by treating a wrapper promise as proof that every tool descendant had died.
- * A terminal IPC message proves only that JavaScript reached a return statement. This owner waits
- * for the host process to be reaped, verifies the dedicated group has no remaining members, and
- * forcibly clears any residual descendants before handing the scheduler permit back.
+ * A terminal IPC message proves only that JavaScript reached a return statement. This supervisor
+ * waits for the direct host and its original process group to disappear. That is valuable cleanup,
+ * but it is not creation-time containment: a real Codex shell tool can call setsid() and escape.
+ * CodexAgentProvider therefore advertises `unconfirmed-descendants`; callers must quarantine
+ * ambiguous cancellation even when this best-effort group reap succeeds.
  */
 export class ProcessOwnedCodexHost {
   readonly #hostFilePath: string
@@ -212,9 +214,9 @@ export class ProcessOwnedCodexHost {
     execution.abortRequested = true
     execution.termination ??= terminateProcessTree(execution.child)
     await execution.termination
-    // `terminateProcessTree` proves the OS boundary is gone. Awaiting the provider promise here is
-    // still useful because it guarantees the close handler has converted that fact into exactly
-    // one runtime-visible settlement before the supervisor returns from escalation.
+    // Awaiting the provider promise guarantees the close handler has converted direct-host/group
+    // exit into exactly one runtime-visible settlement. It deliberately does not upgrade that fact
+    // to proof about descendants which may have escaped the group.
     await execution.result.then(() => undefined, () => undefined)
   }
 
@@ -253,9 +255,10 @@ export class ProcessOwnedCodexHost {
   ): Promise<void> {
     if (execution.settled) return
     try {
-      // A normally completed SDK turn can still leave a detached tool grandchild. Reaping here is
-      // not merely cancellation cleanup; it is what makes every successful permit release obey
-      // the same process-tree invariant as a timed-out one.
+      // A normally completed SDK turn can still leave group members. Clear those best-effort so a
+      // successful host does not leak ordinary descendants; the provider's public termination
+      // boundary remains unconfirmed because session-owning grandchildren are not enumerable from
+      // this process group after they escape.
       execution.termination ??= reapResidualProcessTree(execution.child)
       await execution.termination
       await execution.delivery

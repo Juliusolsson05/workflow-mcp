@@ -29,6 +29,8 @@ export type WorkflowRunManifest = {
   recoveryMode?: 'manual' | 'automatic'
   /** Persisted decision; recovery must not reinterpret a later host's provider configuration. */
   automaticReplaySafe?: boolean
+  /** Exact provider/configuration evidence which must match before crash recovery can replay. */
+  providerRecoveryFingerprint?: string
   cancellationReason?: string
   error?: string
 }

@@ -5,7 +5,12 @@
  * process, MCP, and Codex SDK functionality. A renderer only needs immutable event reduction; a
  * hard subpath keeps accidental Node imports out of browser bundles by construction.
  */
-export { createWorkflowState, projectWorkflowState, reduceWorkflowState } from './workflowState.js'
+export {
+  createWorkflowAgentCounts,
+  createWorkflowState,
+  projectWorkflowState,
+  reduceWorkflowState,
+} from './workflowState.js'
 export type {
   WorkflowActivitySnapshot,
   WorkflowActivityStatus,

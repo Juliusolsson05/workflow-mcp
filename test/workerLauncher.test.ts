@@ -98,7 +98,35 @@ class WatchdogWorker implements WorkflowWorkerHandle {
   }
 }
 
+class ThrowingCancelWorker extends WatchdogWorker {
+  constructor() {
+    super('idle')
+  }
+
+  override postMessage(message: ParentToWorkerMessage): void {
+    if (message.type === 'cancel') throw new Error('worker already exited before cancel IPC')
+    super.postMessage(message)
+  }
+}
+
 describe('WorkflowWorkerLauncher boundary', () => {
+  it('settles cancellation even when worker cancel IPC throws', async () => {
+    const worker = new ThrowingCancelWorker()
+    const run = runWorkflow({
+      workflow: parseWorkflowSource(`export const meta = { name: 'throw-cancel', description: 'fixture' }
+        await new Promise(() => {})`),
+      cwd: process.cwd(),
+      provider: new FakeAgentProvider([]),
+      workerLauncher: { launch: () => worker },
+      limits: { cancellationGraceMs: 5 },
+    })
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20))
+
+    await expect(run.cancel('throwing transport')).resolves.toBeUndefined()
+    await expect(run.result).rejects.toThrow('throwing transport')
+    expect(worker.isRunning()).toBe(false)
+  })
+
   it('executes through an injected non-ChildProcess handle and explicit worker entry', async () => {
     let launchOptions: WorkflowWorkerLaunchOptions | undefined
     const launcher: WorkflowWorkerLauncher = {

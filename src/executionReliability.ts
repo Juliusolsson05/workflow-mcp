@@ -17,6 +17,7 @@ export type WorkflowReliabilityPolicy = {
   hardTerminationGraceMs: number
   preparationTimeoutMs: number
   cleanupTimeoutMs: number
+  eventSinkTimeoutMs: number
   workerStartupTimeoutMs: number
   workerHeartbeatTimeoutMs: number
   workerIdleTimeoutMs: number
@@ -43,6 +44,7 @@ export const DEFAULT_WORKFLOW_RELIABILITY_POLICY: Readonly<WorkflowReliabilityPo
   hardTerminationGraceMs: 5_000,
   preparationTimeoutMs: 2 * 60_000,
   cleanupTimeoutMs: 30_000,
+  eventSinkTimeoutMs: 30_000,
   workerStartupTimeoutMs: 30_000,
   workerHeartbeatTimeoutMs: 30_000,
   workerIdleTimeoutMs: 2 * 60_000,
@@ -256,6 +258,7 @@ export function normalizeReliabilityPolicy(
     'hardTerminationGraceMs',
     'preparationTimeoutMs',
     'cleanupTimeoutMs',
+    'eventSinkTimeoutMs',
     'workerStartupTimeoutMs',
     'workerHeartbeatTimeoutMs',
     'workerIdleTimeoutMs',
