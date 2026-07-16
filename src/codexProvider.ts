@@ -58,6 +58,14 @@ export type CodexProviderOptions = Omit<CodexOptions, 'env'> & {
    * boundary, and must classify every server it intentionally exposes.
    */
   capabilities?: CodexExecutionCapabilities
+  /** Exact host-resolved CLI identity; unlike the SDK version this describes what is executed. */
+  executableEvidence?: CodexExecutableEvidence
+}
+
+export type CodexExecutableEvidence = {
+  path: string
+  sha256: string
+  version?: string
 }
 
 export type CodexExternalCapabilityEffect = 'read-only' | 'idempotent' | 'mutating' | 'unknown'
@@ -75,6 +83,14 @@ export type CodexConfigurationIsolation = {
   codexHome: string
   /** Optional login copied into the isolated home before each host starts. */
   authenticationFile?: string
+  /**
+   * App-owned credential broker hook run immediately before each attempt snapshots auth.
+   *
+   * WHY this is a callback instead of teaching workflow-mcp OAuth/keyring policy: the embedding
+   * application owns interactive account state. The hook lets it serialize refresh and write an
+   * access-only snapshot while this package continues to own process/config isolation.
+   */
+  prepareAuthentication?(): void | Promise<void>
   /**
    * Optional pre-isolation Codex home from which the exact requested rollout may be imported.
    * Configuration, plugins, apps, and unrelated sessions are never copied.
@@ -116,6 +132,7 @@ export class CodexAgentProvider implements AgentProvider {
       providerHostFilePath,
       configurationIsolation,
       capabilities = { inheritedMcpServers: 'unknown' },
+      executableEvidence,
       env,
       ...codexOptions
     } = options
@@ -152,6 +169,7 @@ export class CodexAgentProvider implements AgentProvider {
       this.#host = new ProcessOwnedCodexHost({
         ...(providerHostFilePath === undefined ? {} : { hostFilePath: providerHostFilePath }),
         ...(configurationIsolation === undefined ? {} : { configurationIsolation }),
+        ...(executableEvidence === undefined ? {} : { executableEvidence }),
         codexOptions: {
           ...codexOptions,
           env: safeCodexEnvironment(env),
@@ -412,7 +430,6 @@ export async function executeCodexTurn(
       diagnostics: {
         sdk: '@openai/codex-sdk',
         sdkVersion: CODEX_SDK_VERSION,
-        bundledCliVersion: CODEX_SDK_VERSION,
         ...(request.recovery === undefined ? {} : { recovery: request.recovery }),
       },
     }

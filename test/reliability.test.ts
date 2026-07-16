@@ -281,6 +281,7 @@ describe('unattended workflow reliability', () => {
       `),
       cwd: process.cwd(),
       provider,
+      sandbox: { mode: 'read-only' },
       limits: { concurrency: 1 },
       reliability: {
         ...FAST_RETRY,
@@ -386,7 +387,9 @@ describe('unattended workflow reliability', () => {
       cwd: process.cwd(),
       provider,
       sandbox: { mode: 'read-only' },
-      reliability: FAST_RETRY,
+      // The ambiguity must remain visible even when policy says no retry would be admitted. This
+      // catches the historical coupling that converted an unsafe final attempt to successful null.
+      reliability: { ...FAST_RETRY, automaticRetry: 'never' },
     })
 
     const events = collect(run)
@@ -857,6 +860,18 @@ describe('unattended workflow reliability', () => {
     let activePreparations = 0
     let maxActivePreparations = 0
     let lateCleanups = 0
+    const fake = new FakeAgentProvider([
+      { outcome: { type: 'result', output: { type: 'text', text: 'second prepared' } } },
+    ])
+    const provider: AgentProvider = {
+      name: fake.name,
+      automaticReplaySafety: fake.automaticReplaySafety,
+      recoveryFingerprint: fake.recoveryFingerprint,
+      // Preparation happens before provider admission. Its ownership fence must therefore settle
+      // even when the eventual provider cannot prove descendant termination.
+      terminationBoundary: 'unconfirmed-descendants',
+      execute: (request, context) => fake.execute(request, context),
+    }
     const run = runWorkflow({
       workflow: workflow(`
         return await parallel([0, 1].map((index) => async () => {
@@ -868,9 +883,7 @@ describe('unattended workflow reliability', () => {
         }))
       `),
       cwd: process.cwd(),
-      provider: new FakeAgentProvider([
-        { outcome: { type: 'result', output: { type: 'text', text: 'second prepared' } } },
-      ]),
+      provider,
       prepareWorkingDirectory: async () => {
         const index = preparationStarts.length
         preparationStarts.push(Date.now())
@@ -1018,6 +1031,39 @@ describe('unattended workflow reliability', () => {
       status: 'completed',
       recoveryMode: 'automatic',
     })
+    await service.stop()
+  })
+
+  it('honors initialization recovery opt-out for an unstarted interrupted run', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-recovery-opt-out-'))
+    const storeRoot = join(cwd, 'state')
+    const source = workflow(`return await agent('must remain stopped')`, 'recovery-opt-out')
+    const seed = new FileWorkflowStore(storeRoot)
+    const lease = await seed.acquireLease('recovery-opt-out-seed')
+    await seed.initialize()
+    await seed.createRun({ runId: 'run_recovery_opt_out', cwd, workflow: source })
+    await seed.appendEvent('run_recovery_opt_out', {
+      schemaVersion: 1,
+      runId: 'run_recovery_opt_out',
+      sequence: 1,
+      eventId: 'event_recovery_opt_out_interrupted',
+      timestamp: new Date().toISOString(),
+      type: 'run.interrupted',
+      payload: { reason: 'fixture stopped before evaluator admission' },
+    })
+    await lease.release()
+
+    const provider = new FakeAgentProvider([])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(storeRoot),
+      provider,
+      recovery: { autoResumeOnInitialize: false },
+    })
+    await service.initialize()
+
+    const manifests = await new FileWorkflowStore(storeRoot).listManifests()
+    expect(manifests.some((manifest) => manifest.resumedFromRunId === 'run_recovery_opt_out')).toBe(false)
+    expect(provider.calls).toHaveLength(0)
     await service.stop()
   })
 

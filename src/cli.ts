@@ -13,6 +13,7 @@ import { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.
 import { WorkflowService } from './workflowService.js'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { realpath } from 'node:fs/promises'
 
 function usage(): never {
   console.error(
@@ -116,12 +117,20 @@ async function main(): Promise<void> {
     if (argument !== '--stdio' && argument !== '--http') usage()
     if (rest.length > (argument === '--http' ? 2 : 1)) usage()
     const cwd = resolve(rest[0] ?? process.cwd())
+    const approvedSources = await standaloneSourceApprovals(cwd)
     const service = new WorkflowService({
       store: new FileWorkflowStore(
         resolve(process.env.WORKFLOW_MCP_STATE_DIR ?? join(homedir(), '.workflow-mcp')),
       ),
       provider: () => new CodexAgentProvider(),
       sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+      // Starting the standalone server is the operator's approval of the workflow definitions
+      // visible at that moment—not a blanket code-execution grant to every future MCP request.
+      // Hash pinning means edits and inline sources fail closed until the operator restarts and can
+      // inspect the new bytes, matching Agent Code's interactive source-approval boundary.
+      authorizeWorkflowSource: request => approvedSources.has(
+        `${request.canonicalIdentity}\0${request.sourceHash}`,
+      ),
     })
     await service.initialize()
 
@@ -149,6 +158,16 @@ async function main(): Promise<void> {
   }
 
   usage()
+}
+
+async function standaloneSourceApprovals(cwd: string): Promise<Set<string>> {
+  const discovered = await findWorkflows({ cwd })
+  const approved = new Set<string>()
+  for (const workflow of discovered.workflows) {
+    const identity = await realpath(workflow.filePath).catch(() => resolve(workflow.filePath))
+    approved.add(`${identity}\0${workflow.sourceHash}`)
+  }
+  return approved
 }
 
 async function executeAndPrint(

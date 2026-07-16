@@ -97,6 +97,8 @@ const service = new WorkflowService({
     configurationIsolation: {
       codexHome: '/private/application/state/workflow-codex',
       authenticationFile: '/home/user/.codex/auth.json',
+      prepareAuthentication: refreshBroker.prepare,
+      effectiveConfigurationFingerprint: verifiedCodexPolicyDigest,
     },
     capabilities: { inheritedMcpServers: 'disabled' },
   }),
@@ -159,6 +161,8 @@ const run = runWorkflow({
     configurationIsolation: {
       codexHome: '/private/application/state/workflow-codex',
       authenticationFile: '/home/user/.codex/auth.json',
+      prepareAuthentication: refreshBroker.prepare,
+      effectiveConfigurationFingerprint: verifiedCodexPolicyDigest,
     },
     capabilities: { inheritedMcpServers: 'disabled' },
   }),
@@ -176,6 +180,12 @@ const snapshot = projectWorkflowState(run.id, events)
 tests or the Codex provider in production. The Codex adapter uses the existing local Codex login or
 the SDK's API-key mode, passes only an explicit environment allowlist, defaults to workspace-write
 with no network and no approvals, and requires explicit mappings for Claude model aliases.
+
+The pre-attempt authentication hook belongs to the embedding application because it owns the
+interactive account and platform credential store. Agent Code serializes refresh-token rotation
+there and writes `chatgptAuthTokens` state without a reusable refresh token for provider children.
+Copying the normal OAuth file directly remains supported for simple standalone embeddings, but it
+is not a safe high-concurrency refresh broker and must not be described as one.
 
 The in-memory journal implements exact-source sparse reuse, edited-source longest-prefix reuse, and
 interrupted provider-session resume. The

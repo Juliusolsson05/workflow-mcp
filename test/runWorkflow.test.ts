@@ -143,7 +143,7 @@ describe('workflow realm', () => {
     expect(projectWorkflowState(run.id, await events).status).toBe('failed')
   })
 
-  it('uses the wall-clock kill as a backstop for an infinite loop after await', async () => {
+  it('honors an explicit wall-clock kill for an infinite loop after await', async () => {
     const source = workflow(`await Promise.resolve(); while (true) {}`)
     const { run, events } = start(source, [], {
       limits: { synchronousTimeoutMs: 50, wallClockTimeoutMs: 100, cancellationGraceMs: 25 },
@@ -153,7 +153,7 @@ describe('workflow realm', () => {
     expect(projectWorkflowState(run.id, await events).status).toBe('cancelled')
   })
 
-  it('uses the wall-clock kill for an infinite timer callback outside vm.runInContext', async () => {
+  it('honors an explicit wall-clock kill for an infinite timer callback outside vm.runInContext', async () => {
     const source = workflow(`
       await new Promise(() => setTimeout(() => { while (true) {} }, 0))
     `)
@@ -493,6 +493,30 @@ describe('cancellation, journal, and composition', () => {
     await expect(second.run.result).resolves.toBe('yes')
     const snapshot = projectWorkflowState(second.run.id, await second.events)
     expect(snapshot.agents[0]?.outcome).toMatchObject({ source: 'journal', structured: true })
+  })
+
+  it('revalidates historical structured output before returning a journal hit', async () => {
+    const schema = {
+      type: 'object',
+      properties: { ok: { type: 'boolean' } },
+      required: ['ok'],
+      additionalProperties: false,
+    }
+    const source = workflow(`return await agent('cached', { schema: ${JSON.stringify(schema)} })`, 'journal-schema-validation')
+    const key = createJournalKey('', 'cached', { schema })
+    const journal = new InMemoryWorkflowJournal([{
+      workflowId: source.meta.name,
+      sourceHash: source.sourceHash,
+      records: [
+        { type: 'started', key, agentId: 'legacy-agent' },
+        { type: 'result', key, agentId: 'legacy-agent', result: { ok: 'not-boolean' }, successful: true },
+      ],
+    }])
+
+    const run = start(source, [], { journal })
+    await expect(run.run.result).rejects.toThrow(/reused agent output failed schema validation/i)
+    expect(run.provider.calls).toHaveLength(0)
+    expect(projectWorkflowState(run.run.id, await run.events).status).toBe('failed')
   })
 
   it('records an interrupted provider session and resumes it on the next matching run', async () => {
