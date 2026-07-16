@@ -545,6 +545,34 @@ describe('unattended workflow reliability', () => {
     expect(provider.calls.map((call) => call.status)).toEqual(['aborted', 'completed'])
   })
 
+  it('retains store ownership when an unconfirmed timeout becomes a coverage gap', async () => {
+    const provider: AgentProvider = {
+      name: 'unconfirmed-timeout',
+      terminationBoundary: 'unconfirmed-descendants',
+      // This deliberately models the macOS Codex failure which motivated the production fence:
+      // AbortSignal reaches the wrapper, but neither wrapper settlement nor complete descendant
+      // termination can be proven. The logical assignment must finish without making it safe for a
+      // replacement supervisor to overlap the still-credentialed physical attempt.
+      execute: () => new Promise<AgentProviderResult>(() => undefined),
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('stalls forever')`),
+      cwd: process.cwd(),
+      provider,
+      sandbox: { mode: 'read-only' },
+      limits: { cancellationGraceMs: 2 },
+      reliability: {
+        ...FAST_RETRY,
+        maxAttempts: 1,
+        startupTimeoutMs: 5,
+        hardTerminationGraceMs: 2,
+      },
+    })
+
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder('recovery_required'))
+    expect(run.ownershipReleaseSafe?.()).toBe(false)
+  })
+
   it('recovers one silent attempt among nine without cancelling its healthy siblings', async () => {
     const provider = new FakeAgentProvider([
       { sessionId: 'silent-session', outcome: { type: 'wait-for-abort' } },

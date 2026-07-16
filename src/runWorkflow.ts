@@ -1511,6 +1511,13 @@ class WorkflowRuntime {
             })
             lastAttemptOpen = false
             if (!retrying) {
+              // WHY logical completion does not imply execution ownership can transfer: on macOS
+              // Codex descendants may escape the wrapper process group. The coverage placeholder
+              // lets every independent assignment and synthesis continue, but a replacement
+              // supervisor still must not reclaim this lineage's durable store while the abandoned
+              // credentialed process may be alive. Keep that cross-process fence closed without
+              // consuming provider admission capacity or turning the casualty into a run failure.
+              this.#quarantineExecution(error.execution)
               preserveWorkspaceForRecovery = true
               await this.#markRecoveryRequired(
                 admission,
