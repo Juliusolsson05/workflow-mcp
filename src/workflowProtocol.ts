@@ -7,6 +7,7 @@ export type WorkflowRunStatus =
   | 'running'
   | 'cancellation_requested'
   | 'completed'
+  | 'completed_with_errors'
   | 'failed'
   | 'cancelled'
   | 'interrupted'

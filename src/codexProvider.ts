@@ -206,13 +206,6 @@ export class CodexAgentProvider implements AgentProvider {
         reason: 'Network-enabled shell execution can produce external effects outside the workflow journal',
       }
     }
-    if (this.#host !== undefined && this.terminationBoundary !== 'process-tree') {
-      return {
-        automatic: false,
-        risk: 'unknown_external',
-        reason: 'This platform cannot yet prove creation-time ownership of every Codex descendant',
-      }
-    }
     if (!this.#externallyReplaySafe()) {
       return {
         automatic: false,
@@ -257,7 +250,11 @@ export class CodexAgentProvider implements AgentProvider {
   }
 
   #externallyReplaySafe(): boolean {
-    if (this.#host !== undefined && this.terminationBoundary !== 'process-tree') return false
+    // WHY process containment is intentionally absent here: this method answers whether repeating
+    // the logical assignment can duplicate an effect, not whether the old wrapper has exited. A
+    // no-network turn with inherited MCP disabled and read-only/idempotent exposed tools remains
+    // replay-safe even on macOS where setsid() prevents complete descendant ownership. Conflating
+    // those questions made every production retry impossible despite a read-only sandbox.
     if (this.#capabilities.inheritedMcpServers !== 'disabled') return false
     return (this.#capabilities.mcpServers ?? []).every(
       (server) => server.effect === 'read-only' || server.effect === 'idempotent',

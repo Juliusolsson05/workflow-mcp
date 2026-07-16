@@ -133,6 +133,7 @@ export type {
   WorkflowEvent,
   WorkflowEventSink,
   WorkflowEventType,
+  WorkflowAgentFailurePlaceholder,
 } from './workflowEvents.js'
 
 export {

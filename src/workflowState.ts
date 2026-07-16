@@ -18,6 +18,7 @@ export type WorkflowRunStatus =
   | 'running'
   | 'cancellation_requested'
   | 'completed'
+  | 'completed_with_errors'
   | 'failed'
   | 'cancelled'
   | 'interrupted'
@@ -208,6 +209,7 @@ export type WorkflowSnapshot = {
 
 const TERMINAL_RUN_STATUSES = new Set<WorkflowRunStatus>([
   'completed',
+  'completed_with_errors',
   'failed',
   'cancelled',
   'interrupted',
@@ -452,7 +454,7 @@ export function reduceWorkflowState(
     case 'run.completed':
       next = {
         ...next,
-        status: 'completed',
+        status: event.payload.withErrors === true ? 'completed_with_errors' : 'completed',
         completedAt: event.timestamp,
         result: event.payload.result,
       }

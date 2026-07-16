@@ -133,8 +133,34 @@ export type RunCompletedEvent = EventEnvelope<
   'run.completed',
   {
     result: ContentReference
+    /**
+     * WHY this is carried by the existing completion event instead of adding a competing terminal
+     * event: old event readers already understand `run.completed`, and the result is still a valid
+     * best-effort product. The flag lets newer projections distinguish complete coverage from a
+     * synthesis that honestly contains one or more assignment casualties.
+     */
+    withErrors?: boolean
   }
 >
+
+/**
+ * A failed provider attempt is data for synthesis, not an exception which may tear down 199
+ * healthy siblings. Keep the marker deliberately loud and versioned so workflow JavaScript cannot
+ * confuse it with a provider's legitimate null/empty result and future versions can extend it
+ * without guessing which ad-hoc error object a historical run returned.
+ */
+export type WorkflowAgentFailurePlaceholder = {
+  __workflowAgentFailure: {
+    schemaVersion: 1
+    agentId: string
+    label: string
+    status: 'failed' | 'recovery_required' | 'skipped'
+    message: string
+    code?: string
+    attempts: number
+    coverageGap: true
+  }
+}
 
 export type RunFailedEvent = EventEnvelope<
   'run.failed',

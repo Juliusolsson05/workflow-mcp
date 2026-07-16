@@ -1,6 +1,6 @@
 # Workflow reliability and continuous-utilization implementation plan
 
-Status: in progress; fail-closed audit hardening implemented on 2026-07-16, native creation-time containment still outstanding
+Status: in progress; unattended best-effort assignment containment implemented on 2026-07-16, native creation-time containment still outstanding
 Date: 2026-07-15
 Scope: `workflow-mcp` runtime, service, persistence, provider lifecycle, worktree lifecycle, MCP
 health surface, and the narrow Agent Code host callbacks required to make those guarantees real.
@@ -10,9 +10,11 @@ health surface, and the narrow Agent Code host callbacks required to make those 
 This document intentionally remains the full end-state plan. The runtime now supervises attempts,
 but the 2026-07-16 audit proved that a POSIX process group is not a complete ownership boundary:
 real Codex shell tools can call `setsid()` and leave it. Both POSIX and Windows therefore advertise
-`unconfirmed-descendants`; automatic replay remains disabled for the production Codex provider
-until cgroup/supervisor or Job Object containment exists. This correction is deliberately explicit
-instead of turning useful kill escalation into a false exactly-once guarantee.
+`unconfirmed-descendants`. Replay safety is now deliberately independent from that OS fact:
+read-only/no-network work with an isolated, attested MCP capability set restarts in a fresh provider
+thread, while an unsafe or exhausted assignment becomes an explicit coverage gap. Native
+containment remains necessary for authoritative cleanup, but it no longer turns one disposable
+attempt into a run-wide availability dependency.
 
 Implemented in the first reliability slice:
 
@@ -20,10 +22,10 @@ Implemented in the first reliability slice:
   narrower per-run ceilings;
 - startup, idle-progress, active-operation, total-attempt, worker-startup, worker-heartbeat, and
   worker-idle watchdogs;
-- same-session, same-workspace logical-agent retries with bounded exponential backoff, per-agent and
+- fresh-thread, same-workspace logical-agent retries with bounded exponential backoff, per-agent and
   per-run retry budgets, provider circuit breaking, and half-open probes;
-- attempt-addressed cancellation escalation, provider termination hooks, and permit quarantine when
-  termination cannot be proven;
+- attempt-addressed cancellation escalation, provider termination hooks, and ownership quarantine
+  during explicit service cancellation when termination cannot be proven;
 - stable workspace identities and durable workspace/deadline/retry/stall events;
 - serialized durable appends, event/manifest crash-tail repair, a process-owner fence, and concurrent
   idempotency-key coalescing;
@@ -73,8 +75,8 @@ Implemented in the 2026-07-16 audit-hardening slice:
 - fail-closed Codex ownership and replay evidence: a private CODEX_HOME alone no longer attests
   that system/managed MCP configuration is absent, and restart recovery requires a matching
   provider fingerprint plus each unresolved attempt's concrete persisted replay assessment;
-- storage-independent cancellation escalation, bounded event-sink delivery, best-effort worker
-  IPC, and an admission fence after ambiguous external effects;
+- storage-independent cancellation escalation, bounded event-sink delivery, and best-effort worker
+  IPC;
 - journal format v2 containing every root/nested workflow identity, with inherited lineage seeded
   before a successor manifest is published and version-1 migration on open;
 - canonical top-level/nested source confinement, symlink-root rejection, no-follow authoring, and
@@ -85,8 +87,23 @@ Implemented in the 2026-07-16 audit-hardening slice:
 - an embedder-owned pre-attempt authentication hook and exact executable evidence in attempt
   diagnostics. Agent Code uses the hook to single-flight OAuth rotation and hand children an
   access-only snapshot; standalone hosts must supply equivalent policy if they copy credentials;
-- explicit remaining limitation: no automatic production Codex replay is safe until native
-  process containment and effective-config inspection land.
+- explicit remaining limitation: mutation-capable attempts still cannot claim exactly-once effects
+  without native process containment and a durable external-effect ledger.
+
+Implemented in the unattended best-effort completion slice:
+
+- agent-local infrastructure, contract, timeout, and replay-ambiguity failures return a versioned
+  `__workflowAgentFailure` value instead of rejecting the complete orchestration;
+- every retry starts a fresh provider thread while retaining logical assignment identity, recovery
+  context, audit events, and the stable isolated workspace;
+- `recovery_required` is an assignment terminal, never a run-wide admission fence; independent
+  agents, nested workflows, and final synthesis remain admissible;
+- `run.completed` carries a backwards-compatible error flag projected as
+  `completed_with_errors`; `run.failed` remains reserved for persistence and supervisor failure;
+- a deterministic 200-assignment soak injects safe retries, terminal contract failures, unsafe
+  ambiguity, and final synthesis under the default nine-way ceiling;
+- unconfirmed-descendant timeout coverage proves that effect-safe work retries without retaining a
+  permanent scheduler/store fence, while explicit service cancellation retains the ownership fence.
 
 ## Executive summary
 

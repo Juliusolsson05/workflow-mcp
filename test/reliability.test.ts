@@ -35,6 +35,16 @@ function collect(run: WorkflowRun): Promise<WorkflowEvent[]> {
   })()
 }
 
+function expectFailurePlaceholder(status: 'failed' | 'recovery_required' = 'failed') {
+  return expect.objectContaining({
+    __workflowAgentFailure: expect.objectContaining({
+      schemaVersion: 1,
+      status,
+      coverageGap: true,
+    }),
+  })
+}
+
 const FAST_RETRY = {
   maxAttempts: 3,
   startupTimeoutMs: 100,
@@ -148,17 +158,14 @@ describe('unattended workflow reliability', () => {
     expect(maximumGlobalActive).toBe(3)
   })
 
-  it('retries one retryable logical agent on the same provider session', async () => {
+  it('retries one retryable logical agent in a fresh provider session', async () => {
     const source = workflow(`return await agent('retry me')`)
     const provider = new FakeAgentProvider([
       {
         sessionId: 'durable-session',
         outcome: { type: 'provider-failure', message: 'temporary stream loss', code: 'stream', retryable: true },
       },
-      {
-        expect: { sessionId: 'durable-session' },
-        outcome: { type: 'result', output: { type: 'text', text: 'recovered' } },
-      },
+      { outcome: { type: 'result', output: { type: 'text', text: 'recovered' } } },
     ])
     const run = runWorkflow({
       workflow: source,
@@ -173,11 +180,11 @@ describe('unattended workflow reliability', () => {
     const captured = await events
     const state = projectWorkflowState(run.id, captured)
     expect(state.agents[0]?.attempts.map((attempt) => attempt.status)).toEqual(['failed', 'completed'])
-    expect(state.agents[0]?.outcome?.source).toBe('provider-resume')
+    expect(state.agents[0]?.outcome?.source).toBe('live')
     expect(captured.some((event) => event.type === 'agent.retry_scheduled')).toBe(true)
     expect(captured.some((event) => event.type === 'agent.recovery_started')).toBe(true)
     expect(captured.some((event) => event.type === 'agent.recovery_completed')).toBe(true)
-    expect(provider.calls[1]?.request.session?.id).toBe('durable-session')
+    expect(provider.calls[1]?.request.session).toBeUndefined()
     expect(provider.calls[1]?.request.recovery?.note).toContain('previous turn was interrupted')
   })
 
@@ -255,7 +262,7 @@ describe('unattended workflow reliability', () => {
       reliability: { ...FAST_RETRY, maxAttempts: 1, circuitBreakerThreshold: 1 },
     })
 
-    await expect(run.result).resolves.toBeNull()
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder())
     expect(circuit.snapshot()).toEqual({ state: 'closed', recentFailures: 0 })
   })
 
@@ -297,7 +304,7 @@ describe('unattended workflow reliability', () => {
     // is one failed outage call plus two post-cooldown starts, not an ordering promise between the
     // two independent successful tasks.
     await expect(run.result).resolves.toEqual(expect.arrayContaining([
-      null,
+      expectFailurePlaceholder(),
       'recovered-1',
       'recovered-2',
     ]))
@@ -319,12 +326,12 @@ describe('unattended workflow reliability', () => {
     })
     const events = collect(run)
 
-    await expect(run.result).resolves.toBeNull()
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder())
     expect(provider.calls).toHaveLength(2)
     expect((await events).filter((event) => event.type === 'agent.retry_scheduled')).toHaveLength(1)
   })
 
-  it('rejects provider contract failures instead of reporting a successful null slot', async () => {
+  it('reports provider contract failures as honest coverage gaps', async () => {
     const provider: AgentProvider = {
       name: 'contract-provider',
       execute: async () => {
@@ -340,7 +347,9 @@ describe('unattended workflow reliability', () => {
       provider,
     })
 
-    await expect(run.result).rejects.toMatchObject({ code: 'structured-output-invalid' })
+    const events = collect(run)
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder())
+    expect(projectWorkflowState(run.id, await events).status).toBe('completed_with_errors')
   })
 
   it('reserves one shared retry slot atomically across concurrent failures', async () => {
@@ -366,7 +375,10 @@ describe('unattended workflow reliability', () => {
     })
     const events = collect(run)
 
-    await expect(run.result).resolves.toEqual(expect.arrayContaining([null, 'only reserved retry']))
+    await expect(run.result).resolves.toEqual(expect.arrayContaining([
+      expectFailurePlaceholder(),
+      'only reserved retry',
+    ]))
     expect(provider.calls).toHaveLength(4)
     expect((await events).filter((event) => event.type === 'agent.retry_scheduled')).toHaveLength(1)
   })
@@ -393,7 +405,7 @@ describe('unattended workflow reliability', () => {
     })
 
     const events = collect(run)
-    await expect(run.result).rejects.toMatchObject({ code: 'agent-recovery-required' })
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder('recovery_required'))
     expect(calls).toBe(1)
     const state = projectWorkflowState(run.id, await events)
     expect(state.agents[0]?.status).toBe('recovery_required')
@@ -401,22 +413,24 @@ describe('unattended workflow reliability', () => {
     expect(state.counts.running).toBe(0)
   })
 
-  it('closes agent and nested-workflow admission after an ambiguous effect', async () => {
+  it('keeps later agents and synthesis admissible after an ambiguous effect', async () => {
     let calls = 0
     let nestedResolutions = 0
     const provider: AgentProvider = {
       name: 'unknown-effects',
       execute: async () => {
         calls += 1
+        if (calls > 1) return { output: { type: 'text', text: `healthy-${calls}` } }
         throw new AgentProviderFailure('lost response after possible mutation', { retryable: true })
       },
     }
     const run = runWorkflow({
       workflow: workflow(`
-        await agent('ambiguous first call').catch(() => null)
-        await agent('must never be admitted').catch(() => null)
-        await workflow('must-never-resolve').catch(() => null)
-        return 'unreachable success'
+        const casualty = await agent('ambiguous first call')
+        const sibling = await agent('healthy sibling')
+        const nested = await workflow('healthy-child')
+        const synthesis = await agent('final synthesis ' + JSON.stringify({ casualty, sibling, nested }))
+        return { casualty, sibling, nested, synthesis }
       `),
       cwd: process.cwd(),
       provider,
@@ -424,15 +438,22 @@ describe('unattended workflow reliability', () => {
       reliability: FAST_RETRY,
       resolveWorkflow: async () => {
         nestedResolutions += 1
-        return workflow(`return 'child'`, 'must-never-resolve')
+        return workflow(`return 'child'`, 'healthy-child')
       },
     })
     const events = collect(run)
 
-    await expect(run.result).rejects.toMatchObject({ code: 'agent-recovery-required' })
-    expect(calls).toBe(1)
-    expect(nestedResolutions).toBe(0)
-    expect(projectWorkflowState(run.id, await events).counts.total).toBe(1)
+    await expect(run.result).resolves.toEqual({
+      casualty: expectFailurePlaceholder('recovery_required'),
+      sibling: 'healthy-2',
+      nested: 'child',
+      synthesis: 'healthy-3',
+    })
+    expect(calls).toBe(3)
+    expect(nestedResolutions).toBe(1)
+    const state = projectWorkflowState(run.id, await events)
+    expect(state.status).toBe('completed_with_errors')
+    expect(state.counts.total).toBe(3)
   })
 
   it('preserves an isolated workspace when an ambiguous attempt requires recovery', async () => {
@@ -457,7 +478,7 @@ describe('unattended workflow reliability', () => {
     })
     const events = collect(run)
 
-    await expect(run.result).rejects.toMatchObject({ code: 'agent-recovery-required' })
+    await expect(run.result).resolves.toEqual(expectFailurePlaceholder('recovery_required'))
     expect(cleanups).toBe(0)
     expect(await events).toContainEqual(expect.objectContaining({
       type: 'warning',
@@ -503,10 +524,7 @@ describe('unattended workflow reliability', () => {
     const source = workflow(`return await agent('stall then recover')`)
     const provider = new FakeAgentProvider([
       { sessionId: 'stalled-session', outcome: { type: 'wait-for-abort' } },
-      {
-        expect: { sessionId: 'stalled-session' },
-        outcome: { type: 'result', output: { type: 'text', text: 'alive' } },
-      },
+      { outcome: { type: 'result', output: { type: 'text', text: 'alive' } } },
     ])
     const run = runWorkflow({
       workflow: source,
@@ -535,10 +553,7 @@ describe('unattended workflow reliability', () => {
         delayMs: 5,
         outcome: { type: 'result', output: { type: 'text', text: `healthy-${index}` } },
       })),
-      {
-        expect: { sessionId: 'silent-session' },
-        outcome: { type: 'result', output: { type: 'text', text: 'silent-recovered' } },
-      },
+      { outcome: { type: 'result', output: { type: 'text', text: 'silent-recovered' } } },
     ])
     const run = runWorkflow({
       workflow: workflow(`
@@ -903,7 +918,7 @@ describe('unattended workflow reliability', () => {
       },
     })
 
-    await expect(run.result).resolves.toEqual(['preparation-failed-0', 'second prepared'])
+    await expect(run.result).resolves.toEqual([expectFailurePlaceholder(), 'second prepared'])
     await run.waitForOwnershipRelease?.()
     expect(maxActivePreparations).toBe(1)
     expect(preparationStarts[1]! - preparationStarts[0]!).toBeGreaterThanOrEqual(25)

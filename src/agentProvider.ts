@@ -219,10 +219,9 @@ export type AgentProviderFailureOptions = {
    */
   circuitImpact?: 'infrastructure' | 'neutral'
   /**
-   * Claude compatibility historically turns ordinary terminal provider failures into a null slot.
-   * Contract failures are different: treating malformed schema output as success lets a top-level
-   * workflow complete with a value which never satisfied its declared API. Providers must opt in
-   * explicitly so transport/rate-limit failures retain the portable null-slot behavior.
+   * Kept on the provider wire for backwards compatibility with older hosts. The unattended
+   * supervisor now returns a versioned failure placeholder for both dispositions: malformed
+   * contract output is a coverage gap for synthesis, not permission to terminate every sibling.
    */
   terminalDisposition?: 'null-slot' | 'reject'
   providerSession?: ProviderSessionReference
@@ -230,9 +229,9 @@ export type AgentProviderFailureOptions = {
 }
 
 /**
- * A terminal API/provider failure is intentionally different from an ordinary JavaScript error.
- * Claude-compatible `agent()` handling turns the former into a logged null result while allowing
- * programming errors in an adapter or fake setup to reject the workflow call.
+ * A terminal API/provider failure carries retry and circuit policy across adapter boundaries.
+ * The workflow supervisor turns an exhausted instance into a versioned coverage-gap result so
+ * unattended siblings and final synthesis can continue without mistaking failure for null data.
  */
 export class AgentProviderFailure extends Error {
   readonly code?: string
