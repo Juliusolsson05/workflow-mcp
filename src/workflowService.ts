@@ -315,7 +315,8 @@ export class WorkflowService {
               // A lone run.interrupted event is the recovery record for a cursor-zero queued run.
               // No evaluator or provider was ever admitted, so continuing it cannot repeat a tool
               // side effect even when the provider correctly refuses general automatic replay.
-              manifest.cursor === 1
+              // The operator's explicit initialization opt-out still wins over that safety fact.
+              (this.#recovery.autoResumeOnInitialize && manifest.cursor === 1)
             )
           ) recoverable.push(manifest)
           continue

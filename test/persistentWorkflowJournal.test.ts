@@ -34,6 +34,7 @@ describe('PersistentWorkflowJournal', () => {
     run.recordResult(second, { value: 'two-result' })
 
     const reopened = await PersistentWorkflowJournal.open(filePath, [imported])
+    expect(reopened.getSnapshot(identity.workflowId)?.records).toHaveLength(4)
     const resumed = reopened.beginRun(identity)
     expect(resumed.admit({ agentId: 'next-first', prompt: 'one' })).toMatchObject({
       reused: true,

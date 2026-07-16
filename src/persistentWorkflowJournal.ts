@@ -139,11 +139,27 @@ export function writeInitialWorkflowJournal(
 }
 
 function mergeSnapshots(primary: JournalSnapshot, fallback: JournalSnapshot): JournalSnapshot {
+  const primaryKeys = new Set(primary.records.map((record) => record.key))
+  const sessionIdentity = (record: JournalSessionRecord): string => (
+    `${record.key}\0${record.agentId}\0${record.session.provider}\0${record.session.id}`
+  )
+  const primarySessions = new Set((primary.sessions ?? []).map(sessionIdentity))
   return {
     workflowId: primary.workflowId,
     sourceHash: primary.sourceHash,
-    records: [...primary.records, ...fallback.records],
-    sessions: [...(primary.sessions ?? []), ...(fallback.sessions ?? [])],
+    // WHY merge by call key instead of concatenating whole generations: createRun seeds the
+    // successor sidecar before publishing its manifest, then startLoaded opens that same sidecar
+    // with the inherited snapshot as a crash fallback. Blind concatenation doubled every record on
+    // every recovery. A key already present in the primary is the newer generation's authority;
+    // only untouched fallback keys are needed to preserve a sparse tail after a partial replay.
+    records: [
+      ...primary.records,
+      ...fallback.records.filter((record) => !primaryKeys.has(record.key)),
+    ],
+    sessions: [
+      ...(primary.sessions ?? []),
+      ...(fallback.sessions ?? []).filter((record) => !primarySessions.has(sessionIdentity(record))),
+    ],
   }
 }
 

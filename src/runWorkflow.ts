@@ -1153,29 +1153,6 @@ class WorkflowRuntime {
       })
     }
 
-    if (decision.reused) {
-      const value = cloneBoundaryValue(decision.result, this.#limits)
-      await this.#emit({
-        type: 'agent.reused',
-        agentId,
-        ...(phaseId === undefined ? {} : { phaseId }),
-        payload: {
-          source: 'journal',
-          result: contentReference(value, this.#limits),
-          // A JSON scalar is still structured when the call declared a schema. Inferring this from
-          // typeof(value) turns schema-backed strings/numbers into text after journal reuse.
-          structured: normalizedOptions.schema !== undefined,
-        },
-      })
-      this.#send(input.worker, {
-        type: 'agent.result',
-        requestId: input.request.requestId,
-        result: { type: 'success', value },
-        budgetSpent: this.#budgetSpent,
-      })
-      return
-    }
-
     let validateOutput: ValidateFunction | undefined
     if (normalizedOptions.schema !== undefined) {
       try {
@@ -1199,6 +1176,46 @@ class WorkflowRuntime {
         this.#replyAgentError(input.worker, input.request.requestId, schemaError)
         return
       }
+    }
+
+    if (decision.reused) {
+      const value = cloneBoundaryValue(decision.result, this.#limits)
+      if (validateOutput && !validateOutput(value)) {
+        // WHY cached output is revalidated even though the schema participates in the journal key:
+        // older releases accepted malformed structured output, and schemas can gain stricter
+        // runtime behavior after an AJV upgrade. A cache hit is an optimization, not permission to
+        // bypass the workflow's current output contract.
+        const schemaError = new TypeError(
+          `Reused agent output failed schema validation: ${this.#ajv.errorsText(validateOutput.errors)}`,
+        )
+        await this.#emit({
+          type: 'agent.failed',
+          agentId,
+          ...(phaseId === undefined ? {} : { phaseId }),
+          payload: { error: errorReference(schemaError) },
+        })
+        this.#replyAgentError(input.worker, input.request.requestId, schemaError)
+        return
+      }
+      await this.#emit({
+        type: 'agent.reused',
+        agentId,
+        ...(phaseId === undefined ? {} : { phaseId }),
+        payload: {
+          source: 'journal',
+          result: contentReference(value, this.#limits),
+          // A JSON scalar is still structured when the call declared a schema. Inferring this from
+          // typeof(value) turns schema-backed strings/numbers into text after journal reuse.
+          structured: normalizedOptions.schema !== undefined,
+        },
+      })
+      this.#send(input.worker, {
+        type: 'agent.result',
+        requestId: input.request.requestId,
+        result: { type: 'success', value },
+        budgetSpent: this.#budgetSpent,
+      })
+      return
     }
 
     await this.#emit({
@@ -1292,7 +1309,7 @@ class WorkflowRuntime {
                 if (latePrepared.cleanup) await this.#cleanupWorkingDirectory(latePrepared)
               })
               .finally(() => preparationLease.release())
-            this.#quarantineExecution(lateDisposition)
+            this.#quarantineSettlingOperation(lateDisposition)
           }
         }
         if (this.#controller.signal.aborted) throw new WorkflowCancelledError(abortReason(this.#controller.signal))
@@ -1521,11 +1538,11 @@ class WorkflowRuntime {
               }),
             )
             const retrying = this.#reserveRetry(admission, error, attemptNumber, replaySafety)
-            const replayWouldBeUnsafe =
-              error.retryable &&
-              attemptNumber < this.#reliability.maxAttempts &&
-              this.#reliability.automaticRetry !== 'never' &&
-              !replaySafety.automatic
+            // WHY replay safety is independent of whether policy would grant another attempt: a
+            // retryable provider failure means the prior turn may have produced an effect whose
+            // response was lost. Converting that ambiguity to the legacy successful-null result
+            // when retry admission is disabled or exhausted is data corruption.
+            const replayWouldBeUnsafe = error.retryable && !replaySafety.automatic
             if (replayWouldBeUnsafe) {
               preserveWorkspaceForRecovery = true
               await this.#markRecoveryRequired(admission, attemptId, error, replaySafety)
@@ -1917,6 +1934,16 @@ class WorkflowRuntime {
     // the same unsafe handoff this quarantine exists to prevent.
     void quarantine.finally(() => this.#quarantinedExecutions.delete(quarantine)).catch(() => undefined)
     return quarantine
+  }
+
+  #quarantineSettlingOperation(operation: Promise<unknown>): Promise<unknown> {
+    // WHY preparation/cleanup does not use #quarantineExecution: no provider process exists yet,
+    // so the provider's descendant-containment guarantee is irrelevant. The operation promise is
+    // authoritative evidence that the git/filesystem work stopped; replacing it with a permanent
+    // provider fence would retain the store lease forever after a completely successful cleanup.
+    this.#quarantinedExecutions.add(operation)
+    void operation.finally(() => this.#quarantinedExecutions.delete(operation)).catch(() => undefined)
+    return operation
   }
 
   #providerRequest(input: {

@@ -1242,7 +1242,8 @@ Workflow MCP is "safe to leave running" when all of the following are true:
 - an artificial workflow batch barrier is diagnosed clearly instead of being confused with a
   scheduler bug;
 - retries release capacity during backoff and cleanup;
-- cancellation escalates to confirmed process-tree termination;
+- cancellation escalates through the directly owned host/original process group, while descendants
+  which can escape that group remain explicitly unconfirmed and quarantined;
 - completed siblings are not unnecessarily rerun after an exact-source crash recovery;
 - restart recovery is automatic for safe work and explicit for ambiguous side effects;
 - worktree state is durable and dirty work is never silently deleted;

@@ -65,7 +65,7 @@ describe('ProcessOwnedCodexHost', () => {
     })
   })
 
-  it('reaps a host and SIGTERM-ignoring grandchild before the provider attempt settles', async () => {
+  it('reaps a host and SIGTERM-ignoring original-process-group grandchild before the provider attempt settles', async () => {
     if (process.platform === 'win32') return
     const directory = await mkdtemp(join(tmpdir(), 'workflow-provider-tree-'))
     const pidPath = join(directory, 'grandchild.pid')
