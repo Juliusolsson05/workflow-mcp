@@ -237,6 +237,21 @@ describe('CodexAgentProvider', () => {
     }))).toMatchObject({ automatic: false, risk: 'unknown_external' })
   })
 
+  it('never calls danger-full-access replay-safe even inside an isolated worktree', () => {
+    const provider = new CodexAgentProvider({
+      client: mockClient([]).client,
+      capabilities: { inheritedMcpServers: 'disabled', mcpServers: [] },
+    })
+
+    expect(provider.assessReplaySafety(request({
+      sandbox: { mode: 'danger-full-access', approvalPolicy: 'never', network: false },
+    }))).toMatchObject({
+      automatic: false,
+      risk: 'unknown_external',
+      reason: expect.stringMatching(/outside the isolated workspace/i),
+    })
+  })
+
   it('resumes a thread, maps a Claude model alias, prepends agent instructions, and parses schema output', async () => {
     const { client, calls } = mockClient([
       { type: 'thread.started', thread_id: 'thread-old' },

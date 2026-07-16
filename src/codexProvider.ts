@@ -199,6 +199,17 @@ export class CodexAgentProvider implements AgentProvider {
   }
 
   assessReplaySafety(request: AgentRequest): AgentReplaySafetyAssessment {
+    if (request.sandbox.mode === 'danger-full-access') {
+      // WHY a worktree cannot rescue this mode: danger-full-access is explicitly allowed to mutate
+      // paths outside the isolated checkout. Replaying after a lost response can therefore repeat
+      // an external filesystem effect even with network and MCP disabled. Only workspace-write is
+      // eligible for the runtime's stable-worktree replay policy.
+      return {
+        automatic: false,
+        risk: 'unknown_external',
+        reason: 'Danger-full-access execution can mutate paths outside the isolated workspace',
+      }
+    }
     if (request.sandbox.network) {
       return {
         automatic: false,

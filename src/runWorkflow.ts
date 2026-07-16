@@ -50,6 +50,7 @@ import type {
   WorkflowEventSink,
   WorkflowAgentFailurePlaceholder,
 } from './workflowEvents.js'
+import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 import type {
   ParentToWorkerMessage,
   SerializedWorkerError,
@@ -1191,6 +1192,24 @@ class WorkflowRuntime {
     if (decision.reused) {
       const value = cloneBoundaryValue(decision.result, this.#limits)
       const reusedCoverageGap = decision.coverageGap === true
+      let coverageGapDisposition
+      if (reusedCoverageGap) {
+        if (!isWorkflowAgentFailurePlaceholder(value)) {
+          // The journal implementations reject this earlier. Keep a final runtime assertion because
+          // WorkflowJournal is injectable and a custom adapter must not gain schema-bypass authority
+          // merely by returning `coverageGap: true` beside arbitrary data.
+          throw new Error('Workflow journal returned an invalid coverage-gap placeholder')
+        }
+        coverageGapDisposition = {
+          status: value.__workflowAgentFailure.status,
+          error: {
+            message: value.__workflowAgentFailure.message,
+            ...(value.__workflowAgentFailure.code === undefined
+              ? {}
+              : { code: value.__workflowAgentFailure.code }),
+          },
+        }
+      }
       if (validateOutput && !reusedCoverageGap && !validateOutput(value)) {
         // WHY cached output is revalidated even though the schema participates in the journal key:
         // older releases accepted malformed structured output, and schemas can gain stricter
@@ -1218,6 +1237,9 @@ class WorkflowRuntime {
           // A JSON scalar is still structured when the call declared a schema. Inferring this from
           // typeof(value) turns schema-backed strings/numbers into text after journal reuse.
           structured: normalizedOptions.schema !== undefined,
+          ...(coverageGapDisposition === undefined
+            ? {}
+            : { coverageGap: coverageGapDisposition }),
         },
       })
       // WHY a coverage gap bypasses the declared provider-output schema: it is supervisor metadata,
@@ -1229,7 +1251,11 @@ class WorkflowRuntime {
       this.#send(input.worker, {
         type: 'agent.result',
         requestId: input.request.requestId,
-        result: { type: 'success', value },
+        result: {
+          type: 'success',
+          value,
+          ...(reusedCoverageGap ? { coverageGap: true } : {}),
+        },
         budgetSpent: this.#budgetSpent,
       })
       return
@@ -1265,6 +1291,7 @@ class WorkflowRuntime {
     let lastAttemptId: string | undefined
     let lastAttemptNumber = 0
     let lastAttemptOpen = false
+    const unconfirmedRetryAbortListeners = new Set<() => void>()
     let providerSession = admission.journalMiss.providerSession?.provider === this.#options.provider.name
       ? admission.journalMiss.providerSession
       : undefined
@@ -1315,11 +1342,19 @@ class WorkflowRuntime {
             ])
           } catch (cause) {
             if (this.#controller.signal.aborted) throw cause
-            throw new AgentAssignmentFailure(
-              'worktree-preparation-failed',
-              `Working-directory preparation failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-              { cause },
-            )
+            if (preparationController.signal.aborted) {
+              throw new AgentAssignmentFailure(
+                'worktree-preparation-timeout',
+                `Working-directory preparation timed out: ${cause instanceof Error ? cause.message : String(cause)}`,
+                { cause },
+              )
+            }
+            // WHY arbitrary preparer failures remain supervisor-fatal: the host owns deterministic
+            // recovery paths and repository identity. A collision/corruption exception is not a
+            // disposable model attempt, and continuing sibling writers after it can compound the
+            // damage. Missing capability and bounded timeout are explicitly classified above;
+            // everything else fails closed until hosts expose a narrower typed availability error.
+            throw cause
           }
         } finally {
           preparationAbort.dispose()
@@ -1578,6 +1613,27 @@ class WorkflowRuntime {
               return
             }
 
+            // Effect safety authorizes a fresh read-only attempt, but it does not prove the old
+            // credentialed descendant exited. If the run is cancelled before this logical agent
+            // finishes, ownership may transfer to another supervisor; promote every still-
+            // ambiguous physical attempt into the permanent process-lifetime fence in that case.
+            // The listener is installed before any awaited retry event so event-sink cancellation
+            // cannot slip through the handoff window.
+            const fenceUnconfirmedAttemptOnAbort = () => {
+              this.#quarantineExecution(error.execution)
+            }
+            unconfirmedRetryAbortListeners.add(fenceUnconfirmedAttemptOnAbort)
+            if (this.#controller.signal.aborted) fenceUnconfirmedAttemptOnAbort()
+            else this.#controller.signal.addEventListener('abort', fenceUnconfirmedAttemptOnAbort, { once: true })
+
+            previousAttemptId = attemptId
+            recovery = recoveryContext(failure, attemptNumber)
+            // Publishing agent.failed promises a fresh physical attempt. Persist removal of the
+            // poisoned provider-session pointer before that awaited event so a host crash cannot
+            // recover into the very thread the audit stream says was abandoned.
+            admission.journalRun.discardProviderSession(admission.journalMiss)
+            providerSession = undefined
+
             // WHY only a retry gets agent.failed here: without `retrying: true` that event is
             // terminal and may close the phase before the more accurate recovery_required event.
             // An abandoned ambiguous attempt has exactly one terminal classification; the failed
@@ -1590,10 +1646,6 @@ class WorkflowRuntime {
               payload: { error: errorReference(failure), retrying: true },
             })
 
-            previousAttemptId = attemptId
-            recovery = recoveryContext(failure, attemptNumber)
-            admission.journalRun.discardProviderSession(admission.journalMiss)
-            providerSession = undefined
             const delayMs = retryDelayMs(this.#reliability, attemptNumber)
             await this.#emit({
               type: 'agent.retry_scheduled',
@@ -1681,6 +1733,13 @@ class WorkflowRuntime {
               return
             }
 
+            previousAttemptId = attemptId
+            recovery = recoveryContext(error, attemptNumber)
+            // Keep the durable fresh-thread boundary ahead of retry diagnostics for the same crash
+            // ordering reason as the unconfirmed-termination branch above.
+            admission.journalRun.discardProviderSession(admission.journalMiss)
+            providerSession = undefined
+
             await this.#emit({
               type: 'agent.failed',
               agentId: admission.agentId,
@@ -1689,14 +1748,6 @@ class WorkflowRuntime {
               payload: { error: errorReference(error), retrying: true },
             })
 
-            previousAttemptId = attemptId
-            recovery = recoveryContext(error, attemptNumber)
-            // A retry is a new physical attempt at the same logical assignment. Reusing the
-            // provider thread is precisely what makes a missing/corrupt stream poison every later
-            // attempt. Durable events retain the old thread for audit, while the journal's active
-            // resume pointer is deleted and the recovery note carries useful context forward.
-            admission.journalRun.discardProviderSession(admission.journalMiss)
-            providerSession = undefined
             const delayMs = retryDelayMs(this.#reliability, attemptNumber)
             const retryAt = new Date(Date.now() + delayMs).toISOString()
             await this.#emit({
@@ -1761,6 +1812,10 @@ class WorkflowRuntime {
         throw error
       }
     } finally {
+      for (const listener of unconfirmedRetryAbortListeners) {
+        this.#controller.signal.removeEventListener('abort', listener)
+      }
+      unconfirmedRetryAbortListeners.clear()
       try {
         const cleanup = prepared?.cleanup && !preserveWorkspaceForRecovery
           ? await this.#cleanupWorkingDirectory(prepared)
@@ -1848,7 +1903,7 @@ class WorkflowRuntime {
         // locks. Preserve both the real concurrency count and the cross-process ownership fence
         // until the cleanup promise—not its AbortSignal—confirms settlement.
         const lateCleanup = observedCleanup.finally(() => cleanupLease.release())
-        this.#quarantineExecution(lateCleanup)
+        this.#quarantineSettlingOperation(lateCleanup)
       }
     }
   }
@@ -1971,7 +2026,10 @@ class WorkflowRuntime {
           {
             code: 'provider-execution-failed',
             retryable: true,
-            circuitImpact: 'infrastructure',
+            // An untyped adapter exception proves only that this physical attempt broke. Providers
+            // must opt known outages into infrastructure impact; otherwise one malformed request
+            // can open the shared circuit and starve every healthy independent assignment.
+            circuitImpact: 'neutral',
             cause: error,
           },
         )
@@ -2212,7 +2270,10 @@ class WorkflowRuntime {
     this.#completeWorkerRequest(admission.worker, admission.requestId, {
       type: 'agent.result',
       requestId: admission.requestId,
-      result: { type: 'success', value: placeholder },
+      // The public placeholder remains visible to synthesis, but the evaluator receives an
+      // out-of-band provenance bit so user-controlled structured output cannot impersonate it and
+      // suppress later pipeline stages.
+      result: { type: 'success', value: placeholder, coverageGap: true },
       budgetSpent: this.#budgetSpent,
     })
   }

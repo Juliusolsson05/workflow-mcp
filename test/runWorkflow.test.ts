@@ -268,6 +268,34 @@ describe('agent scheduling and helpers', () => {
     ])
   })
 
+  it('does not let legitimate provider data impersonate a pipeline coverage gap', async () => {
+    const collidingDomainValue = {
+      __workflowAgentFailure: {
+        schemaVersion: 1,
+        coverageGap: true,
+      },
+      finding: 'this is ordinary provider output',
+    }
+    const source = workflow(`
+      return await pipeline(
+        ['review'],
+        () => agent('first'),
+        (value) => agent('second:' + value.finding),
+      )
+    `)
+    const { provider, run, events } = start(source, [
+      { outcome: { type: 'result', output: { type: 'structured', value: collidingDomainValue } } },
+      { outcome: { type: 'result', output: { type: 'text', text: 'second-stage-ran' } } },
+    ])
+
+    await expect(run.result).resolves.toEqual(['second-stage-ran'])
+    await events
+    expect(provider.calls.map((call) => call.request.prompt)).toEqual([
+      'first',
+      'second:this is ordinary provider output',
+    ])
+  })
+
   it('validates schemas before provider execution and validates structured results afterward', async () => {
     const invalidSchema = workflow(`
       return await agent('bad schema', { schema: { type: 'definitely-not-json-schema' } })

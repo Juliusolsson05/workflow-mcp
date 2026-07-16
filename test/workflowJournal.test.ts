@@ -107,10 +107,14 @@ describe('InMemoryWorkflowJournal', () => {
       __workflowAgentFailure: {
         schemaVersion: 1,
         agentId: 'casualty',
+        label: 'casualty',
         status: 'recovery_required',
+        message: 'fixture coverage gap',
+        attempts: 1,
         coverageGap: true,
       },
     }
+    first.recordProviderSession(decision, { provider: 'codex', id: 'poisoned-gap-thread' })
     first.recordResult(decision, placeholder, { successful: false, coverageGap: true })
 
     const automatic = journal.beginRun(identity, { reuseCoverageGaps: true })
@@ -129,7 +133,36 @@ describe('InMemoryWorkflowJournal', () => {
       reuseMode: 'exact-source-sparse',
       reuseCoverageGaps: false,
     })
-    expect(manual.admit({ agentId: 'manual', prompt: 'inspect unsafe state' }).reused).toBe(false)
+    expect(manual.admit({ agentId: 'manual', prompt: 'inspect unsafe state' })).toMatchObject({
+      reused: false,
+    })
+    expect(manual.snapshot().sessions).toBeUndefined()
+  })
+
+  it('rejects malformed imported and newly recorded coverage gaps', () => {
+    const key = createJournalKey('', 'corrupt')
+    expect(() => new InMemoryWorkflowJournal([{
+      ...identity,
+      records: [
+        { type: 'started', key, agentId: 'old' },
+        {
+          type: 'result',
+          key,
+          agentId: 'old',
+          result: 'not a placeholder',
+          successful: false,
+          coverageGap: true,
+        },
+      ],
+    }])).toThrow(/coverage-gap results/i)
+
+    const journal = new InMemoryWorkflowJournal()
+    const run = journal.beginRun(identity)
+    const decision = run.admit({ agentId: 'new', prompt: 'corrupt' }) as JournalMiss
+    expect(() => run.recordResult(decision, 'not a placeholder', {
+      successful: false,
+      coverageGap: true,
+    })).toThrow(/coverage-gap results/i)
   })
 
   it('durably discards an abandoned provider session before a fresh retry', () => {

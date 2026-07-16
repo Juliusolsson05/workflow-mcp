@@ -4,6 +4,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 import type { ProviderSessionReference } from './agentProvider.js'
+import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 import {
   InMemoryWorkflowJournal,
   type JournalCall,
@@ -409,6 +410,19 @@ function parseRecord(value: unknown, filePath: string, index: number): JournalRe
     throw new PersistentJournalError(
       'invalid-record',
       `Workflow journal result ${index + 1} has an invalid coverage-gap marker: ${filePath}`,
+    )
+  }
+  if (
+    value.coverageGap === true &&
+    (value.successful !== false || !isWorkflowAgentFailurePlaceholder(value.result))
+  ) {
+    // WHY a valid boolean is insufficient: `coverageGap` is a recovery capability bit. It skips
+    // provider-output schema validation and prevents automatic replay, so pairing it with arbitrary
+    // JSON would let a damaged sidecar silently inject data into workflow synthesis. Persistence
+    // corruption is one of the few intentionally run-fatal conditions; reject it at open time.
+    throw new PersistentJournalError(
+      'invalid-record',
+      `Workflow journal result ${index + 1} has an invalid coverage-gap value: ${filePath}`,
     )
   }
   return {

@@ -1076,13 +1076,35 @@ export class WorkflowService {
     ) return false
 
     const snapshot = await this.#options.store.snapshot(manifest.runId)
-    const unresolvedAttempts = snapshot.state.agents.flatMap((agent) => (
-      agent.attempts.filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+    const unresolvedAgents = snapshot.state.agents.filter((agent) => (
+      agent.attempts.some((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
     ))
+    const journal = await PersistentWorkflowJournal.open(
+      this.#options.store.journalPath(manifest.runId),
+    )
+    const terminalJournalCalls = new Set(
+      journal.getSnapshots().flatMap((journalSnapshot) => (
+        journalSnapshot.records.flatMap((record) => (
+          record.type === 'result' ? [`${record.key}\0${record.agentId}`] : []
+        ))
+      )),
+    )
     // WHY legacy attempts without request evidence fail closed: provider-wide safety cannot prove
     // that this particular call had no network access, shared-worktree mutation, or expanded tool
     // capability. New runs persist the concrete assessment in agent.started before dispatch.
-    return unresolvedAttempts.every((attempt) => attempt.replaySafety?.automatic === true)
+    //
+    // WHY a terminal journal result overrides stale event state: result/session disposition is one
+    // atomic recovery commit, but the subsequent agent.completed/recovery_required event is a
+    // separate append. A crash between them leaves projection saying "running" even though the
+    // successor will reuse the durable result and never replay the physical attempt. Requiring
+    // replay safety in that window strands final synthesis, especially for intentionally unsafe
+    // coverage gaps. Only unresolved calls without a terminal journal value need replay authority.
+    return unresolvedAgents.every((agent) => (
+      terminalJournalCalls.has(`${agent.cacheKey}\0${agent.id}`) ||
+      agent.attempts
+        .filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+        .every((attempt) => attempt.replaySafety?.automatic === true)
+    ))
   }
 
   async #releaseStoreLease(): Promise<void> {

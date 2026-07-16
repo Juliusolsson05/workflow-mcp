@@ -198,4 +198,32 @@ describe('PersistentWorkflowJournal', () => {
       PersistentWorkflowJournal.open(validPath, [{ ...identity, sourceHash: 'changed', records: [] }]),
     ).rejects.toMatchObject<Partial<PersistentJournalError>>({ code: 'source-mismatch' })
   })
+
+  it('rejects a coverage-gap capability bit paired with corrupt result data', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-persistent-corrupt-gap-'))
+    const filePath = join(root, 'resume.json')
+    const key = createJournalKey('', 'corrupt gap')
+    await writeFile(filePath, `${JSON.stringify({
+      format: 'workflow-mcp-journal',
+      version: 2,
+      snapshots: [{
+        ...identity,
+        records: [
+          { type: 'started', key, agentId: 'casualty' },
+          {
+            type: 'result',
+            key,
+            agentId: 'casualty',
+            result: 'corrupt',
+            successful: false,
+            coverageGap: true,
+          },
+        ],
+      }],
+    })}\n`)
+
+    await expect(PersistentWorkflowJournal.open(filePath)).rejects.toMatchObject<
+      Partial<PersistentJournalError>
+    >({ code: 'invalid-record' })
+  })
 })

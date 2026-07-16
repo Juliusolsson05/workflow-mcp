@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 
 import type { ProviderSessionReference } from './agentProvider.js'
+import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 
 const EXECUTION_OPTION_KEYS = ['schema', 'model', 'effort', 'isolation', 'agentType'] as const
 const OMIT = Symbol('omit-from-journal-key')
@@ -217,11 +218,25 @@ type HistoricalCall = {
   providerSession?: ProviderSessionReference
 }
 
+function assertCoverageGapRecord(record: JournalRecord): void {
+  if (record.type !== 'result' || record.coverageGap !== true) return
+  if (record.successful !== false || !isWorkflowAgentFailurePlaceholder(record.result)) {
+    // WHY this guard also lives in the in-memory implementation: imported snapshots are a public
+    // recovery seam and do not necessarily pass through PersistentWorkflowJournal's JSON parser.
+    // A coverage-gap bit authorizes schema bypass and automatic reuse, so accepting a partial marker
+    // here would make an in-memory fallback less trustworthy than the on-disk source it mirrors.
+    throw new TypeError(
+      'Journal coverage-gap results must be unsuccessful versioned workflow failure placeholders',
+    )
+  }
+}
+
 function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
   const calls: HistoricalCall[] = []
   const pending = new Map<string, HistoricalCall[]>()
 
   for (const record of snapshot.records) {
+    assertCoverageGapRecord(record)
     const recordId = `${record.key}\0${record.agentId}`
     if (record.type === 'started') {
       const call: HistoricalCall = {
@@ -428,8 +443,12 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       throw new Error('Journal result does not belong to an unfinished call in this run')
     }
 
-    pending.completed = true
     if (options.coverageGap === true) {
+      if (options.successful !== false || !isWorkflowAgentFailurePlaceholder(result)) {
+        throw new TypeError(
+          'Journal coverage-gap results must be unsuccessful versioned workflow failure placeholders',
+        )
+      }
       // WHY terminal disposition and session invalidation share one journal mutation: a durable
       // adapter persists recordResult only after this method returns. Performing a separate
       // discard first leaves a crash window containing an unfinished call with no session, which
@@ -442,6 +461,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
         }
       }
     }
+    pending.completed = true
     this.#records.push({
       type: 'result',
       key: pending.key,
@@ -467,7 +487,10 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
   readonly #snapshots = new Map<string, JournalSnapshot>()
 
   constructor(snapshots: Iterable<JournalSnapshot> = []) {
-    for (const snapshot of snapshots) this.#snapshots.set(snapshot.workflowId, copySnapshot(snapshot))
+    for (const snapshot of snapshots) {
+      for (const record of snapshot.records) assertCoverageGapRecord(record)
+      this.#snapshots.set(snapshot.workflowId, copySnapshot(snapshot))
+    }
   }
 
   beginRun(

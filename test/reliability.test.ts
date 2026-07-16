@@ -208,6 +208,68 @@ describe('unattended workflow reliability', () => {
     ])
   })
 
+  it('removes a poisoned session before publishing the retrying failure event', async () => {
+    const source = workflow(`return await agent('retry atomically')`)
+    const journal = new InMemoryWorkflowJournal()
+    let sessionPresentAtRetryEvent = true
+    const run = runWorkflow({
+      workflow: source,
+      cwd: process.cwd(),
+      provider: new FakeAgentProvider([
+        {
+          sessionId: 'poisoned-session',
+          outcome: { type: 'provider-failure', message: 'stream broke', retryable: true },
+        },
+        { outcome: { type: 'result', output: { type: 'text', text: 'fresh success' } } },
+      ]),
+      journal,
+      sandbox: { mode: 'read-only' },
+      reliability: FAST_RETRY,
+      eventSink: (event) => {
+        if (event.type === 'agent.failed' && event.payload.retrying === true) {
+          sessionPresentAtRetryEvent = (journal.getSnapshot(source.meta.name)?.sessions?.length ?? 0) > 0
+        }
+      },
+    })
+
+    await expect(run.result).resolves.toBe('fresh success')
+    expect(sessionPresentAtRetryEvent).toBe(false)
+  })
+
+  it('keeps raw request-local provider errors neutral to the shared outage circuit', async () => {
+    let calls = 0
+    const provider: AgentProvider = {
+      name: 'request-local-error-provider',
+      automaticReplaySafety: 'safe',
+      execute: async () => {
+        calls += 1
+        if (calls === 1) throw new Error('malformed response for one request')
+        return { output: { type: 'text', text: 'healthy sibling completed' } }
+      },
+    }
+    const circuit = new ProviderCircuitBreaker({
+      circuitBreakerThreshold: 1,
+      circuitBreakerWindowMs: 1_000,
+      circuitBreakerCooldownMs: 1_000,
+    })
+    const run = runWorkflow({
+      workflow: workflow(`return await parallel([() => agent('bad'), () => agent('good')])`),
+      cwd: process.cwd(),
+      provider,
+      circuitBreaker: circuit,
+      limits: { concurrency: 1 },
+      sandbox: { mode: 'read-only', network: false },
+      reliability: { ...FAST_RETRY, maxAttempts: 1 },
+    })
+
+    await expect(run.result).resolves.toEqual([
+      expectFailurePlaceholder(),
+      'healthy sibling completed',
+    ])
+    expect(calls).toBe(2)
+    expect(circuit.snapshot().state).toBe('closed')
+  })
+
   it('treats an unsolicited provider abort as a disposable attempt rather than run cancellation', async () => {
     let calls = 0
     const provider: AgentProvider = {
@@ -716,6 +778,42 @@ describe('unattended workflow reliability', () => {
     expect(run.ownershipReleaseSafe?.()).toBe(false)
   })
 
+  it('promotes an unconfirmed retry to the ownership fence when cancellation lands in its event sink', async () => {
+    let abort!: () => void
+    const signalController = new AbortController()
+    abort = () => signalController.abort(new Error('cancel from retry event'))
+    let calls = 0
+    const provider: AgentProvider = {
+      name: 'unconfirmed-retry-event-cancellation',
+      terminationBoundary: 'unconfirmed-descendants',
+      automaticReplaySafety: 'safe',
+      execute: () => {
+        calls += 1
+        return new Promise<AgentProviderResult>(() => undefined)
+      },
+    }
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('cancel retry handoff')`),
+      cwd: process.cwd(),
+      provider,
+      signal: signalController.signal,
+      sandbox: { mode: 'read-only' },
+      limits: { cancellationGraceMs: 2 },
+      reliability: {
+        ...FAST_RETRY,
+        startupTimeoutMs: 5,
+        hardTerminationGraceMs: 2,
+      },
+      eventSink: (event) => {
+        if (event.type === 'agent.failed' && event.payload.retrying === true) abort()
+      },
+    })
+
+    await expect(run.result).rejects.toThrow(/cancel from retry event/i)
+    expect(calls).toBe(1)
+    expect(run.ownershipReleaseSafe?.()).toBe(false)
+  })
+
   it('charges malformed structured output against the authoritative output-token budget', async () => {
     const run = runWorkflow({
       workflow: workflow(`
@@ -1038,15 +1136,22 @@ describe('unattended workflow reliability', () => {
     const cleanupStarts: number[] = []
     let activeCleanups = 0
     let maxActiveCleanups = 0
+    const fake = new FakeAgentProvider([
+      { outcome: { type: 'result', output: { type: 'text', text: 'one' } } },
+      { outcome: { type: 'result', output: { type: 'text', text: 'two' } } },
+    ])
+    const provider: AgentProvider = {
+      name: fake.name,
+      terminationBoundary: 'unconfirmed-descendants',
+      automaticReplaySafety: fake.automaticReplaySafety,
+      execute: (request, context) => fake.execute(request, context),
+    }
     const run = runWorkflow({
       workflow: workflow(`
         return await parallel([0, 1].map((index) => () => agent('cleanup-' + index, { isolation: 'worktree' })))
       `),
       cwd: process.cwd(),
-      provider: new FakeAgentProvider([
-        { outcome: { type: 'result', output: { type: 'text', text: 'one' } } },
-        { outcome: { type: 'result', output: { type: 'text', text: 'two' } } },
-      ]),
+      provider,
       prepareWorkingDirectory: async () => ({
         path: root,
         cleanup: async () => {
@@ -1066,6 +1171,7 @@ describe('unattended workflow reliability', () => {
 
     await expect(run.result).resolves.toEqual(['one', 'two'])
     await run.waitForOwnershipRelease?.()
+    expect(run.ownershipReleaseSafe?.()).toBe(true)
     expect(maxActiveCleanups).toBe(1)
     expect(cleanupStarts[1]! - cleanupStarts[0]!).toBeGreaterThanOrEqual(25)
   })
@@ -1124,6 +1230,21 @@ describe('unattended workflow reliability', () => {
     expect(maxActivePreparations).toBe(1)
     expect(preparationStarts[1]! - preparationStarts[0]!).toBeGreaterThanOrEqual(25)
     expect(lateCleanups).toBe(1)
+  })
+
+  it('fails the run when the host worktree preparer reports repository corruption', async () => {
+    const run = runWorkflow({
+      workflow: workflow(`return await agent('unsafe workspace', { isolation: 'worktree' })`),
+      cwd: process.cwd(),
+      provider: new FakeAgentProvider([]),
+      prepareWorkingDirectory: async () => {
+        throw new Error('deterministic workspace belongs to another repository')
+      },
+    })
+    const events = collect(run)
+
+    await expect(run.result).rejects.toThrow(/another repository/i)
+    expect((await events).some((event) => event.type === 'run.failed')).toBe(true)
   })
 
   it('diagnoses a workflow-authored batch barrier instead of claiming queued work is starved', async () => {
@@ -1548,6 +1669,61 @@ describe('unattended workflow reliability', () => {
     if (success.reused || casualty.reused) throw new Error('Fresh automatic gap fixture reused work')
     prior.recordResult(success, 'preserved success', { successful: true })
     prior.recordResult(casualty, coverageGapValue(), { successful: false, coverageGap: true })
+    // Model the narrow crash window after the journal atomically committed the casualty but before
+    // the corresponding terminal agent event reached the durable event stream. Event projection is
+    // still "running" and explicitly replay-unsafe; recovery must trust the terminal journal value
+    // and reuse it rather than strand synthesis or invoke the provider.
+    await seed.appendEvent('run_automatic_gap_crashed', {
+      schemaVersion: 1,
+      runId: 'run_automatic_gap_crashed',
+      sequence: 2,
+      eventId: 'event_automatic_gap_admitted',
+      timestamp: new Date().toISOString(),
+      type: 'agent.admitted',
+      agentId: 'old-gap',
+      payload: {
+        callIndex: casualty.callIndex,
+        label: 'terminal casualty',
+        prompt: {
+          preview: 'terminal casualty',
+          content: 'terminal casualty',
+          mediaType: 'text/plain',
+          lineCount: 1,
+        },
+        options: {},
+        cacheKey: casualty.key,
+      },
+    })
+    await seed.appendEvent('run_automatic_gap_crashed', {
+      schemaVersion: 1,
+      runId: 'run_automatic_gap_crashed',
+      sequence: 3,
+      eventId: 'event_automatic_gap_queued',
+      timestamp: new Date().toISOString(),
+      type: 'agent.queued',
+      agentId: 'old-gap',
+      payload: {},
+    })
+    await seed.appendEvent('run_automatic_gap_crashed', {
+      schemaVersion: 1,
+      runId: 'run_automatic_gap_crashed',
+      sequence: 4,
+      eventId: 'event_automatic_gap_attempt_started',
+      timestamp: new Date().toISOString(),
+      type: 'agent.started',
+      agentId: 'old-gap',
+      attemptId: 'old-gap-attempt-1',
+      payload: {
+        attemptNumber: 1,
+        source: 'live',
+        provider: 'fake',
+        replaySafety: {
+          automatic: false,
+          risk: 'unknown_external',
+          reason: 'fixture unsafe attempt already has a terminal journal gap',
+        },
+      },
+    })
     await lease.release()
 
     const provider = new FakeAgentProvider([])
@@ -1567,6 +1743,17 @@ describe('unattended workflow reliability', () => {
       status: 'completed_with_errors',
     })
     expect(provider.calls).toHaveLength(0)
+    const recoveredEvents = (await new FileWorkflowStore(storeRoot).readEvents(
+      recovered.runId,
+      0,
+      1_000,
+    )).events.map((stored) => stored.event)
+    const recoveredSnapshot = projectWorkflowState(recovered.runId, recoveredEvents)
+    expect(recoveredSnapshot.counts).toMatchObject({
+      total: 2,
+      completed: 1,
+      recovery_required: 1,
+    })
     await service.stop()
   })
 
