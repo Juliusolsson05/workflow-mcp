@@ -71,7 +71,8 @@ export type WorkflowLimits = {
   maxValueDepth: number
   maxValueNodes: number
   synchronousTimeoutMs: number
-  wallClockTimeoutMs: number
+  /** Optional host policy. Omit to let the workflow run until completion or explicit cancellation. */
+  wallClockTimeoutMs?: number
   cancellationGraceMs: number
 }
 
@@ -209,7 +210,12 @@ const DEFAULT_LIMITS: WorkflowLimits = {
   maxValueDepth: 64,
   maxValueNodes: 100_000,
   synchronousTimeoutMs: 30_000,
-  wallClockTimeoutMs: 60 * 60 * 1_000,
+  // WHY there is no default wall-clock deadline: workflows are durable orchestration, and useful
+  // runs can legitimately wait on providers, retries, user intervention, or large agent trees for
+  // longer than an hour. A process-local timer cannot distinguish that healthy work from a stuck
+  // run and used to cancel resumable work at exactly 3,600,000 ms. Run lifetime is therefore owned
+  // by completion or explicit cancellation. Embedders that truly have a finite service deadline
+  // can still opt into one through `limits.wallClockTimeoutMs`.
   cancellationGraceMs: 500,
 }
 
@@ -484,9 +490,12 @@ class WorkflowRuntime {
         return
       }
 
-      this.#wallClockTimer = setTimeout(() => {
-        void this.cancel(`Workflow exceeded ${this.#limits.wallClockTimeoutMs}ms wall-clock limit`)
-      }, this.#limits.wallClockTimeoutMs)
+      const wallClockTimeoutMs = this.#limits.wallClockTimeoutMs
+      if (wallClockTimeoutMs !== undefined) {
+        this.#wallClockTimer = setTimeout(() => {
+          void this.cancel(`Workflow exceeded ${wallClockTimeoutMs}ms wall-clock limit`)
+        }, wallClockTimeoutMs)
+      }
 
       const result = await this.#executeWorker({
         workflow: this.#options.workflow,

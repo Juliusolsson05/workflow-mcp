@@ -143,7 +143,7 @@ describe('workflow realm', () => {
     expect(projectWorkflowState(run.id, await events).status).toBe('failed')
   })
 
-  it('uses the wall-clock kill as a backstop for an infinite loop after await', async () => {
+  it('honors an explicit wall-clock kill for an infinite loop after await', async () => {
     const source = workflow(`await Promise.resolve(); while (true) {}`)
     const { run, events } = start(source, [], {
       limits: { synchronousTimeoutMs: 50, wallClockTimeoutMs: 100, cancellationGraceMs: 25 },
@@ -153,7 +153,7 @@ describe('workflow realm', () => {
     expect(projectWorkflowState(run.id, await events).status).toBe('cancelled')
   })
 
-  it('uses the wall-clock kill for an infinite timer callback outside vm.runInContext', async () => {
+  it('honors an explicit wall-clock kill for an infinite timer callback outside vm.runInContext', async () => {
     const source = workflow(`
       await new Promise(() => setTimeout(() => { while (true) {} }, 0))
     `)
