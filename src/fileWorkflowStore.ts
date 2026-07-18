@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { COPYFILE_EXCL } from 'node:constants'
 import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
@@ -21,16 +21,27 @@ import { promisify } from 'node:util'
 import { parseWorkflowSource } from './loadWorkflow.js'
 import { writeInitialWorkflowJournal } from './persistentWorkflowJournal.js'
 import type { WorkflowEvent } from './workflowEvents.js'
+import {
+  MAX_WORKFLOW_RESULT_PAGE_BYTES,
+  MIN_WORKFLOW_RESULT_PAGE_BYTES,
+} from './workflowStore.js'
+import type {
+  ContentChecksum,
+  ContentReference,
+  WorkflowResultMaterialization,
+} from './workflowEvents.js'
 import { createWorkflowState, reduceWorkflowState } from './workflowState.js'
 import type {
   CreateWorkflowRunInput,
   StoredWorkflowEvent,
   WorkflowEventPage,
+  WorkflowResultPage,
   WorkflowRunManifest,
   WorkflowRunSnapshot,
   WorkflowRunStatus,
   WorkflowStore,
   WorkflowStoreLease,
+  WorkflowResultReadInput,
 } from './workflowStore.js'
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
@@ -47,14 +58,39 @@ const RUN_STATUSES = new Set<WorkflowRunStatus>([
   ...TERMINAL_STATUSES,
 ])
 const DEFAULT_MAX_EVENT_FILE_BYTES = 512 * 1024 * 1024
+export const DEFAULT_MAX_WORKFLOW_RESULT_BYTES = 64 * 1024 * 1024
+export const MAX_WORKFLOW_RESULT_BYTES = 512 * 1024 * 1024
+const MAX_RESULT_METADATA_BYTES = 8 * 1024
 const EVENT_INDEX_STRIDE = 256
 const OWNER_LOCK_DIRECTORY = 'service-owner.lock'
 const OWNER_METADATA_FILE = 'owner.json'
 const OWNER_ACQUIRE_ATTEMPTS = 16
 const execFileAsync = promisify(execFile)
 
+type StoredWorkflowResultMetadata = {
+  schemaVersion: 1
+  runId: string
+  artifactId: string
+  mediaType: string
+  sizeBytes: number
+  lineCount: number
+  checksum: ContentChecksum
+  createdAt: string
+}
+
 export class WorkflowStoreError extends Error {
-  readonly code: 'run-exists' | 'run-not-found' | 'corrupt-store' | 'event-log-full' | 'lineage-active' | 'io-error' | 'owner-conflict'
+  readonly code:
+    | 'run-exists'
+    | 'run-not-found'
+    | 'corrupt-store'
+    | 'event-log-full'
+    | 'lineage-active'
+    | 'io-error'
+    | 'owner-conflict'
+    | 'result-too-large'
+    | 'invalid-result'
+    | 'result-not-found'
+    | 'invalid-cursor'
 
   constructor(code: WorkflowStoreError['code'], message: string, options?: { cause?: unknown }) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause })
@@ -80,15 +116,29 @@ export class FileWorkflowStore implements WorkflowStore {
   #createTail: Promise<void> = Promise.resolve()
   readonly #quarantinedRuns = new Map<string, WorkflowStoreError>()
   readonly #maxEventFileBytes: number
+  readonly #maxResultBytes: number
   #leaseToken: string | undefined
   #leaseWasAcquired = false
 
-  constructor(rootDirectory: string, options: { maxEventFileBytes?: number } = {}) {
+  constructor(
+    rootDirectory: string,
+    options: { maxEventFileBytes?: number; maxResultBytes?: number } = {},
+  ) {
     this.rootDirectory = resolve(rootDirectory)
     this.runsDirectory = join(this.rootDirectory, 'runs')
     this.#maxEventFileBytes = options.maxEventFileBytes ?? DEFAULT_MAX_EVENT_FILE_BYTES
+    this.#maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_WORKFLOW_RESULT_BYTES
     if (!Number.isSafeInteger(this.#maxEventFileBytes) || this.#maxEventFileBytes <= 0) {
       throw new TypeError('maxEventFileBytes must be a positive safe integer')
+    }
+    if (
+      !Number.isSafeInteger(this.#maxResultBytes) ||
+      this.#maxResultBytes <= 0 ||
+      this.#maxResultBytes > MAX_WORKFLOW_RESULT_BYTES
+    ) {
+      throw new TypeError(
+        `maxResultBytes must be an integer from 1 through ${MAX_WORKFLOW_RESULT_BYTES}`,
+      )
     }
   }
 
@@ -478,6 +528,198 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  async persistResult(
+    runId: string,
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference> {
+    await this.#assertLease()
+    const manifest = await this.#requiredManifest(runId)
+    if (TERMINAL_STATUSES.has(manifest.status)) {
+      throw new WorkflowStoreError(
+        'corrupt-store',
+        `Cannot replace the result of terminal workflow run ${runId}`,
+      )
+    }
+    const mediaType = result.reference.mediaType
+    if (typeof mediaType !== 'string' || mediaType.length === 0 || mediaType.length > 255) {
+      throw new WorkflowStoreError('corrupt-store', `Workflow result media type is invalid: ${runId}`)
+    }
+    const sizeBytes = Buffer.byteLength(result.serializedContent, 'utf8')
+    if (sizeBytes > this.#maxResultBytes) {
+      // A completed run is a promise that every advertised result byte can be read. Silently
+      // clipping at the storage ceiling would recreate the original bug behind a different API,
+      // so a result which cannot fit the configured durable bound fails the run before completion.
+      throw new WorkflowStoreError(
+        'result-too-large',
+        `Workflow result exceeds ${this.#maxResultBytes} UTF-8 bytes: ${runId}`,
+      )
+    }
+    const bytes = Buffer.from(result.serializedContent, 'utf8')
+    if (bytes.toString('utf8') !== result.serializedContent) {
+      // JavaScript permits lone UTF-16 surrogates but UTF-8 does not. Node would silently replace
+      // them with U+FFFD, making the artifact differ from run.completed's inline value. Fail before
+      // completion instead so a successful locator is always byte-for-byte faithful.
+      throw new WorkflowStoreError(
+        'invalid-result',
+        `Workflow result cannot be represented losslessly as UTF-8: ${runId}`,
+      )
+    }
+    const lineCount = countUtf8Lines(bytes)
+    if (lineCount !== result.reference.lineCount) {
+      throw new WorkflowStoreError(
+        'corrupt-store',
+        `Workflow result line count changed during materialization: ${runId}`,
+      )
+    }
+    const checksum: ContentChecksum = {
+      algorithm: 'sha256',
+      value: createHash('sha256').update(bytes).digest('hex'),
+    }
+    const metadata: StoredWorkflowResultMetadata = {
+      schemaVersion: 1,
+      runId,
+      artifactId: resultArtifactId(checksum.value),
+      mediaType,
+      sizeBytes,
+      lineCount,
+      checksum,
+      createdAt: new Date().toISOString(),
+    }
+
+    const existing = await this.#readResultMetadata(runId, true)
+    if (existing !== undefined) {
+      // A crash may leave fully synced artifact bytes just before run.completed is appended. A
+      // retry in the same process may reuse byte-identical materialization, but a second value for
+      // one run ID is corruption: cursors and checksum identity are intentionally immutable.
+      if (
+        existing.artifactId !== metadata.artifactId ||
+        existing.mediaType !== metadata.mediaType ||
+        existing.sizeBytes !== metadata.sizeBytes ||
+        existing.lineCount !== metadata.lineCount
+      ) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow run ${runId} already has a different result artifact`,
+        )
+      }
+      return resultReference(result.reference, existing)
+    }
+
+    const dataPath = this.#resultDataPath(runId)
+    const metadataPath = this.#resultMetadataPath(runId)
+    try {
+      // Data is published before metadata, and run.completed is appended only after this method
+      // returns. Every externally visible locator therefore names complete, fsynced bytes. A crash
+      // between these steps leaves an unreferenced fixed-name file, never a half-readable result.
+      await writePrivateFileAtomically(dataPath, bytes)
+      await writePrivateFileAtomically(
+        metadataPath,
+        Buffer.from(`${JSON.stringify(metadata)}\n`, 'utf8'),
+      )
+      await syncDirectory(this.#artifactsDirectory(runId))
+    } catch (cause) {
+      if (cause instanceof WorkflowStoreError) throw cause
+      throw new WorkflowStoreError(
+        'io-error',
+        `Cannot persist workflow result artifact: ${runId}`,
+        { cause },
+      )
+    }
+    return resultReference(result.reference, metadata)
+  }
+
+  async readResult(runId: string, input: WorkflowResultReadInput): Promise<WorkflowResultPage> {
+    await this.#requiredManifest(runId)
+    if (input.artifactId.length === 0 || input.artifactId.length > 200) {
+      throw new WorkflowStoreError('result-not-found', `Workflow result artifact does not exist for ${runId}`)
+    }
+    if (input.cursor !== undefined && (input.cursor.length === 0 || input.cursor.length > 200)) {
+      throw new WorkflowStoreError('invalid-cursor', 'Workflow result cursor is malformed')
+    }
+    if (
+      !Number.isSafeInteger(input.maxBytes) ||
+      input.maxBytes < MIN_WORKFLOW_RESULT_PAGE_BYTES ||
+      input.maxBytes > MAX_WORKFLOW_RESULT_PAGE_BYTES
+    ) {
+      throw new TypeError(
+        `maxBytes must be an integer from ${MIN_WORKFLOW_RESULT_PAGE_BYTES} through ${MAX_WORKFLOW_RESULT_PAGE_BYTES}`,
+      )
+    }
+    const metadata = await this.#readResultMetadata(runId)
+    if (input.artifactId !== metadata.artifactId) {
+      // Artifact IDs are capabilities scoped beneath an already-authorized run. Never interpolate
+      // the caller's value into a path; equality against private metadata is the entire selector.
+      throw new WorkflowStoreError(
+        'result-not-found',
+        `Workflow result artifact does not exist for ${runId}`,
+      )
+    }
+    const fromByte = parseResultCursor(input.cursor, metadata)
+    const path = this.#resultDataPath(runId)
+    let handle
+    try {
+      handle = await open(path, 'r')
+    } catch (cause) {
+      if (isMissing(cause)) {
+        throw new WorkflowStoreError(
+          'result-not-found',
+          `Workflow result artifact is missing or expired: ${runId}`,
+          { cause },
+        )
+      }
+      throw new WorkflowStoreError('io-error', `Cannot open workflow result: ${runId}`, { cause })
+    }
+    try {
+      const info = await handle.stat()
+      if (info.size !== metadata.sizeBytes || info.size > MAX_WORKFLOW_RESULT_BYTES) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow result size does not match its integrity metadata: ${runId}`,
+        )
+      }
+      if (fromByte === metadata.sizeBytes) {
+        return resultPage(runId, metadata, fromByte, fromByte, '', false)
+      }
+
+      const requestedBytes = Math.min(input.maxBytes, metadata.sizeBytes - fromByte)
+      const buffer = Buffer.allocUnsafe(requestedBytes)
+      const { bytesRead } = await handle.read(buffer, 0, requestedBytes, fromByte)
+      if (bytesRead <= 0) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow result ended before byte ${fromByte}: ${runId}`,
+        )
+      }
+      const selected = buffer.subarray(0, bytesRead)
+      if (isUtf8ContinuationByte(selected[0]!)) {
+        throw new WorkflowStoreError(
+          'invalid-cursor',
+          `Workflow result cursor is not on a UTF-8 boundary: ${runId}`,
+        )
+      }
+      const decoded = decodeCompleteUtf8Prefix(selected, runId)
+      const toByte = fromByte + decoded.bytes
+      if (toByte <= fromByte) {
+        // The public minimum is four bytes, enough for the largest UTF-8 scalar. No progress under
+        // that bound means the file is malformed rather than merely ending inside a code point.
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow result contains invalid UTF-8 at byte ${fromByte}: ${runId}`,
+        )
+      }
+      return resultPage(
+        runId,
+        metadata,
+        fromByte,
+        toByte,
+        decoded.content,
+        toByte < metadata.sizeBytes,
+      )
+    } finally {
+      await handle.close()
+    }
+  }
+
   async snapshot(runId: string): Promise<WorkflowRunSnapshot> {
     const manifest = await this.#requiredManifest(runId)
     const cached = this.#snapshotCache.get(runId)
@@ -522,6 +764,55 @@ export class FileWorkflowStore implements WorkflowStore {
 
   transcriptDirectory(runId: string): string {
     return join(this.#runDirectory(runId), 'transcripts')
+  }
+
+  async #readResultMetadata(runId: string): Promise<StoredWorkflowResultMetadata>
+  async #readResultMetadata(
+    runId: string,
+    missingAllowed: true,
+  ): Promise<StoredWorkflowResultMetadata | undefined>
+  async #readResultMetadata(
+    runId: string,
+    missingAllowed = false,
+  ): Promise<StoredWorkflowResultMetadata | undefined> {
+    const path = this.#resultMetadataPath(runId)
+    let source: string
+    try {
+      source = (await readBoundedFile(path, MAX_RESULT_METADATA_BYTES)).toString('utf8')
+    } catch (cause) {
+      if (isMissing(cause)) {
+        if (missingAllowed) return undefined
+        throw new WorkflowStoreError(
+          'result-not-found',
+          `Workflow result artifact is missing or expired: ${runId}`,
+          { cause },
+        )
+      }
+      if (cause instanceof WorkflowStoreError) throw cause
+      throw new WorkflowStoreError(
+        'io-error',
+        `Cannot read workflow result metadata: ${runId}`,
+        { cause },
+      )
+    }
+    try {
+      // The configured limit is a write-admission policy, not a retention policy. Lowering it on
+      // restart must not make a previously accepted immutable result unreadable, so historical
+      // reads use the package hard ceiling while new materialization uses #maxResultBytes.
+      return parseResultMetadata(
+        JSON.parse(source) as unknown,
+        path,
+        runId,
+        MAX_WORKFLOW_RESULT_BYTES,
+      )
+    } catch (cause) {
+      if (cause instanceof WorkflowStoreError) throw cause
+      throw new WorkflowStoreError(
+        'corrupt-store',
+        `Workflow result metadata is invalid: ${path}`,
+        { cause },
+      )
+    }
   }
 
   async #appendAgentTranscript(stored: StoredWorkflowEvent): Promise<void> {
@@ -673,6 +964,7 @@ export class FileWorkflowStore implements WorkflowStore {
       const {
         error: _oldError,
         cancellationReason: _oldCancellationReason,
+        result: _oldResult,
         ...identity
       } = manifest
       let rebuilt: WorkflowRunManifest = {
@@ -749,6 +1041,19 @@ export class FileWorkflowStore implements WorkflowStore {
   #eventsPath(runId: string): string {
     return join(this.#runDirectory(runId), 'events.jsonl')
   }
+
+
+  #artifactsDirectory(runId: string): string {
+    return join(this.#runDirectory(runId), 'artifacts')
+  }
+
+  #resultDataPath(runId: string): string {
+    return join(this.#artifactsDirectory(runId), 'workflow-result.data')
+  }
+
+  #resultMetadataPath(runId: string): string {
+    return join(this.#artifactsDirectory(runId), 'workflow-result.json')
+  }
 }
 
 async function readOwner(path: string): Promise<{
@@ -821,6 +1126,7 @@ function applyEventToManifest(
   let status = manifest.status
   let error = manifest.error
   let cancellationReason = manifest.cancellationReason
+  let result = manifest.result
   switch (event.type) {
     case 'run.started': status = 'running'; break
     case 'run.cancellation_requested':
@@ -829,6 +1135,11 @@ function applyEventToManifest(
       break
     case 'run.completed':
       status = event.payload.withErrors === true ? 'completed_with_errors' : 'completed'
+      // Status polling needs the durable locator, but copying the inline result body into every
+      // manifest rewrite would duplicate up to 10 KB and turn a small health response into another
+      // result transport. Keep preview plus integrity metadata; events retain the compatible inline
+      // `content` field for existing consumers.
+      result = compactResultReference(event.payload.result)
       break
     case 'run.failed': status = 'failed'; error = event.payload.error.message; break
     case 'run.cancelled':
@@ -844,6 +1155,7 @@ function applyEventToManifest(
     updatedAt: stored.recordedAt,
     ...(error === undefined ? {} : { error }),
     ...(cancellationReason === undefined ? {} : { cancellationReason }),
+    ...(result === undefined ? {} : { result }),
   }
 }
 
@@ -884,11 +1196,240 @@ function parseManifest(value: unknown, path: string): WorkflowRunManifest {
     typeof value.updatedAt !== 'string' ||
     !isObject(value.workflow) ||
     typeof value.workflow.name !== 'string' ||
-    typeof value.workflow.description !== 'string'
+    typeof value.workflow.description !== 'string' ||
+    (value.result !== undefined && !isContentReference(value.result))
   ) {
     throw new WorkflowStoreError('corrupt-store', `Workflow manifest is invalid: ${path}`)
   }
   return value as WorkflowRunManifest
+}
+
+function compactResultReference(reference: ContentReference): ContentReference {
+  const { content: _inlineContent, ...compact } = reference
+  return compact
+}
+
+function isContentReference(value: unknown): value is ContentReference {
+  if (
+    !isObject(value) ||
+    typeof value.preview !== 'string' ||
+    !Number.isSafeInteger(value.lineCount) ||
+    (value.lineCount as number) < 0 ||
+    (value.artifactId !== undefined && typeof value.artifactId !== 'string') ||
+    (value.mediaType !== undefined && typeof value.mediaType !== 'string') ||
+    (value.truncated !== undefined && typeof value.truncated !== 'boolean') ||
+    (
+      value.sizeBytes !== undefined &&
+      (!Number.isSafeInteger(value.sizeBytes) || (value.sizeBytes as number) < 0)
+    ) ||
+    (value.checksum !== undefined && !isContentChecksum(value.checksum))
+  ) return false
+  return true
+}
+
+function isContentChecksum(value: unknown): value is ContentChecksum {
+  return isObject(value) &&
+    value.algorithm === 'sha256' &&
+    typeof value.value === 'string' &&
+    /^[a-f0-9]{64}$/.test(value.value)
+}
+
+function parseResultMetadata(
+  value: unknown,
+  path: string,
+  runId: string,
+  maxResultBytes: number,
+): StoredWorkflowResultMetadata {
+  if (
+    !isObject(value) ||
+    value.schemaVersion !== 1 ||
+    value.runId !== runId ||
+    typeof value.artifactId !== 'string' ||
+    typeof value.mediaType !== 'string' ||
+    value.mediaType.length === 0 ||
+    value.mediaType.length > 255 ||
+    !Number.isSafeInteger(value.sizeBytes) ||
+    (value.sizeBytes as number) < 0 ||
+    (value.sizeBytes as number) > maxResultBytes ||
+    !Number.isSafeInteger(value.lineCount) ||
+    (value.lineCount as number) < 0 ||
+    typeof value.createdAt !== 'string' ||
+    !isContentChecksum(value.checksum) ||
+    value.artifactId !== resultArtifactId(value.checksum.value)
+  ) {
+    throw new WorkflowStoreError('corrupt-store', `Workflow result metadata is invalid: ${path}`)
+  }
+  const sizeBytes = value.sizeBytes as number
+  const lineCount = value.lineCount as number
+  if (
+    (sizeBytes === 0 && lineCount !== 0) ||
+    (sizeBytes > 0 && (lineCount < 1 || lineCount > sizeBytes + 1))
+  ) {
+    throw new WorkflowStoreError('corrupt-store', `Workflow result line metadata is invalid: ${path}`)
+  }
+  return value as StoredWorkflowResultMetadata
+}
+
+function resultArtifactId(checksum: string): string {
+  // The ID is content-derived for stable integrity identity, but the file name is intentionally
+  // fixed. A caller can hand back this opaque value; it can never turn into path traversal.
+  return `result_sha256_${checksum}`
+}
+
+function resultCursor(metadata: StoredWorkflowResultMetadata, offset: number): string {
+  return `v1.${metadata.checksum.value}.${offset}`
+}
+
+function parseResultCursor(
+  cursor: string | undefined,
+  metadata: StoredWorkflowResultMetadata,
+): number {
+  if (cursor === undefined) return 0
+  const match = /^v1\.([a-f0-9]{64})\.(0|[1-9][0-9]*)$/.exec(cursor)
+  const offset = match?.[2] === undefined ? Number.NaN : Number(match[2])
+  if (
+    match?.[1] !== metadata.checksum.value ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset > metadata.sizeBytes
+  ) {
+    throw new WorkflowStoreError('invalid-cursor', 'Workflow result cursor is malformed or stale')
+  }
+  return offset
+}
+
+function resultReference(
+  inline: ContentReference,
+  metadata: StoredWorkflowResultMetadata,
+): ContentReference {
+  return {
+    ...inline,
+    artifactId: metadata.artifactId,
+    mediaType: metadata.mediaType,
+    sizeBytes: metadata.sizeBytes,
+    lineCount: metadata.lineCount,
+    checksum: metadata.checksum,
+    // New durable references make the state explicit. Legacy events may omit false, but status and
+    // completion readers should not have to infer whether a missing boolean predates artifacts.
+    truncated: inline.truncated === true,
+  }
+}
+
+function resultPage(
+  runId: string,
+  metadata: StoredWorkflowResultMetadata,
+  fromByte: number,
+  toByte: number,
+  content: string,
+  hasMore: boolean,
+): WorkflowResultPage {
+  return {
+    runId,
+    artifact: {
+      artifactId: metadata.artifactId,
+      mediaType: metadata.mediaType,
+      sizeBytes: metadata.sizeBytes,
+      lineCount: metadata.lineCount,
+      checksum: metadata.checksum,
+    },
+    encoding: 'utf-8',
+    fromByte,
+    toByte,
+    content,
+    hasMore,
+    ...(hasMore ? { nextCursor: resultCursor(metadata, toByte) } : {}),
+  }
+}
+
+function countUtf8Lines(bytes: Buffer): number {
+  if (bytes.length === 0) return 0
+  let lines = 1
+  for (const byte of bytes) if (byte === 0x0a) lines += 1
+  return lines
+}
+
+function isUtf8ContinuationByte(byte: number): boolean {
+  return (byte & 0xc0) === 0x80
+}
+
+function decodeCompleteUtf8Prefix(
+  bytes: Buffer,
+  runId: string,
+): { bytes: number; content: string } {
+  // A valid page can be incomplete only at its final scalar. Trying at most three trims is enough
+  // because UTF-8 code points are at most four bytes; `fatal` also detects corruption in the
+  // interior instead of replacing it with U+FFFD and invalidating the advertised checksum.
+  // `ignoreBOM: true` means "do not consume it" in the Encoding API. Workflow strings may
+  // legitimately begin with U+FEFF; silently stripping those three bytes would make concatenated
+  // pages fail the checksum even though every page decoded successfully.
+  for (let trim = 0; trim <= Math.min(3, bytes.length); trim += 1) {
+    const length = bytes.length - trim
+    try {
+      // Use a fresh decoder after each fatal attempt; implementations are not required to preserve
+      // useful state after throwing on an incomplete suffix.
+      const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+      return { bytes: length, content: decoder.decode(bytes.subarray(0, length)) }
+    } catch {
+      // Try removing one more possible suffix byte. Interior corruption fails every attempt.
+    }
+  }
+  throw new WorkflowStoreError('corrupt-store', `Workflow result contains invalid UTF-8: ${runId}`)
+}
+
+async function readBoundedFile(path: string, maxBytes: number): Promise<Buffer> {
+  const handle = await open(path, 'r')
+  try {
+    const before = await handle.stat()
+    if (before.size > maxBytes) {
+      throw new WorkflowStoreError('corrupt-store', `Workflow metadata file is too large: ${path}`)
+    }
+    const buffer = Buffer.alloc(before.size)
+    let offset = 0
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+    }
+    const after = await handle.stat()
+    if (offset !== buffer.length || after.size !== before.size) {
+      throw new WorkflowStoreError('corrupt-store', `Workflow metadata changed while reading: ${path}`)
+    }
+    return buffer
+  } finally {
+    await handle.close()
+  }
+}
+
+async function writePrivateFileAtomically(path: string, content: Buffer): Promise<void> {
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`
+  let handle
+  try {
+    handle = await open(temporary, 'wx', 0o600)
+    await handle.writeFile(content)
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await rename(temporary, path)
+    await chmod(path, 0o600)
+  } catch (cause) {
+    await handle?.close().catch(() => undefined)
+    await rm(temporary, { force: true }).catch(() => undefined)
+    throw cause
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  let handle
+  try {
+    handle = await open(path, 'r')
+    await handle.sync()
+  } catch (error) {
+    // Windows does not expose directory fsync through Node. The files themselves are still synced
+    // before publication; ignore only that platform limitation, never an unexpected POSIX error.
+    if (process.platform !== 'win32') throw error
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
 }
 
 async function writePrivateFile(path: string, content: string): Promise<void> {

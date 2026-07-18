@@ -169,6 +169,41 @@ describe('workflow realm', () => {
     const completed = (await events).find((event) => event.type === 'run.completed')
     expect(completed?.payload.result.preview).toBe('undefined')
   })
+
+  it('materializes the canonical full result before publishing its artifact and completion events', async () => {
+    const expected = { report: 'x'.repeat(12_000), nested: [1, null, true] }
+    let serialized = ''
+    const { run, events } = start(workflow('return args'), [], {
+      args: expected,
+      materializeResult: async (materialization) => {
+        serialized = materialization.serializedContent
+        return {
+          ...materialization.reference,
+          artifactId: 'result_sha256_fixture',
+          sizeBytes: Buffer.byteLength(materialization.serializedContent),
+          checksum: { algorithm: 'sha256', value: 'a'.repeat(64) },
+        }
+      },
+    })
+
+    await expect(run.result).resolves.toEqual(expected)
+    expect(JSON.parse(serialized)).toEqual(expected)
+    const published = await events
+    expect(published.slice(-2).map(event => event.type)).toEqual([
+      'artifact.created',
+      'run.completed',
+    ])
+    expect(published.at(-1)).toMatchObject({
+      payload: {
+        result: {
+          artifactId: 'result_sha256_fixture',
+          mediaType: 'application/json',
+          truncated: true,
+          content: expect.any(String),
+        },
+      },
+    })
+  })
 })
 
 describe('agent scheduling and helpers', () => {

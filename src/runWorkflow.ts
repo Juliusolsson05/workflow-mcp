@@ -49,6 +49,7 @@ import type {
   WorkflowEvent,
   WorkflowEventSink,
   WorkflowAgentFailurePlaceholder,
+  WorkflowResultMaterialization,
 } from './workflowEvents.js'
 import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 import type {
@@ -135,6 +136,13 @@ export type RunWorkflowOptions = {
   defaultEffort?: string
   sandbox?: Partial<AgentSandboxPolicy>
   eventSink?: WorkflowEventSink
+  /**
+   * Persist the canonical final representation before its completion locator is published.
+   * Low-level callers may omit this; WorkflowService always delegates it to the run store.
+   */
+  materializeResult?(
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference>
   /**
    * Retain direct-API event replay for iterators attached after publication. Services with a
    * durable eventSink should disable this to avoid holding a second unbounded activity history.
@@ -532,12 +540,38 @@ class WorkflowRuntime {
       // late events appear after run.completed. Drain a stable snapshot until no task remains.
       await this.#drainTasks()
       if (this.#controller.signal.aborted || this.#terminal) return
+      const materialization = workflowResultMaterialization(result, this.#limits)
+      const resultReference = this.#options.materializeResult === undefined
+        ? materialization.reference
+        : await this.#options.materializeResult(materialization)
+      if (this.#controller.signal.aborted || this.#terminal) return
+      if (resultReference.artifactId !== undefined) {
+        // The durable bytes already exist when this discovery event is emitted. Publishing a
+        // generic artifact record before the terminal event keeps existing artifact projections
+        // useful while run.completed remains the direct, backwards-compatible result locator.
+        await this.#emit({
+          type: 'artifact.created',
+          payload: {
+            artifactId: resultReference.artifactId,
+            name: resultReference.mediaType === 'application/json'
+              ? 'workflow-result.json'
+              : 'workflow-result.txt',
+            ...(resultReference.mediaType === undefined
+              ? {}
+              : { mediaType: resultReference.mediaType }),
+            ...(resultReference.sizeBytes === undefined
+              ? {}
+              : { sizeBytes: resultReference.sizeBytes }),
+          },
+        })
+      }
+      if (this.#controller.signal.aborted || this.#terminal) return
       if (!this.#claimTerminal('completion')) return
 
       await this.#emit({
         type: 'run.completed',
         payload: {
-          result: contentReference(result, this.#limits),
+          result: resultReference,
           ...(this.#completedWithErrors ? { withErrors: true } : {}),
         },
       })
@@ -2849,6 +2883,13 @@ function cloneBoundaryValue(value: unknown, limits: WorkflowLimits = DEFAULT_LIM
 }
 
 function contentReference(value: unknown, limits: WorkflowLimits = DEFAULT_LIMITS): ContentReference {
+  return workflowResultMaterialization(value, limits).reference
+}
+
+function workflowResultMaterialization(
+  value: unknown,
+  limits: WorkflowLimits = DEFAULT_LIMITS,
+): WorkflowResultMaterialization {
   const cloned = cloneBoundaryValue(value, limits)
   // `undefined` is a valid JavaScript workflow result even though JSON has no spelling for it.
   // Giving it an explicit preview keeps list UIs useful while leaving `content` absent rather than
@@ -2869,13 +2910,23 @@ function contentReference(value: unknown, limits: WorkflowLimits = DEFAULT_LIMIT
   // remains available to execution and journal reuse; only this display copy becomes bounded.
   const retainedContent = contentWasCapped ? full.slice(0, limits.maxLogCharacters) : cloned
   return {
-    preview: full.slice(0, previewLimit),
-    lineCount: countLines(full),
-    ...(cloned === undefined ? {} : { content: retainedContent }),
-    mediaType: contentWasCapped || typeof cloned === 'string' || cloned === undefined
-      ? 'text/plain'
-      : 'application/json',
-    ...(full.length <= previewLimit ? {} : { truncated: true }),
+    serializedContent: full,
+    reference: {
+      preview: full.slice(0, previewLimit),
+      lineCount: countLines(full),
+      ...(cloned === undefined ? {} : { content: retainedContent }),
+      // Media type describes the complete value behind the reference, not the bounded inline
+      // prefix. A clipped JSON prefix is not independently parseable, but callers can now follow
+      // its artifactId and concatenate pages into the advertised application/json document.
+      mediaType: typeof cloned === 'string' || cloned === undefined
+        ? 'text/plain'
+        : 'application/json',
+      // `preview` is always allowed to be shorter than complete inline `content`. `truncated`
+      // specifically means the inline content is incomplete and the artifact must be followed;
+      // conflating those two states made 4-10 KB values look irrecoverably clipped when they were
+      // actually present in full.
+      ...(contentWasCapped ? { truncated: true } : {}),
+    },
   }
 }
 
