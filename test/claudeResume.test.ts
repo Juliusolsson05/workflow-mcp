@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 import {
   ClaudeResumeError,
   claudeResumeSidecarPath,
+  findClaudeWorkflowRunMetadata,
   loadClaudeWorkflowResume,
 } from '../src/claudeResume.js'
 import { FakeAgentProvider } from '../src/fakeProvider.js'
@@ -22,6 +23,67 @@ return await agent('first', { schema: { type: 'object' } })
 `
 
 describe('Claude persisted workflow resume', () => {
+  it('discovers a Claude workflow metadata file by run ID within one project', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'workflow-claude-project-'))
+    const metadataPath = join(projectRoot, 'session-one', 'workflows', 'wf_resume1.json')
+    await mkdir(dirname(metadataPath), { recursive: true })
+    await writeFile(metadataPath, JSON.stringify({
+      runId: 'wf_resume1',
+      workflowName: 'resume-test',
+      scriptPath: '/tmp/resume-test.js',
+    }))
+
+    await expect(findClaudeWorkflowRunMetadata(projectRoot, 'wf_resume1')).resolves.toBe(metadataPath)
+  })
+
+  it('rejects identifiers that are not native Claude workflow run IDs', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'workflow-claude-project-'))
+
+    await expect(
+      findClaudeWorkflowRunMetadata(projectRoot, '../wf_escape'),
+    ).rejects.toMatchObject<Partial<ClaudeResumeError>>({ code: 'invalid-run-id' })
+  })
+
+  it('fails closed when the same Claude run ID exists in multiple sessions', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'workflow-claude-project-'))
+    for (const session of ['session-one', 'session-two']) {
+      const metadataPath = join(projectRoot, session, 'workflows', 'wf_duplicate.json')
+      await mkdir(dirname(metadataPath), { recursive: true })
+      await writeFile(metadataPath, JSON.stringify({
+        runId: 'wf_duplicate',
+        workflowName: 'resume-test',
+        scriptPath: '/tmp/resume-test.js',
+      }))
+    }
+
+    await expect(
+      findClaudeWorkflowRunMetadata(projectRoot, 'wf_duplicate'),
+    ).rejects.toMatchObject<Partial<ClaudeResumeError>>({ code: 'ambiguous-run' })
+  })
+
+  it('rejects metadata whose embedded run ID differs from its filename', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'workflow-claude-project-'))
+    const metadataPath = join(projectRoot, 'session-one', 'workflows', 'wf_expected.json')
+    await mkdir(dirname(metadataPath), { recursive: true })
+    await writeFile(metadataPath, JSON.stringify({
+      runId: 'wf_different',
+      workflowName: 'resume-test',
+      scriptPath: '/tmp/resume-test.js',
+    }))
+
+    await expect(
+      findClaudeWorkflowRunMetadata(projectRoot, 'wf_expected'),
+    ).rejects.toMatchObject<Partial<ClaudeResumeError>>({ code: 'run-id-mismatch' })
+  })
+
+  it('reports a missing Claude project root as a missing run', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'workflow-claude-project-'))
+
+    await expect(
+      findClaudeWorkflowRunMetadata(join(parent, 'missing'), 'wf_missing1'),
+    ).rejects.toMatchObject<Partial<ClaudeResumeError>>({ code: 'run-not-found' })
+  })
+
   it('uses deterministic workflow-mcp-owned storage for resumed suffix state', () => {
     const first = claudeResumeSidecarPath('/tmp/claude/workflows/wf_one.json')
     expect(first).toBe(claudeResumeSidecarPath('/tmp/claude/workflows/wf_one.json'))

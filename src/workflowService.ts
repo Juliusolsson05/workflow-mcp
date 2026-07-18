@@ -6,7 +6,11 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import type { AgentProvider, AgentSandboxPolicy } from './agentProvider.js'
-import { loadClaudeWorkflowResume } from './claudeResume.js'
+import {
+  ClaudeResumeError,
+  findClaudeWorkflowRunMetadata,
+  loadClaudeWorkflowResume,
+} from './claudeResume.js'
 import { findWorkflows } from './findWorkflows.js'
 import type { FoundWorkflow } from './findWorkflows.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
@@ -53,6 +57,12 @@ export type WorkflowServiceScope = {
 export type WorkflowServiceOptions = {
   store: WorkflowStore
   provider: AgentProvider | ((context: WorkflowProviderFactoryContext) => AgentProvider)
+  /**
+   * Root containing Claude's project-key directories. Production uses ~/.claude/projects; an
+   * explicit root lets embedders with isolated Claude state and tests preserve the same scope rules
+   * without mutating the process home directory.
+   */
+  claudeProjectsRoot?: string
   /**
    * Side-effect-free recovery evidence for lazy provider factories. Initialization must compare
    * persisted capability evidence without constructing a run-scoped provider twice. Static
@@ -195,7 +205,7 @@ export type WorkflowStartInput = {
   /** Highest-precedence source selector, scoped to visible .claude/workflows directories. */
   scriptPath?: string
   args?: unknown
-  /** Claude-shaped resume alias; creates a new durable run and preserves the lineage. */
+  /** Agent Code run_* or scoped Claude wf_* resume alias; creates a new durable linked run. */
   resumeFromRunId?: string
   idempotencyKey?: string
 }
@@ -496,7 +506,7 @@ export class WorkflowService {
     }
 
     if (input.resumeFromRunId !== undefined) {
-      return this.#resumeStored(scope, {
+      return this.#resumeRunId(scope, {
         runId: input.resumeFromRunId,
         ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       }, input)
@@ -620,8 +630,55 @@ export class WorkflowService {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
     return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => (
-      'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeStored(scope, input)
+      'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeRunId(scope, input)
     ))
+  }
+
+  async #resumeRunId(
+    scope: WorkflowServiceScope,
+    input: Extract<WorkflowResumeInput, { runId: string }>,
+    overrides?: WorkflowStartInput,
+  ): Promise<WorkflowRunStartResult> {
+    if (!input.runId.startsWith('wf_')) return this.#resumeStored(scope, input, overrides)
+
+    const cwd = resolve(scope.cwd)
+    const projectRoot = await this.#claudeProjectRoot(cwd)
+    let metadataPath: string
+    try {
+      metadataPath = await findClaudeWorkflowRunMetadata(projectRoot, input.runId)
+    } catch (cause) {
+      if (!(cause instanceof ClaudeResumeError)) throw cause
+      throw new WorkflowServiceError(
+        cause.code === 'run-not-found' ? 'run-not-found' : 'invalid-request',
+        cause.message,
+        { cause },
+      )
+    }
+
+    let workflowPath: string | undefined
+    const hasSourceOverride = overrides?.scriptPath !== undefined ||
+      overrides?.script !== undefined ||
+      overrides?.name !== undefined
+    if (hasSourceOverride) {
+      const workflow = await this.#resolveStartWorkflow(scope, overrides ?? {})
+      if (workflow.filePath === undefined) {
+        throw new WorkflowServiceError(
+          'invalid-request',
+          'Claude workflow resume source override must resolve to a persisted workflow file',
+        )
+      }
+      workflowPath = workflow.filePath
+    }
+
+    // Native and Claude runs deliberately keep different identifier namespaces. Routing here—at
+    // the service boundary shared by both MCP tools—prevents an external wf_* ID from ever reaching
+    // FileWorkflowStore's run_* path validator while preserving one validated importer for explicit
+    // paths and discovered IDs.
+    return this.#resumeClaude(scope, {
+      claudeRunPath: metadataPath,
+      ...(workflowPath === undefined ? {} : { workflowPath }),
+      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+    })
   }
 
   async #resumeStored(
@@ -729,9 +786,7 @@ export class WorkflowService {
     input: Extract<WorkflowResumeInput, { claudeRunPath: string }>,
   ): Promise<WorkflowRunStartResult> {
     const cwd = resolve(scope.cwd)
-    const claudeProjectRoot = await realpath(
-      join(homedir(), '.claude', 'projects', claudeProjectKey(cwd)),
-    ).catch(() => join(homedir(), '.claude', 'projects', claudeProjectKey(cwd)))
+    const claudeProjectRoot = await this.#claudeProjectRoot(cwd)
     const metadataPath = await realpath(resolve(input.claudeRunPath)).catch(() => resolve(input.claudeRunPath))
     if (!isInside(claudeProjectRoot, metadataPath)) {
       throw new WorkflowServiceError(
@@ -768,6 +823,14 @@ export class WorkflowService {
       recoveryMode: 'manual',
       ...(journalSnapshots.length === 0 ? {} : { journalSnapshots }),
     })
+  }
+
+  async #claudeProjectRoot(cwd: string): Promise<string> {
+    const projectsRoot = resolve(
+      this.#options.claudeProjectsRoot ?? join(homedir(), '.claude', 'projects'),
+    )
+    const projectRoot = join(projectsRoot, claudeProjectKey(cwd))
+    return realpath(projectRoot).catch(() => projectRoot)
   }
 
   subscribe(listener: WorkflowServiceListener): () => void {
