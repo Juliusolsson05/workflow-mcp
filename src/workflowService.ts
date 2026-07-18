@@ -6,7 +6,11 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import type { AgentProvider, AgentSandboxPolicy } from './agentProvider.js'
-import { loadClaudeWorkflowResume } from './claudeResume.js'
+import {
+  ClaudeResumeError,
+  findClaudeWorkflowRunMetadata,
+  loadClaudeWorkflowResume,
+} from './claudeResume.js'
 import { findWorkflows } from './findWorkflows.js'
 import type { FoundWorkflow } from './findWorkflows.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
@@ -53,6 +57,12 @@ export type WorkflowServiceScope = {
 export type WorkflowServiceOptions = {
   store: WorkflowStore
   provider: AgentProvider | ((context: WorkflowProviderFactoryContext) => AgentProvider)
+  /**
+   * Root containing Claude's project-key directories. Production uses ~/.claude/projects; an
+   * explicit root lets embedders with isolated Claude state and tests preserve the same scope rules
+   * without mutating the process home directory.
+   */
+  claudeProjectsRoot?: string
   /**
    * Side-effect-free recovery evidence for lazy provider factories. Initialization must compare
    * persisted capability evidence without constructing a run-scoped provider twice. Static
@@ -195,7 +205,7 @@ export type WorkflowStartInput = {
   /** Highest-precedence source selector, scoped to visible .claude/workflows directories. */
   scriptPath?: string
   args?: unknown
-  /** Claude-shaped resume alias; creates a new durable run and preserves the lineage. */
+  /** Agent Code run_* or scoped Claude wf_* resume alias; creates a new durable linked run. */
   resumeFromRunId?: string
   idempotencyKey?: string
 }
@@ -496,7 +506,7 @@ export class WorkflowService {
     }
 
     if (input.resumeFromRunId !== undefined) {
-      return this.#resumeStored(scope, {
+      return this.#resumeRunId(scope, {
         runId: input.resumeFromRunId,
         ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       }, input)
@@ -620,8 +630,57 @@ export class WorkflowService {
     this.#assertAvailable()
     validateIdempotencyKey(input.idempotencyKey)
     return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => (
-      'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeStored(scope, input)
+      'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeRunId(scope, input)
     ))
+  }
+
+  async #resumeRunId(
+    scope: WorkflowServiceScope,
+    input: Extract<WorkflowResumeInput, { runId: string }>,
+    overrides?: WorkflowStartInput,
+  ): Promise<WorkflowRunStartResult> {
+    if (!input.runId.startsWith('wf_')) return this.#resumeStored(scope, input, overrides)
+
+    const cwd = resolve(scope.cwd)
+    const projectRoot = await this.#claudeProjectRoot(cwd)
+    let metadataPath: string
+    try {
+      metadataPath = await findClaudeWorkflowRunMetadata(projectRoot, input.runId)
+    } catch (cause) {
+      if (!(cause instanceof ClaudeResumeError)) throw cause
+      throw new WorkflowServiceError(
+        cause.code === 'run-not-found' ? 'run-not-found' : 'invalid-request',
+        cause.message,
+        { cause },
+      )
+    }
+
+    let workflowPath: string | undefined
+    const hasSourceOverride = overrides?.scriptPath !== undefined ||
+      overrides?.script !== undefined ||
+      overrides?.name !== undefined
+    if (hasSourceOverride) {
+      const workflow = await this.#resolveStartWorkflow(scope, overrides ?? {})
+      if (workflow.filePath === undefined) {
+        throw new WorkflowServiceError(
+          'invalid-request',
+          'Claude workflow resume source override must resolve to a persisted workflow file',
+        )
+      }
+      workflowPath = workflow.filePath
+    }
+
+    // Native and Claude runs deliberately keep different identifier namespaces. Routing here—at
+    // the service boundary shared by both MCP tools—prevents an external wf_* ID from ever reaching
+    // FileWorkflowStore's run_* path validator while preserving one validated importer for explicit
+    // paths and discovered IDs.
+    return this.#resumeClaude(scope, {
+      claudeRunPath: metadataPath,
+      ...(workflowPath === undefined ? {} : { workflowPath }),
+      ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+    }, overrides !== undefined && Object.prototype.hasOwnProperty.call(overrides, 'args')
+      ? { provided: true, value: overrides.args }
+      : undefined)
   }
 
   async #resumeStored(
@@ -638,7 +697,7 @@ export class WorkflowService {
       )
     }
     const original = await this.status(scope, input.runId)
-    if (!['interrupted', 'failed', 'cancelled'].includes(original.status)) {
+    if (!['interrupted', 'failed', 'cancelled', 'completed_with_errors'].includes(original.status)) {
       throw new WorkflowServiceError(
         'run-not-resumable',
         `Workflow run ${input.runId} has status ${original.status}`,
@@ -727,11 +786,10 @@ export class WorkflowService {
   async #resumeClaude(
     scope: WorkflowServiceScope,
     input: Extract<WorkflowResumeInput, { claudeRunPath: string }>,
+    argsOverride?: { provided: true; value: unknown },
   ): Promise<WorkflowRunStartResult> {
     const cwd = resolve(scope.cwd)
-    const claudeProjectRoot = await realpath(
-      join(homedir(), '.claude', 'projects', claudeProjectKey(cwd)),
-    ).catch(() => join(homedir(), '.claude', 'projects', claudeProjectKey(cwd)))
+    const claudeProjectRoot = await this.#claudeProjectRoot(cwd)
     const metadataPath = await realpath(resolve(input.claudeRunPath)).catch(() => resolve(input.claudeRunPath))
     if (!isInside(claudeProjectRoot, metadataPath)) {
       throw new WorkflowServiceError(
@@ -760,14 +818,34 @@ export class WorkflowService {
     const imported = await loadClaudeWorkflowResume(metadataPath, {
       ...(workflowPath === undefined ? {} : { workflowPath }),
     })
+    const importedArgs = Object.prototype.hasOwnProperty.call(imported.metadata, 'args')
+      ? { provided: true as const, value: imported.metadata.args }
+      : { provided: false as const }
+    const args = argsOverride ?? importedArgs
+    const exactArgs = argsOverride === undefined || isDeepStrictEqual(argsOverride, importedArgs)
     const journalSnapshots = imported.journal.getSnapshots()
     return this.#startLoaded(scope, imported.workflow, {
+      ...(args.provided ? { args: args.value } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       resumedFromRunId: imported.metadata.runId,
       lineageId: imported.metadata.runId,
       recoveryMode: 'manual',
+      // loadClaudeWorkflowResume already refuses a source mismatch. When args also match, use the
+      // same sparse contract as an unchanged native manual resume so one failed Claude call does not
+      // invalidate successful siblings; imported prompt identities additionally repair chained-key
+      // changes caused solely by work-conserving pipeline completion order. A caller-provided args
+      // change falls back to Claude's conservative longest-prefix rule.
+      journalReuseMode: exactArgs ? 'exact-source-sparse' : 'longest-prefix',
       ...(journalSnapshots.length === 0 ? {} : { journalSnapshots }),
     })
+  }
+
+  async #claudeProjectRoot(cwd: string): Promise<string> {
+    const projectsRoot = resolve(
+      this.#options.claudeProjectsRoot ?? join(homedir(), '.claude', 'projects'),
+    )
+    const projectRoot = join(projectsRoot, claudeProjectKey(cwd))
+    return realpath(projectRoot).catch(() => projectRoot)
   }
 
   subscribe(listener: WorkflowServiceListener): () => void {
@@ -785,6 +863,7 @@ export class WorkflowService {
       lineageId?: string
       recoveryMode?: 'manual' | 'automatic'
       journalReuseMode?: JournalReuseMode
+      reuseCoverageGaps?: boolean
       journalSnapshots?: Parameters<typeof PersistentWorkflowJournal.open>[1]
     },
   ): Promise<WorkflowRunStartResult> {
@@ -860,6 +939,11 @@ export class WorkflowService {
       journalReuseMode: input.journalReuseMode ?? (
         input.recoveryMode === 'automatic' ? 'exact-source-sparse' : 'longest-prefix'
       ),
+      // WHY only automatic recovery reuses coverage gaps: it is repairing an interrupted
+      // supervisor generation and must not silently replay work already classified unsafe or
+      // exhausted. An explicit workflow_resume is the user's request to try those casualties
+      // again, while still reusing every successful sibling from the exact-source sparse journal.
+      reuseCoverageGaps: input.reuseCoverageGaps ?? input.recoveryMode === 'automatic',
       scheduler: this.#scheduler,
       circuitBreaker,
       lineageId: input.lineageId ?? runId,
@@ -1070,13 +1154,35 @@ export class WorkflowService {
     ) return false
 
     const snapshot = await this.#options.store.snapshot(manifest.runId)
-    const unresolvedAttempts = snapshot.state.agents.flatMap((agent) => (
-      agent.attempts.filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+    const unresolvedAgents = snapshot.state.agents.filter((agent) => (
+      agent.attempts.some((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
     ))
+    const journal = await PersistentWorkflowJournal.open(
+      this.#options.store.journalPath(manifest.runId),
+    )
+    const terminalJournalCalls = new Set(
+      journal.getSnapshots().flatMap((journalSnapshot) => (
+        journalSnapshot.records.flatMap((record) => (
+          record.type === 'result' ? [`${record.key}\0${record.agentId}`] : []
+        ))
+      )),
+    )
     // WHY legacy attempts without request evidence fail closed: provider-wide safety cannot prove
     // that this particular call had no network access, shared-worktree mutation, or expanded tool
     // capability. New runs persist the concrete assessment in agent.started before dispatch.
-    return unresolvedAttempts.every((attempt) => attempt.replaySafety?.automatic === true)
+    //
+    // WHY a terminal journal result overrides stale event state: result/session disposition is one
+    // atomic recovery commit, but the subsequent agent.completed/recovery_required event is a
+    // separate append. A crash between them leaves projection saying "running" even though the
+    // successor will reuse the durable result and never replay the physical attempt. Requiring
+    // replay safety in that window strands final synthesis, especially for intentionally unsafe
+    // coverage gaps. Only unresolved calls without a terminal journal value need replay authority.
+    return unresolvedAgents.every((agent) => (
+      terminalJournalCalls.has(`${agent.cacheKey}\0${agent.id}`) ||
+      agent.attempts
+        .filter((attempt) => attempt.status === 'running' || attempt.status === 'stalled')
+        .every((attempt) => attempt.replaySafety?.automatic === true)
+    ))
   }
 
   async #releaseStoreLease(): Promise<void> {

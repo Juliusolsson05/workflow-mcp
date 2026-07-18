@@ -102,8 +102,14 @@ provider-neutral AgentProvider
   only persistence or supervisor faults fail the complete run.
 - **Resume** — continue a managed run, or import-and-resume a real Claude run
   after verifying its source and journal byte-identity. Exact source/arguments
-  reuse completed calls sparsely; edited source retains the longest unchanged
-  prefix. Claude's own files are never rewritten.
+  reuse completed calls sparsely; automatic crash recovery also preserves
+  terminal coverage gaps, while an explicit manual resume retries those gaps.
+  Edited source retains the longest unchanged prefix. MCP callers may pass a
+  managed `run_*` ID or Claude's native `wf_*` ID; Claude's own files are never
+  rewritten. For exact-source Claude imports, bounded hashes of the original
+  subagent prompts preserve completed dynamic-pipeline siblings even when cached
+  parents settle in a different order; raw prompt text is not copied into the
+  workflow-mcp sidecar.
 - **An embeddable service** — the same `WorkflowService` and tool registrar that
   the CLI uses can be mounted inside another host (this is how
   [Agent Code](https://github.com/Juliusolsson05/agent-code) renders each run as
@@ -146,6 +152,11 @@ node dist/cli.js serve --stdio /path/to/project
 # token are printed once to stderr).
 node dist/cli.js serve --http /path/to/project 0
 ```
+
+Once served, both `workflow_resume({ runId: "wf_..." })` and
+`workflow_run({ resumeFromRunId: "wf_..." })` discover that Claude run inside
+the scoped project's Claude state. Use `claudeRunPath` only when duplicate
+historical metadata requires explicit selection.
 
 ## Embedding
 

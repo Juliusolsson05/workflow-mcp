@@ -10,11 +10,11 @@ import type {
 import { serializeWorkerError, WORKFLOW_WORKER_HEARTBEAT_INTERVAL_MS } from './workerMessages.js'
 
 type PendingRequest = {
-  resolve(value: unknown): void
+  resolve(value: unknown, coverageGap?: boolean): void
   reject(error: Error): void
 }
 
-type RealmResolve = (json: string, isUndefined: boolean) => void
+type RealmResolve = (json: string, isUndefined: boolean, coverageGap: boolean) => void
 type RealmReject = (name: string, message: string, stack?: string, code?: string) => void
 
 const BLOCKED_VALUE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
@@ -85,18 +85,18 @@ function rejectPending(error: Error): void {
 
 function pendingRealmRequest(resolveRealm: RealmResolve, rejectRealm: RealmReject): PendingRequest {
   return {
-    resolve(value: unknown): void {
+    resolve(value: unknown, coverageGap = false): void {
       // Never pass a host object into the untrusted realm. Even an Array or Error that looks like
       // data carries a host constructor, and constructor.constructor is enough to recover Node's
       // Function and then process. JSON text plus a primitive undefined marker forces every result
       // to be reconstructed with the workflow realm's own prototypes.
       if (value === undefined) {
-        resolveRealm('', true)
+        resolveRealm('', true, coverageGap)
         return
       }
       const json = JSON.stringify(value)
       if (json === undefined) throw new TypeError('Workflow response cannot cross the realm boundary')
-      resolveRealm(json, false)
+      resolveRealm(json, false, coverageGap)
     },
     reject(error: Error): void {
       // The same rule applies to failures: a host Error must never become a workflow rejection.
@@ -337,9 +337,25 @@ const INITIALIZE_REALM = `
   const RealmString = String
   const parseJson = JSON.parse
   const stringifyJson = JSON.stringify
+  // WHY a WeakSet instead of inspecting __workflowAgentFailure: provider output is untrusted
+  // workflow data and may legitimately contain that public shape. Only the privileged parent knows
+  // whether a returned object is supervisor metadata. Preserve that provenance out-of-band while
+  // the JSON boundary reconstructs an object owned by this realm, then let pipeline() consult the
+  // unforgeable identity brand. User code can read and synthesize the value, but cannot mint the
+  // private brand and accidentally suppress later stages.
+  const coverageGaps = new WeakSet()
   const request = (start) => new RealmPromise((resolve, reject) => {
     start(
-      (json, isUndefined) => resolve(isUndefined ? undefined : parseJson(json)),
+      (json, isUndefined, coverageGap) => {
+        const value = isUndefined ? undefined : parseJson(json)
+        if (coverageGap) {
+          if (value === null || typeof value !== 'object') {
+            throw new TypeError('Workflow coverage-gap response must be an object')
+          }
+          coverageGaps.add(value)
+        }
+        resolve(value)
+      },
       (name, message, stack, code) => {
         const error = new RealmError(message)
         error.name = name
@@ -425,11 +441,17 @@ const INITIALIZE_REALM = `
     }
 
     let droppedForBudget = 0
+    const isCoverageGap = (value) =>
+      value !== null && typeof value === 'object' && coverageGaps.has(value)
     const results = await Promise.all(items.map(async (original, index) => {
       let current = original
       try {
         for (const stage of stages) {
-          if (current === null) break
+          // WHY coverage gaps are terminal pipeline values, not ordinary stage output: feeding a
+          // failed research assignment into later agents wastes budget and can turn supervisor
+          // metadata into prompts a workflow never intended. Keep the typed placeholder in the
+          // result array for synthesis, but stop only this item while healthy siblings advance.
+          if (current === null || isCoverageGap(current)) break
           current = await stage(current, original, index)
         }
         return current
@@ -568,7 +590,9 @@ function receive(message: ParentToWorkerMessage): void {
     const pending = pendingAgents.get(message.requestId)
     if (!pending) return
     pendingAgents.delete(message.requestId)
-    if (message.result.type === 'success') pending.resolve(message.result.value)
+    if (message.result.type === 'success') {
+      pending.resolve(message.result.value, message.result.coverageGap === true)
+    }
     else {
       const error = new Error(message.result.error.message)
       error.name = message.result.error.name

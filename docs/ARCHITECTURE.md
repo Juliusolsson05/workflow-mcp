@@ -125,9 +125,10 @@ also keeps immutable private run bytes and returns a `transcriptDirectory` conta
 tool descriptions carry this author-run-edit-poll loop so clients do not need repository context.
 
 Managed resume creates a new run with `resumedFromRunId`; it never appends a second execution to an
-old event stream. The same tool can import a Claude run with `{ claudeRunPath, workflowPath? }`.
-The service accepts only Claude manifests beneath the scoped Claude project directory, and an
-optional live workflow path must be one of that project's discovered definitions. Source and v2
+old event stream. `workflow_resume.runId` and `workflow_run.resumeFromRunId` accept managed `run_*`
+IDs and real Claude `wf_*` IDs. A Claude ID is resolved only beneath the scoped Claude project
+directory; `{ claudeRunPath, workflowPath? }` remains the explicit-path form for ambiguous history.
+An optional live workflow path must be one of that project's discovered definitions. Source and v2
 journal byte-identity checks still belong to the existing Claude importer.
 
 Renderer code imports only from `workflow-mcp/state`. That subpath exports events, immutable state

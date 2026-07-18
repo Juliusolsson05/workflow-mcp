@@ -45,7 +45,7 @@ export type ParentToWorkerMessage =
       type: 'agent.result'
       requestId: string
       result:
-        | { type: 'success'; value: unknown }
+        | { type: 'success'; value: unknown; coverageGap?: true }
         | { type: 'error'; error: SerializedWorkerError }
       budgetSpent: number
     }

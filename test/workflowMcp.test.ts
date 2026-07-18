@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -11,6 +11,7 @@ import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { registerWorkflowMcpTools } from '../src/workflowMcp.js'
 import { WorkflowService } from '../src/workflowService.js'
+import { createJournalKey } from '../src/workflowJournal.js'
 
 describe('workflow MCP facade', () => {
   it('registers the complete stable eight-tool surface', async () => {
@@ -142,4 +143,240 @@ describe('workflow MCP facade', () => {
     await server.close()
     await service.stop()
   })
+
+  it.each([
+    ['workflow_resume', 'wf_resume1'],
+    ['workflow_run', 'wf_run001'],
+  ] as const)('continues a real Claude run by ID through %s', async (toolName, claudeRunId) => {
+    const fixture = await createClaudeRunIdFixture(claudeRunId)
+    const provider = new FakeAgentProvider([])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(fixture.root, 'state')),
+      provider,
+      claudeProjectsRoot: fixture.claudeProjectsRoot,
+    })
+    await service.initialize()
+    const server = new McpServer({ name: 'claude-resume-server', version: '1' })
+    registerWorkflowMcpTools(server, service, { cwd: fixture.cwd })
+    const client = new Client({ name: 'claude-resume-client', version: '1' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+
+    const resumed = await client.callTool({
+      name: toolName,
+      arguments: toolName === 'workflow_resume'
+        ? { runId: claudeRunId }
+        : { resumeFromRunId: claudeRunId },
+    })
+    expect(resumed.structuredContent, JSON.stringify(resumed)).toBeDefined()
+    const runId = (resumed.structuredContent as { run: { runId: string } }).run.runId
+    let terminalStatus: string | undefined
+    for (let index = 0; index < 100; index += 1) {
+      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
+      terminalStatus = (status.structuredContent as { run: { status: string } }).run.status
+      if (terminalStatus === 'completed') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+
+    expect(terminalStatus).toBe('completed')
+    expect(resumed.structuredContent).toMatchObject({
+      ok: true,
+      run: {
+        runId: expect.stringMatching(/^run_/),
+        resumedFromRunId: claudeRunId,
+        lineageId: claudeRunId,
+        recoveryMode: 'manual',
+      },
+    })
+    expect(provider.calls).toHaveLength(0)
+
+    await client.close()
+    await server.close()
+    await service.stop()
+  })
+
+  it('keeps completed dynamic siblings cached through the service-level Claude resume path', async () => {
+    const fixture = await createClaudeDynamicRunIdFixture()
+    const provider = new FakeAgentProvider([{
+      outcome: { type: 'result', output: { type: 'text', text: 'verified-slow-live' } },
+    }])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(fixture.root, 'state')),
+      provider,
+      claudeProjectsRoot: fixture.claudeProjectsRoot,
+    })
+    await service.initialize()
+    const started = await service.resume(
+      { cwd: fixture.cwd },
+      { runId: fixture.runId },
+    )
+
+    let status = await service.status({ cwd: fixture.cwd }, started.runId)
+    for (let index = 0; index < 100 && status.status !== 'completed'; index += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      status = await service.status({ cwd: fixture.cwd }, started.runId)
+    }
+
+    expect(status.status).toBe('completed')
+    expect(provider.calls.map((call) => call.request.prompt)).toEqual(['verify:slow:SLOW'])
+    provider.assertExhausted()
+    await service.stop()
+  })
+
+  it('honors changed Claude resume args without enabling imported sparse reuse', async () => {
+    const fixture = await createClaudeDynamicRunIdFixture()
+    const provider = new FakeAgentProvider([
+      { outcome: { type: 'result', output: { type: 'text', text: 'FAST-LIVE' } } },
+      { outcome: { type: 'result', output: { type: 'text', text: 'verified-fast-live' } } },
+    ])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(fixture.root, 'changed-state')),
+      provider,
+      claudeProjectsRoot: fixture.claudeProjectsRoot,
+    })
+    await service.initialize()
+    const started = await service.start({ cwd: fixture.cwd }, {
+      resumeFromRunId: fixture.runId,
+      args: { items: ['fast'] },
+    })
+
+    let status = await service.status({ cwd: fixture.cwd }, started.runId)
+    for (let index = 0; index < 100 && status.status !== 'completed'; index += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      status = await service.status({ cwd: fixture.cwd }, started.runId)
+    }
+
+    expect(status.status).toBe('completed')
+    expect(provider.calls.map((call) => call.request.prompt)).toEqual([
+      'find:fast',
+      'verify:fast:FAST-LIVE',
+    ])
+    provider.assertExhausted()
+    await service.stop()
+  })
 })
+
+const CLAUDE_RESUME_SOURCE = `export const meta = {
+  name: 'claude-run-id-resume',
+  description: 'Claude run ID resume fixture',
+}
+return await agent('cached result', { schema: { type: 'object' } })
+`
+
+async function createClaudeRunIdFixture(runId: string): Promise<{
+  root: string
+  cwd: string
+  claudeProjectsRoot: string
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'workflow-mcp-claude-id-'))
+  const cwd = join(root, 'project')
+  const claudeProjectsRoot = join(root, 'claude-projects')
+  const projectKey = cwd.replace(/[^A-Za-z0-9]/g, '-')
+  const sessionRoot = join(claudeProjectsRoot, projectKey, 'session-one')
+  const metadataPath = join(sessionRoot, 'workflows', `${runId}.json`)
+  const scriptPath = join(sessionRoot, 'workflows', 'scripts', `claude-run-id-resume-${runId}.js`)
+  const journalPath = join(sessionRoot, 'subagents', 'workflows', runId, 'journal.jsonl')
+  await Promise.all([
+    mkdir(cwd, { recursive: true }),
+    mkdir(join(sessionRoot, 'workflows', 'scripts'), { recursive: true }),
+    mkdir(join(sessionRoot, 'subagents', 'workflows', runId), { recursive: true }),
+  ])
+  const key = createJournalKey('', 'cached result', { schema: { type: 'object' } })
+  await Promise.all([
+    writeFile(scriptPath, CLAUDE_RESUME_SOURCE),
+    writeFile(metadataPath, JSON.stringify({
+      runId,
+      workflowName: 'claude-run-id-resume',
+      status: 'completed',
+      scriptPath,
+      script: CLAUDE_RESUME_SOURCE,
+      agentCount: 1,
+    })),
+    writeFile(journalPath, `${JSON.stringify({
+      type: 'started',
+      key,
+      agentId: 'claude-agent-one',
+    })}\n${JSON.stringify({
+      type: 'result',
+      key,
+      agentId: 'claude-agent-one',
+      result: { cached: true },
+    })}\n`),
+  ])
+  return { root, cwd, claudeProjectsRoot }
+}
+
+async function createClaudeDynamicRunIdFixture(): Promise<{
+  root: string
+  cwd: string
+  claudeProjectsRoot: string
+  runId: string
+}> {
+  const runId = 'wf_dynamic1'
+  const source = `export const meta = {
+  name: 'claude-dynamic-resume',
+  description: 'Dynamic service resume fixture',
+}
+return await pipeline(
+  args.items,
+  item => agent('find:' + item),
+  (found, item) => agent('verify:' + item + ':' + found),
+)
+`
+  const root = await mkdtemp(join(tmpdir(), 'workflow-mcp-claude-dynamic-'))
+  const cwd = join(root, 'project')
+  const claudeProjectsRoot = join(root, 'claude-projects')
+  const projectKey = cwd.replace(/[^A-Za-z0-9]/g, '-')
+  const sessionRoot = join(claudeProjectsRoot, projectKey, 'session-one')
+  const metadataPath = join(sessionRoot, 'workflows', `${runId}.json`)
+  const scriptPath = join(sessionRoot, 'workflows', 'scripts', `claude-dynamic-${runId}.js`)
+  const runDirectory = join(sessionRoot, 'subagents', 'workflows', runId)
+  const calls = [
+    { agentId: 'find-slow', prompt: 'find:slow', result: 'SLOW' },
+    { agentId: 'find-fast', prompt: 'find:fast', result: 'FAST' },
+    { agentId: 'verify-fast', prompt: 'verify:fast:FAST', result: 'verified-fast-cached' },
+    { agentId: 'verify-slow', prompt: 'verify:slow:SLOW' },
+  ]
+  let previousKey = ''
+  const keyed = calls.map((call) => {
+    const key = createJournalKey(previousKey, call.prompt)
+    previousKey = key
+    return { ...call, key }
+  })
+  const records = [
+    ...keyed.map(({ key, agentId }) => ({ type: 'started', key, agentId })),
+    ...keyed.flatMap(({ key, agentId, result }) => (
+      result === undefined ? [] : [{ type: 'result', key, agentId, result }]
+    )),
+  ]
+  await Promise.all([
+    mkdir(cwd, { recursive: true }),
+    mkdir(dirname(scriptPath), { recursive: true }),
+    mkdir(runDirectory, { recursive: true }),
+  ])
+  await Promise.all([
+    writeFile(scriptPath, source),
+    writeFile(metadataPath, JSON.stringify({
+      runId,
+      workflowName: 'claude-dynamic-resume',
+      status: 'completed',
+      scriptPath,
+      script: source,
+      agentCount: 4,
+      args: { items: ['slow', 'fast'] },
+    })),
+    writeFile(
+      join(runDirectory, 'journal.jsonl'),
+      `${records.map((record) => JSON.stringify(record)).join('\n')}\n`,
+    ),
+    ...keyed.map(({ agentId, prompt }) => writeFile(
+      join(runDirectory, `agent-${agentId}.jsonl`),
+      `${JSON.stringify({
+        type: 'user',
+        agentId,
+        message: { role: 'user', content: prompt },
+      })}\n`,
+    )),
+  ])
+  return { root, cwd, claudeProjectsRoot, runId }
+}

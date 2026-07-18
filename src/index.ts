@@ -28,6 +28,7 @@ export type {
 export {
   ClaudeResumeError,
   claudeResumeSidecarPath,
+  findClaudeWorkflowRunMetadata,
   loadClaudeWorkflowResume,
 } from './claudeResume.js'
 export type { ClaudeWorkflowResume, ClaudeWorkflowRunMetadata } from './claudeResume.js'

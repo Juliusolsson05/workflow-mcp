@@ -1,5 +1,6 @@
 import type {
   AgentOutcome,
+  AgentReusedOutcome,
   AgentUsage,
   ArtifactCreatedEvent,
   ContentReference,
@@ -340,6 +341,37 @@ function applyAgentOutcome(
   return next
 }
 
+function applyReusedCoverageGap(
+  state: WorkflowSnapshot,
+  agentId: string,
+  outcome: AgentReusedOutcome,
+  timestamp: string,
+): WorkflowSnapshot {
+  const disposition = outcome.coverageGap
+  if (!disposition) throw new Error('Reused coverage gap has no disposition')
+  return updateAgent(state, agentId, 'agent.reused', (agent) => {
+    const {
+      error: _previousError,
+      skippedReason: _previousSkippedReason,
+      cancelledReason: _previousCancelledReason,
+      ...agentWithoutTerminalDetail
+    } = agent
+    // WHY journal reuse is not synonymous with success: automatic recovery intentionally reuses a
+    // durable casualty to avoid replaying unsafe work. Projecting that event as `completed` makes
+    // health counters claim full coverage while run.completed says the opposite. Preserve the
+    // logical terminal disposition while the outcome still records that no provider ran this time.
+    return {
+      ...agentWithoutTerminalDetail,
+      status: disposition.status,
+      completedAt: timestamp,
+      outcome,
+      ...(disposition.status === 'skipped'
+        ? { skippedReason: disposition.error.message }
+        : { error: disposition.error }),
+    }
+  })
+}
+
 function deriveCounts(agents: WorkflowAgentSnapshot[]): WorkflowAgentCounts {
   const counts = createWorkflowAgentCounts()
   counts.total = agents.length
@@ -642,7 +674,9 @@ export function reduceWorkflowState(
       if (event.attemptId !== undefined) {
         throw new Error('agent.reused cannot reference a provider attempt')
       }
-      next = applyAgentOutcome(next, event.agentId, undefined, event.payload, event.timestamp, event.type)
+      next = event.payload.coverageGap === undefined
+        ? applyAgentOutcome(next, event.agentId, undefined, event.payload, event.timestamp, event.type)
+        : applyReusedCoverageGap(next, event.agentId, event.payload, event.timestamp)
       break
 
     case 'agent.started':

@@ -221,6 +221,37 @@ describe('CodexAgentProvider', () => {
     })).toThrow(expect.objectContaining({ code: 'codex-capability-attestation-invalid' }))
   })
 
+  it('does not call a read-only request replay-safe when extra writable directories are exposed', () => {
+    const provider = new CodexAgentProvider({
+      client: mockClient([]).client,
+      capabilities: { inheritedMcpServers: 'disabled', mcpServers: [] },
+    })
+
+    expect(provider.assessReplaySafety(request({
+      sandbox: {
+        mode: 'read-only',
+        approvalPolicy: 'never',
+        network: false,
+        additionalWritableDirectories: ['/tmp/shared-output'],
+      },
+    }))).toMatchObject({ automatic: false, risk: 'unknown_external' })
+  })
+
+  it('never calls danger-full-access replay-safe even inside an isolated worktree', () => {
+    const provider = new CodexAgentProvider({
+      client: mockClient([]).client,
+      capabilities: { inheritedMcpServers: 'disabled', mcpServers: [] },
+    })
+
+    expect(provider.assessReplaySafety(request({
+      sandbox: { mode: 'danger-full-access', approvalPolicy: 'never', network: false },
+    }))).toMatchObject({
+      automatic: false,
+      risk: 'unknown_external',
+      reason: expect.stringMatching(/outside the isolated workspace/i),
+    })
+  })
+
   it('resumes a thread, maps a Claude model alias, prepends agent instructions, and parses schema output', async () => {
     const { client, calls } = mockClient([
       { type: 'thread.started', thread_id: 'thread-old' },
