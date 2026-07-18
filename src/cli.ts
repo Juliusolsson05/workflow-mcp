@@ -7,7 +7,7 @@ import type { LoadedWorkflow } from './loadWorkflow.js'
 import { claudeResumeSidecarPath, loadClaudeWorkflowResume } from './claudeResume.js'
 import { CodexAgentProvider } from './codexProvider.js'
 import { runWorkflow } from './runWorkflow.js'
-import type { WorkflowJournal } from './workflowJournal.js'
+import type { JournalReuseMode, WorkflowJournal } from './workflowJournal.js'
 import { PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
 import { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
 import { WorkflowService } from './workflowService.js'
@@ -103,13 +103,20 @@ async function main(): Promise<void> {
         workflowName: resume.metadata.workflowName,
         priorStatus: resume.metadata.status,
         journalRecordCount: resume.journalRecordCount,
+        importedPromptCount: resume.importedPromptCount,
         sidecarPath,
       })}\n`,
     )
     // Claude workflows can contain write-capable agents, but importing a foreign historical run
     // should never silently grant that capability. The standalone resume command is read-only;
     // an embedding host can call runWorkflow directly with an explicitly approved broader policy.
-    await executeAndPrint(resume.workflow, undefined, journal, 'read-only')
+    await executeAndPrint(
+      resume.workflow,
+      resume.metadata.args,
+      journal,
+      'read-only',
+      'exact-source-sparse',
+    )
     return
   }
 
@@ -175,12 +182,14 @@ async function executeAndPrint(
   args?: unknown,
   journal?: WorkflowJournal,
   sandboxMode: 'read-only' | 'workspace-write' = 'workspace-write',
+  journalReuseMode?: JournalReuseMode,
 ): Promise<void> {
   const concurrency = configuredConcurrency()
   const run = runWorkflow({
     workflow,
     ...(args === undefined ? {} : { args }),
     ...(journal === undefined ? {} : { journal }),
+    ...(journalReuseMode === undefined ? {} : { journalReuseMode }),
     cwd: process.cwd(),
     provider: new CodexAgentProvider(),
     ...(concurrency === undefined ? {} : { limits: { concurrency } }),
