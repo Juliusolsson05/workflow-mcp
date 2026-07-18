@@ -126,6 +126,7 @@ export type {
   AgentAttemptStarted,
   AgentSessionStartedEvent,
   AgentOutcome,
+  ContentChecksum,
   ContentReference,
   NormalizedAgentOptions,
   WorkflowActivityDetails,
@@ -135,6 +136,7 @@ export type {
   WorkflowEventSink,
   WorkflowEventType,
   WorkflowAgentFailurePlaceholder,
+  WorkflowResultMaterialization,
 } from './workflowEvents.js'
 
 export {
@@ -177,11 +179,24 @@ export type {
 } from './workerLauncher.js'
 export { NodeWorkflowWorkerLauncher } from './nodeWorkflowWorkerLauncher.js'
 
-export { FileWorkflowStore, WorkflowStoreError } from './fileWorkflowStore.js'
+export {
+  DEFAULT_MAX_WORKFLOW_RESULT_BYTES,
+  FileWorkflowStore,
+  MAX_WORKFLOW_RESULT_BYTES,
+  WorkflowStoreError,
+} from './fileWorkflowStore.js'
+export {
+  DEFAULT_WORKFLOW_RESULT_PAGE_BYTES,
+  MAX_WORKFLOW_RESULT_PAGE_BYTES,
+  MIN_WORKFLOW_RESULT_PAGE_BYTES,
+} from './workflowStore.js'
 export type {
   CreateWorkflowRunInput,
   StoredWorkflowEvent,
   WorkflowEventPage,
+  WorkflowResultArtifact,
+  WorkflowResultPage,
+  WorkflowResultReadInput as WorkflowStoreResultReadInput,
   WorkflowRunManifest,
   WorkflowRunSnapshot,
   WorkflowStore,
@@ -193,6 +208,7 @@ export type {
   WorkflowRunStartResult,
   WorkflowStoredRunReference,
   WorkflowRunHealth,
+  WorkflowResultReadInput,
   WorkflowStartInput,
   WorkflowResumeInput,
   WorkflowServiceErrorCode,

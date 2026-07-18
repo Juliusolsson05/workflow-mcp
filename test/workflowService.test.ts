@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -330,6 +331,254 @@ describe('WorkflowService', () => {
     )
     expect(all.events.at(-1)?.event.type).toBe('run.cancelled')
     expect((await service.status({ cwd: fixture.cwd }, run.runId)).status).toBe('cancelled')
+    await service.stop()
+  })
+
+  it('exposes and reads every byte of a truncated 1,186-line result after service restart', async () => {
+    const fixture = await project(`export const meta = { name: 'large-result', description: 'Durable result fixture' }
+      return args.result`)
+    const expected = Array.from(
+      { length: 1_186 },
+      (_, index) => `line ${index + 1}: ${'payload'.repeat(3)} 😀`,
+    ).join('\n')
+    const first = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+    })
+    await first.initialize()
+    const run = await first.start(
+      { cwd: fixture.cwd },
+      { name: 'large-result', args: { result: expected } },
+    )
+    const completed = await terminal(first, fixture.cwd, run.runId)
+    expect(completed).toMatchObject({
+      status: 'completed',
+      result: {
+        artifactId: expect.stringMatching(/^result_sha256_[a-f0-9]{64}$/),
+        mediaType: 'text/plain',
+        sizeBytes: Buffer.byteLength(expected),
+        lineCount: 1_186,
+        truncated: true,
+        checksum: { algorithm: 'sha256', value: expect.stringMatching(/^[a-f0-9]{64}$/) },
+      },
+    })
+    expect(completed.result).not.toHaveProperty('content')
+    const events = await first.readEvents(
+      { cwd: fixture.cwd },
+      { runId: run.runId, after: 0, limit: 1_000 },
+    )
+    const artifactEvent = events.events.find(stored => stored.event.type === 'artifact.created')
+    const completionEvent = events.events.find(stored => stored.event.type === 'run.completed')
+    expect(artifactEvent?.cursor).toBeLessThan(completionEvent?.cursor ?? 0)
+    expect(completionEvent?.event).toMatchObject({
+      payload: {
+        result: {
+          artifactId: completed.result?.artifactId,
+          truncated: true,
+        },
+      },
+    })
+    await first.stop()
+
+    const reopened = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+    })
+    await reopened.initialize()
+    let cursor: string | undefined
+    let reconstructed = ''
+    do {
+      const page = await reopened.readResult({ cwd: fixture.cwd }, {
+        runId: run.runId,
+        artifactId: completed.result!.artifactId!,
+        maxBytes: 257,
+        ...(cursor === undefined ? {} : { cursor }),
+      })
+      expect(Buffer.byteLength(page.content, 'utf8')).toBeLessThanOrEqual(257)
+      reconstructed += page.content
+      cursor = page.nextCursor
+      if (!page.hasMore) break
+      expect(cursor).toEqual(expect.any(String))
+    } while (true)
+    expect(reconstructed).toBe(expected)
+    expect(createHash('sha256').update(reconstructed, 'utf8').digest('hex')).toBe(
+      completed.result!.checksum!.value,
+    )
+    await expect(reopened.readResult({ cwd: join(fixture.cwd, 'other') }, {
+      runId: run.runId,
+      artifactId: completed.result!.artifactId!,
+    })).rejects.toMatchObject({ code: 'scope-forbidden' })
+
+    await unlink(join(
+      fixture.storeRoot,
+      'runs',
+      run.runId,
+      'artifacts',
+      'workflow-result.data',
+    ))
+    await expect(reopened.readResult({ cwd: fixture.cwd }, {
+      runId: run.runId,
+      artifactId: completed.result!.artifactId!,
+    })).rejects.toMatchObject({ code: 'result-expired' })
+    await reopened.stop()
+  })
+
+  it.each([
+    ['structured JSON', { nested: { ok: true }, values: [1, null, 'three'] }, 'application/json'],
+    ['null', null, 'application/json'],
+    ['empty string', '', 'text/plain'],
+    ['undefined', undefined, 'text/plain'],
+  ] as const)('materializes %s results with explicit media and line semantics', async (_label, value, mediaType) => {
+    const fixture = await project(`export const meta = { name: 'typed-result', description: 'Typed result fixture' }
+      return args`)
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+    const run = await service.start({ cwd: fixture.cwd }, { name: 'typed-result', args: value })
+    const completed = await terminal(service, fixture.cwd, run.runId)
+    const page = await service.readResult({ cwd: fixture.cwd }, {
+      runId: run.runId,
+      artifactId: completed.result!.artifactId!,
+      maxBytes: 7,
+    })
+    let serialized = page.content
+    let cursor = page.nextCursor
+    while (cursor !== undefined) {
+      const next = await service.readResult({ cwd: fixture.cwd }, {
+        runId: run.runId,
+        artifactId: completed.result!.artifactId!,
+        cursor,
+        maxBytes: 7,
+      })
+      serialized += next.content
+      cursor = next.nextCursor
+    }
+    expect(completed.result?.mediaType).toBe(mediaType)
+    expect(completed.result?.lineCount).toBe(value === '' ? 0 : serialized.split('\n').length)
+    if (mediaType === 'application/json') expect(JSON.parse(serialized)).toEqual(value)
+    else expect(serialized).toBe(value === undefined ? 'undefined' : value)
+    await service.stop()
+  })
+
+  it('rejects result reads for non-terminal and failed runs with stable error codes', async () => {
+    const waitingFixture = await project(`export const meta = { name: 'waiting-result', description: 'Waiting result fixture' }
+      return await agent('wait')`)
+    const waiting = new WorkflowService({
+      store: new FileWorkflowStore(waitingFixture.storeRoot),
+      provider: new FakeAgentProvider([{ outcome: { type: 'wait-for-abort' } }]),
+    })
+    await waiting.initialize()
+    const active = await waiting.start({ cwd: waitingFixture.cwd }, { name: 'waiting-result' })
+    await expect(waiting.readResult({ cwd: waitingFixture.cwd }, {
+      runId: active.runId,
+      artifactId: 'result_sha256_unknown',
+    })).rejects.toMatchObject({ code: 'result-not-ready' })
+    await waiting.cancel({ cwd: waitingFixture.cwd }, active.runId, 'finish result readiness test')
+    await waiting.stop()
+
+    const failedFixture = await project(`export const meta = { name: 'failed-result', description: 'Failed result fixture' }
+      throw new Error('intentional failure')`)
+    const failed = new WorkflowService({
+      store: new FileWorkflowStore(failedFixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+    })
+    await failed.initialize()
+    const run = await failed.start({ cwd: failedFixture.cwd }, { name: 'failed-result' })
+    await expect(terminal(failed, failedFixture.cwd, run.runId)).resolves.toMatchObject({ status: 'failed' })
+    await expect(failed.readResult({ cwd: failedFixture.cwd }, {
+      runId: run.runId,
+      artifactId: 'result_sha256_unknown',
+    })).rejects.toMatchObject({ code: 'result-unavailable' })
+    await failed.stop()
+  })
+
+  it('fails the run instead of publishing a completion whose result exceeds storage policy', async () => {
+    const fixture = await project(`export const meta = { name: 'oversized-result', description: 'Result cap fixture' }
+      return args`)
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot, { maxResultBytes: 32 }),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+    const run = await service.start(
+      { cwd: fixture.cwd },
+      { name: 'oversized-result', args: 'x'.repeat(33) },
+    )
+    await expect(terminal(service, fixture.cwd, run.runId)).resolves.toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('exceeds 32 UTF-8 bytes'),
+    })
+    const events = await service.readEvents(
+      { cwd: fixture.cwd },
+      { runId: run.runId, after: 0, limit: 1_000 },
+    )
+    expect(events.events.some(stored => stored.event.type === 'run.completed')).toBe(false)
+    await service.stop()
+  })
+
+  it('keeps legacy completion events readable while reporting their absent artifact explicitly', async () => {
+    const fixture = await project(`export const meta = { name: 'legacy-result', description: 'Legacy result fixture' }
+      return 'unused'`)
+    const seed = new FileWorkflowStore(fixture.storeRoot)
+    const lease = await seed.acquireLease('legacy-result-seed')
+    await seed.initialize()
+    await seed.createRun({
+      runId: 'run_legacy_result',
+      cwd: fixture.cwd,
+      workflow: parseWorkflowSource(`export const meta = { name: 'legacy-result', description: 'Legacy result fixture' }
+        return 'unused'`),
+    })
+    await seed.appendEvent('run_legacy_result', {
+      schemaVersion: 1,
+      runId: 'run_legacy_result',
+      sequence: 1,
+      eventId: 'legacy-started',
+      timestamp: new Date().toISOString(),
+      type: 'run.started',
+      payload: { workflow: { name: 'legacy-result', description: 'Legacy result fixture' } },
+    })
+    await seed.appendEvent('run_legacy_result', {
+      schemaVersion: 1,
+      runId: 'run_legacy_result',
+      sequence: 2,
+      eventId: 'legacy-completed',
+      timestamp: new Date().toISOString(),
+      type: 'run.completed',
+      payload: {
+        result: {
+          preview: 'legacy prefix',
+          content: 'legacy prefix',
+          lineCount: 12,
+          mediaType: 'text/plain',
+          truncated: true,
+        },
+      },
+    })
+    await lease.release()
+
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+    await expect(service.status({ cwd: fixture.cwd }, 'run_legacy_result')).resolves.toMatchObject({
+      status: 'completed',
+      result: { preview: 'legacy prefix', lineCount: 12, truncated: true },
+    })
+    const events = await service.readEvents(
+      { cwd: fixture.cwd },
+      { runId: 'run_legacy_result', after: 0, limit: 10 },
+    )
+    expect(events.events.at(-1)?.event).toMatchObject({
+      type: 'run.completed',
+      payload: { result: { content: 'legacy prefix' } },
+    })
+    await expect(service.readResult({ cwd: fixture.cwd }, {
+      runId: 'run_legacy_result',
+      artifactId: 'result_sha256_missing',
+    })).rejects.toMatchObject({ code: 'result-unavailable' })
     await service.stop()
   })
 })

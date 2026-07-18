@@ -32,6 +32,7 @@ export type {
   AgentAttemptStarted,
   AgentSessionStartedEvent,
   AgentOutcome,
+  ContentChecksum,
   ContentReference,
   NormalizedAgentOptions,
   WorkflowActivityDetails,
@@ -43,6 +44,8 @@ export type {
 export type {
   StoredWorkflowEvent,
   WorkflowEventPage,
+  WorkflowResultArtifact,
+  WorkflowResultPage,
   WorkflowRunManifest,
   WorkflowRunSnapshot,
 } from './workflowProtocol.js'

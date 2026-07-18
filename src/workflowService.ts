@@ -33,8 +33,14 @@ import type {
   WorkflowRunManifest,
   WorkflowRunSnapshot,
   WorkflowRunStatus,
+  WorkflowResultPage,
   WorkflowStore,
   WorkflowStoreLease,
+} from './workflowStore.js'
+import {
+  DEFAULT_WORKFLOW_RESULT_PAGE_BYTES,
+  MAX_WORKFLOW_RESULT_PAGE_BYTES,
+  MIN_WORKFLOW_RESULT_PAGE_BYTES,
 } from './workflowStore.js'
 import { WorkConservingScheduler } from './workConservingScheduler.js'
 import type { AgentScheduler, SchedulerSnapshot } from './workConservingScheduler.js'
@@ -185,6 +191,11 @@ export type WorkflowServiceErrorCode =
   | 'service-stopped'
   | 'unsafe-provider-active'
   | 'source-approval-required'
+  | 'result-not-ready'
+  | 'result-unavailable'
+  | 'result-not-found'
+  | 'result-expired'
+  | 'invalid-cursor'
   | 'invalid-request'
 
 export class WorkflowServiceError extends Error {
@@ -219,6 +230,13 @@ type ReadInput = {
   after?: number
   limit?: number
   waitMs?: number
+}
+
+export type WorkflowResultReadInput = {
+  runId: string
+  artifactId: string
+  cursor?: string
+  maxBytes?: number
 }
 
 export type WorkflowServiceListener = (event: StoredWorkflowEvent) => void
@@ -608,6 +626,80 @@ export class WorkflowService {
     return page
   }
 
+  async readResult(
+    scope: WorkflowServiceScope,
+    input: WorkflowResultReadInput,
+  ): Promise<WorkflowResultPage> {
+    const maxBytes = boundedInteger(
+      input.maxBytes ?? DEFAULT_WORKFLOW_RESULT_PAGE_BYTES,
+      'maxBytes',
+      MIN_WORKFLOW_RESULT_PAGE_BYTES,
+      MAX_WORKFLOW_RESULT_PAGE_BYTES,
+    )
+    if (input.artifactId.length === 0 || input.artifactId.length > 200) {
+      throw new WorkflowServiceError(
+        'invalid-request',
+        'artifactId must contain 1 to 200 characters',
+      )
+    }
+    if (input.cursor !== undefined && (input.cursor.length === 0 || input.cursor.length > 200)) {
+      throw new WorkflowServiceError('invalid-cursor', 'Workflow result cursor is malformed')
+    }
+    const manifest = await this.status(scope, input.runId)
+    if (manifest.status !== 'completed' && manifest.status !== 'completed_with_errors') {
+      if (!TERMINAL_STATUSES.has(manifest.status)) {
+        throw new WorkflowServiceError(
+          'result-not-ready',
+          `Workflow run ${input.runId} has not completed`,
+        )
+      }
+      throw new WorkflowServiceError(
+        'result-unavailable',
+        `Workflow run ${input.runId} ended with ${manifest.status} and has no result`,
+      )
+    }
+    const reference = manifest.result
+    if (reference?.artifactId === undefined) {
+      // Runs created before durable result artifacts may still carry a complete small inline value.
+      // Do not pretend that value is a paginated artifact: old truncated completions cannot be
+      // distinguished safely from complete ones after renderer compaction, and manufacturing a
+      // locator would give callers false restart/retention guarantees.
+      throw new WorkflowServiceError(
+        'result-unavailable',
+        `Workflow run ${input.runId} has no durable result artifact`,
+      )
+    }
+    if (input.artifactId !== reference.artifactId) {
+      throw new WorkflowServiceError(
+        'result-not-found',
+        `Workflow result artifact does not exist for ${input.runId}`,
+      )
+    }
+    try {
+      return await this.#options.store.readResult(input.runId, {
+        artifactId: input.artifactId,
+        maxBytes,
+        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+      })
+    } catch (cause) {
+      if (hasErrorCode(cause, 'invalid-cursor')) {
+        throw new WorkflowServiceError(
+          'invalid-cursor',
+          `Workflow result cursor is malformed or stale for ${input.runId}`,
+          { cause },
+        )
+      }
+      if (hasErrorCode(cause, 'result-not-found')) {
+        throw new WorkflowServiceError(
+          'result-expired',
+          `Workflow result artifact is missing or expired for ${input.runId}`,
+          { cause },
+        )
+      }
+      throw cause
+    }
+  }
+
   async cancel(
     scope: WorkflowServiceScope,
     runId: string,
@@ -970,6 +1062,10 @@ export class WorkflowService {
       // Durable store replay is the service source of truth. Keeping a second in-memory copy was
       // the renderer-host memory amplification that originally made large workflows unstable.
       retainEventHistory: false,
+      // Result bytes must cross the store's fsync boundary before artifact.created/run.completed
+      // can expose their locator. This hook is deliberately adjacent to the durable event sink:
+      // together they make completion publication one ordered artifact-then-event protocol.
+      materializeResult: result => this.#options.store.persistResult(runId, result),
       eventSink: async (event) => {
         const stored = await this.#options.store.appendEvent(runId, event)
         this.#publish(stored)

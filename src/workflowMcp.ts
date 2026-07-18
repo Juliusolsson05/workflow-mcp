@@ -2,6 +2,10 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import * as z from 'zod/v4'
 
 import { MAX_WORKFLOW_BYTES } from './loadWorkflow.js'
+import {
+  MAX_WORKFLOW_RESULT_PAGE_BYTES,
+  MIN_WORKFLOW_RESULT_PAGE_BYTES,
+} from './workflowStore.js'
 import type {
   WorkflowRunStartResult,
   WorkflowService,
@@ -14,7 +18,7 @@ To run an existing workflow, call workflow_list, optionally workflow_describe, t
 
 Inline source is saved under the current Git project's .claude/workflows and the run result returns scriptPath. That path is the editable Claude-visible definition. Iterate by editing it and calling workflow_run with scriptPath; existing definitions are never overwritten implicitly. Each execution also keeps a private immutable source snapshot for recovery and returns transcriptDirectory, containing journal.jsonl plus agent-<id>.jsonl mirrors for investigation.
 
-workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId accepts a native Agent Code run_* ID or discovers a real Claude wf_* run inside the scoped project, then creates a new linked run; workflow_resume remains a compatibility alias and keeps claudeRunPath as an explicit-path escape hatch. A manual resume reuses successful work but retries coverage gaps, while automatic host-crash recovery preserves terminal gaps without unsafe replay. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status and health. Continue until completed, completed_with_errors, failed, cancelled, or interrupted. Retryable replay-safe work starts a fresh provider thread beneath the same logical assignment; the abandoned physical attempt remains in the audit stream. Exhausted or replay-unsafe assignments return a versioned __workflowAgentFailure coverage-gap value, while independent siblings and final synthesis continue. Only persistence or supervisor faults fail the complete run. An untouched queued run, or a replay-safe run interrupted by a host crash, is automatically continued as a new run in the same lineage.
+workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId accepts a native Agent Code run_* ID or discovers a real Claude wf_* run inside the scoped project, then creates a new linked run; workflow_resume remains a compatibility alias and keeps claudeRunPath as an explicit-path escape hatch. A manual resume reuses successful work but retries coverage gaps, while automatic host-crash recovery preserves terminal gaps without unsafe replay. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status and health. Continue until completed, completed_with_errors, failed, cancelled, or interrupted. A completed run's run.result and run.completed payload carry an artifactId, byte/line counts, media type, and SHA-256 checksum. When result.truncated is true, call workflow_result_read with that runId and artifactId, then follow nextCursor until hasMore is false; never reconstruct a filesystem path. Retryable replay-safe work starts a fresh provider thread beneath the same logical assignment; the abandoned physical attempt remains in the audit stream. Exhausted or replay-unsafe assignments return a versioned __workflowAgentFailure coverage-gap value, while independent siblings and final synthesis continue. Only persistence or supervisor faults fail the complete run. An untouched queued run, or a replay-safe run interrupted by a host crash, is automatically continued as a new run in the same lineage.
 
 The service has a shared provider capacity of nine by default. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed batches of nine: when only two slow agents remain in such a batch, JavaScript has not admitted the next batch and the scheduler cannot fill the other seven slots. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`
 
@@ -109,7 +113,7 @@ export function registerWorkflowMcpTools(
     'workflow_run_status',
     {
       title: 'Workflow run status',
-      description: 'Read durable status plus scheduler/agent health, retry/stall counts, timestamps, recovery lineage, and latest event cursor. Terminal statuses are completed, completed_with_errors, failed, cancelled, and interrupted.',
+      description: 'Read durable status plus scheduler/agent health, retry/stall counts, timestamps, recovery lineage, and latest event cursor. Completed runs include run.result with the workflow_result_read artifact locator and integrity metadata. Terminal statuses are completed, completed_with_errors, failed, cancelled, and interrupted.',
       inputSchema: { runId: z.string().min(1) },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -136,6 +140,33 @@ export function registerWorkflowMcpTools(
         ...(after === undefined ? {} : { after }),
         ...(limit === undefined ? {} : { limit }),
         ...(waitMs === undefined ? {} : { waitMs }),
+      }),
+    }),
+  )
+
+  server.registerTool(
+    'workflow_result_read',
+    {
+      title: 'Read workflow result',
+      description: 'Read one bounded UTF-8 page of a completed run result. Copy artifactId from workflow_run_status.run.result or run.completed; follow nextCursor while hasMore. The locator is run-scoped and never accepts filesystem paths.',
+      inputSchema: {
+        runId: z.string().min(1),
+        artifactId: z.string().min(1).max(200),
+        cursor: z.string().min(1).max(200).optional(),
+        maxBytes: z.number().int()
+          .min(MIN_WORKFLOW_RESULT_PAGE_BYTES)
+          .max(MAX_WORKFLOW_RESULT_PAGE_BYTES)
+          .optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ runId, artifactId, cursor, maxBytes }) => result({
+      ok: true,
+      page: await service.readResult(scope, {
+        runId,
+        artifactId,
+        ...(cursor === undefined ? {} : { cursor }),
+        ...(maxBytes === undefined ? {} : { maxBytes }),
       }),
     }),
   )

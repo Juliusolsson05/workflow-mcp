@@ -14,7 +14,7 @@ import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
 
 describe('workflow MCP facade', () => {
-  it('registers the complete stable eight-tool surface', async () => {
+  it('registers the complete stable nine-tool surface', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-mcp-tools-'))
     const service = new WorkflowService({
       store: new FileWorkflowStore(join(cwd, 'state')),
@@ -31,6 +31,7 @@ describe('workflow MCP facade', () => {
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
       'workflow_describe',
       'workflow_list',
+      'workflow_result_read',
       'workflow_resume',
       'workflow_run',
       'workflow_run_cancel',
@@ -129,7 +130,17 @@ describe('workflow MCP facade', () => {
     })
     expect(resumedStatus.structuredContent).toMatchObject({
       ok: true,
-      run: { status: 'completed', resumedFromRunId: runId },
+      run: {
+        status: 'completed',
+        resumedFromRunId: runId,
+        result: {
+          artifactId: expect.stringMatching(/^result_sha256_[a-f0-9]{64}$/),
+          mediaType: 'text/plain',
+          sizeBytes: 7,
+          lineCount: 1,
+          checksum: { algorithm: 'sha256', value: expect.stringMatching(/^[a-f0-9]{64}$/) },
+        },
+      },
       health: {
         status: 'completed',
         scheduler: { capacity: 9, active: 0 },
@@ -138,6 +149,51 @@ describe('workflow MCP facade', () => {
         recoveryMode: 'manual',
       },
     })
+    const resultReference = (resumedStatus.structuredContent as {
+      run: { result: { artifactId: string } }
+    }).run.result
+    const firstResultPage = await client.callTool({
+      name: 'workflow_result_read',
+      arguments: { runId: resumedId, artifactId: resultReference.artifactId, maxBytes: 4 },
+    })
+    expect(JSON.parse((firstResultPage.content[0] as { text: string }).text)).toEqual(
+      firstResultPage.structuredContent,
+    )
+    expect(firstResultPage.structuredContent).toMatchObject({
+      ok: true,
+      page: {
+        runId: resumedId,
+        content: 'resu',
+        fromByte: 0,
+        toByte: 4,
+        hasMore: true,
+        nextCursor: expect.any(String),
+      },
+    })
+    const nextCursor = (firstResultPage.structuredContent as {
+      page: { nextCursor: string }
+    }).page.nextCursor
+    const finalResultPage = await client.callTool({
+      name: 'workflow_result_read',
+      arguments: {
+        runId: resumedId,
+        artifactId: resultReference.artifactId,
+        cursor: nextCursor,
+        maxBytes: 4,
+      },
+    })
+    expect(finalResultPage.structuredContent).toMatchObject({
+      page: { content: 'med', fromByte: 4, toByte: 7, hasMore: false },
+    })
+    const malformed = await client.callTool({
+      name: 'workflow_result_read',
+      arguments: {
+        runId: resumedId,
+        artifactId: resultReference.artifactId,
+        cursor: 'not-a-result-cursor',
+      },
+    })
+    expect(malformed.isError).toBe(true)
 
     await client.close()
     await server.close()
