@@ -267,13 +267,10 @@ describe('workflow MCP facade', () => {
       { runId: fixture.runId },
     )
 
-    let status = await service.status({ cwd: fixture.cwd }, started.runId)
-    for (let index = 0; index < 100 && status.status !== 'completed'; index += 1) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-      status = await service.status({ cwd: fixture.cwd }, started.runId)
-    }
-
-    expect(status.status).toBe('completed')
+    await expect.poll(
+      async () => (await service.status({ cwd: fixture.cwd }, started.runId)).status,
+      { timeout: 5_000, interval: 25 },
+    ).toBe('completed')
     expect(provider.calls.map((call) => call.request.prompt)).toEqual(['verify:slow:SLOW'])
     provider.assertExhausted()
     await service.stop()

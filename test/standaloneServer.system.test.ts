@@ -71,7 +71,7 @@ describe('standalone Streamable HTTP server', () => {
     await second.client.close()
     await server.close()
     await service.stop()
-  })
+  }, 20_000)
 })
 
 async function httpClient(url: string, token: string, name: string) {

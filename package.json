@@ -29,16 +29,25 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
-    "test": "npm run build && npm run check:browser-state && vitest run",
+    "build": "node scripts/clean-dist.mjs && tsc",
+    "typecheck": "tsc --noEmit && npm run check:browser-state",
+    "test": "npm run build && vitest run --project core && vitest run --project system && vitest run --project corpus",
+    "test:core": "npm run build && vitest run --project core",
+    "test:system": "npm run build && vitest run --project system",
+    "test:corpus": "vitest run --project corpus",
+    "test:live": "npm run build && vitest run --config vitest.live.config.ts --passWithNoTests",
+    "test:soak": "npm run build && vitest run --config vitest.soak.config.ts",
+    "test:coverage": "npm run build && vitest run --coverage --maxWorkers=1",
+    "test:package": "npm run build && node scripts/test-package.mjs",
+    "test:contract": "node scripts/check-test-contract.mjs",
     "check:browser-state": "tsc -p tsconfig.browser-state.json",
-    "test:integration": "npm run build && vitest run test/codexProvider.integration.test.ts",
+    "test:integration": "npm run test:live",
     "benchmark:codex": "npm run build && node dist/benchmarkCodex.js",
-    "check": "npm test",
+    "check": "npm run test:contract && npm run typecheck && npm test && npm run test:package",
     "prepack": "npm run build"
   },
   "engines": {
-    "node": ">=20.14.0"
+    "node": ">=20.19.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
@@ -49,6 +58,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.20.0",
+    "@vitest/coverage-v8": "^4.1.10",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
