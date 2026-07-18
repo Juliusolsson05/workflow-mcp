@@ -169,6 +169,41 @@ describe('workflow realm', () => {
     const completed = (await events).find((event) => event.type === 'run.completed')
     expect(completed?.payload.result.preview).toBe('undefined')
   })
+
+  it('materializes the canonical full result before publishing its artifact and completion events', async () => {
+    const expected = { report: 'x'.repeat(12_000), nested: [1, null, true] }
+    let serialized = ''
+    const { run, events } = start(workflow('return args'), [], {
+      args: expected,
+      materializeResult: async (materialization) => {
+        serialized = materialization.serializedContent
+        return {
+          ...materialization.reference,
+          artifactId: 'result_sha256_fixture',
+          sizeBytes: Buffer.byteLength(materialization.serializedContent),
+          checksum: { algorithm: 'sha256', value: 'a'.repeat(64) },
+        }
+      },
+    })
+
+    await expect(run.result).resolves.toEqual(expected)
+    expect(JSON.parse(serialized)).toEqual(expected)
+    const published = await events
+    expect(published.slice(-2).map(event => event.type)).toEqual([
+      'artifact.created',
+      'run.completed',
+    ])
+    expect(published.at(-1)).toMatchObject({
+      payload: {
+        result: {
+          artifactId: 'result_sha256_fixture',
+          mediaType: 'application/json',
+          truncated: true,
+          content: expect.any(String),
+        },
+      },
+    })
+  })
 })
 
 describe('agent scheduling and helpers', () => {
@@ -429,11 +464,11 @@ describe('cancellation, journal, and composition', () => {
     const { provider, run, events } = start(source, [
       { outcome: { type: 'wait-for-abort' } },
     ], { limits: { cancellationGraceMs: 100 } })
-    const rejected = expect(run.result).rejects.toMatchObject({ name: 'AbortError' })
+    const rejection = run.result.catch((error: unknown) => error)
 
     while (provider.activeExecutions === 0) await new Promise((resolveWait) => setTimeout(resolveWait, 2))
     await run.cancel('user stopped the run')
-    await rejected
+    await expect(rejection).resolves.toMatchObject({ name: 'AbortError' })
     const snapshot = projectWorkflowState(run.id, await events)
     expect(snapshot.status).toBe('cancelled')
     expect(snapshot.counts.cancelled).toBe(1)
@@ -451,7 +486,7 @@ describe('cancellation, journal, and composition', () => {
     const { provider, run, events } = start(source, [
       { outcome: { type: 'wait-for-abort' } },
     ], { limits: { concurrency: 1, cancellationGraceMs: 100 } })
-    const rejected = expect(run.result).rejects.toMatchObject({ name: 'AbortError' })
+    const rejection = run.result.catch((error: unknown) => error)
 
     // Provider start can win the IPC race before the worker's next two synchronous requests reach
     // the parent. Wait for the state this test names instead of sleeping and assuming host speed.
@@ -462,7 +497,7 @@ describe('cancellation, journal, and composition', () => {
     }
     while (provider.activeExecutions === 0) await new Promise((resolveWait) => setTimeout(resolveWait, 2))
     await run.cancel('stop queued work')
-    await rejected
+    await expect(rejection).resolves.toMatchObject({ name: 'AbortError' })
     const snapshot = projectWorkflowState(run.id, await events)
     expect(snapshot.counts.cancelled).toBe(3)
     expect(snapshot.agents.map((agent) => agent.attempts.length)).toEqual([1, 0, 0])
@@ -584,12 +619,12 @@ describe('cancellation, journal, and composition', () => {
     const first = start(source, [
       { sessionId: 'session-to-resume', outcome: { type: 'wait-for-abort' } },
     ], { journal, limits: { cancellationGraceMs: 100 } })
-    const rejected = expect(first.run.result).rejects.toMatchObject({ name: 'AbortError' })
+    const rejection = first.run.result.catch((error: unknown) => error)
     while (first.provider.activeExecutions === 0) {
       await new Promise((resolveWait) => setTimeout(resolveWait, 2))
     }
     await first.run.cancel('interrupt')
-    await rejected
+    await expect(rejection).resolves.toMatchObject({ name: 'AbortError' })
     await first.events
 
     const second = start(source, [

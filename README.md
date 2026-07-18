@@ -89,9 +89,9 @@ provider-neutral AgentProvider
 ## What you get
 
 - **Portable workflow files** — the same `.js` runs here and in Claude Code.
-- **A durable MCP server** — eight stable tools (`workflow_list`,
+- **A durable MCP server** — nine stable tools (`workflow_list`,
   `workflow_describe`, `workflow_validate`, `workflow_run`,
-  `workflow_run_status`, `workflow_run_events`, `workflow_run_cancel`,
+  `workflow_run_status`, `workflow_run_events`, `workflow_result_read`, `workflow_run_cancel`,
   `workflow_resume`) over stdio or an authenticated loopback HTTP transport.
 - **Immediate run handles** — `workflow_run` returns a run ID at once; clients
   follow progress by polling a durable cursor, not a transport-specific push.
@@ -157,6 +157,75 @@ Once served, both `workflow_resume({ runId: "wf_..." })` and
 `workflow_run({ resumeFromRunId: "wf_..." })` discover that Claude run inside
 the scoped project's Claude state. Use `claudeRunPath` only when duplicate
 historical metadata requires explicit selection.
+
+### Reading a complete result
+
+Every newly completed service run stores one immutable UTF-8 result artifact. The compact
+`workflow_run_status.run.result` reference and the `run.completed` event both include its
+`artifactId`, media type, total UTF-8 byte count, line count, and SHA-256 checksum. When
+`truncated` is true, inline `content` is only a display prefix; it is not the complete result.
+
+`workflow_result_read` accepts only a scoped `runId` plus that opaque `artifactId`—never a
+filesystem path. Pages default to 16 KiB and may request 4 through 65,536 bytes. Page ends are
+moved backward when necessary so concatenating `content` never splits a UTF-8 code point:
+
+```ts
+import { createHash } from 'node:crypto'
+
+const statusCall = await client.callTool({
+  name: 'workflow_run_status',
+  arguments: { runId },
+})
+const status = statusCall.structuredContent as {
+  run: {
+    result: {
+      artifactId: string
+      checksum: { algorithm: 'sha256'; value: string }
+    }
+  }
+}
+
+const parts: string[] = []
+let cursor: string | undefined
+for (;;) {
+  const call = await client.callTool({
+    name: 'workflow_result_read',
+    arguments: {
+      runId,
+      artifactId: status.run.result.artifactId,
+      ...(cursor === undefined ? {} : { cursor }),
+      maxBytes: 16_384,
+    },
+  })
+  const { page } = call.structuredContent as {
+    page: { content: string; hasMore: boolean; nextCursor?: string }
+  }
+  parts.push(page.content)
+  if (!page.hasMore) break
+  if (page.nextCursor === undefined) throw new Error('missing continuation cursor')
+  cursor = page.nextCursor
+}
+
+const completeResult = parts.join('')
+const digest = createHash('sha256').update(completeResult, 'utf8').digest('hex')
+if (digest !== status.run.result.checksum.value) throw new Error('result integrity mismatch')
+```
+
+String results are raw `text/plain`; objects, arrays, numbers, booleans, and `null` are pretty
+printed `application/json`; JavaScript `undefined` is the `text/plain` bytes `undefined`. An empty
+string has zero bytes and zero lines. A top-level string containing a lone UTF-16 surrogate fails
+before completion because it has no lossless UTF-8 representation. Non-terminal runs return
+`result-not-ready`; failed, cancelled, or interrupted runs return `result-unavailable`; a
+completed legacy run without an artifact also returns `result-unavailable`; and missing retained
+bytes return `result-expired`.
+Malformed, stale, or non-UTF-8-boundary cursors return `invalid-cursor`.
+
+`FileWorkflowStore` retains result bytes with the run directory and defaults to a 64 MiB result
+ceiling. Configure `maxResultBytes` when constructing the store if the host needs a different
+bounded policy (up to the hard 512 MiB safety ceiling). A result over that ceiling fails the run
+before `run.completed` rather than publishing another irreversible prefix. The direct
+`workflow-mcp run` CLI still writes its full result to stdout; the paginated contract applies to
+durable service/MCP runs.
 
 ## Embedding
 

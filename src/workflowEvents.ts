@@ -9,14 +9,20 @@ import type {
 
 export type { AgentUsage, ProviderSessionReference } from './agentProvider.js'
 
+export type ContentChecksum = {
+  algorithm: 'sha256'
+  /** Lowercase hexadecimal digest of the complete UTF-8 artifact bytes. */
+  value: string
+}
+
 /**
  * A bounded piece of content carried by the event stream.
  *
- * WHY both `preview` and `content` exist: prompts and outcomes are small enough to retain in
- * memory today, but production runs will eventually move large values into an artifact store.
- * Consumers must be able to render a list without loading the artifact, while an inspector can
- * still show the full value when it is present. Keeping that distinction in version one avoids a
- * breaking event migration when persistence arrives.
+ * WHY both `preview` and `content` exist: most prompts and agent outcomes are small enough to
+ * retain in events, while final workflow results now move their complete bytes into the artifact
+ * store. Consumers must be able to render a list without loading an artifact, while an inspector
+ * can still show inline content when it is present. The optional locator fields keep one additive
+ * shape readable across legacy inline-only events and durable paginated results.
  */
 export type ContentReference = {
   preview: string
@@ -25,6 +31,24 @@ export type ContentReference = {
   artifactId?: string
   mediaType?: string
   truncated?: boolean
+  /** Exact UTF-8 artifact size, not JavaScript UTF-16 code units. */
+  sizeBytes?: number
+  /** Stable integrity identity for reassembling bounded result pages. */
+  checksum?: ContentChecksum
+}
+
+/**
+ * The executor owns JavaScript normalization while the store owns durable bytes.
+ *
+ * WHY this handoff contains a serialized string rather than the raw result: `runWorkflow` already
+ * applies the compatibility boundary which turns Dates into ISO strings, rejects cycles and
+ * blocked keys, and maps non-finite numbers to null. Asking a store to repeat that policy would
+ * let the inline completion event and downloaded artifact disagree about what the workflow
+ * returned. The store encodes this one canonical representation as UTF-8 and adds its locator.
+ */
+export type WorkflowResultMaterialization = {
+  serializedContent: string
+  reference: ContentReference
 }
 
 export type WorkflowErrorReference = {

@@ -1,4 +1,9 @@
-import type { WorkflowDefinitionReference, WorkflowEvent } from './workflowEvents.js'
+import type {
+  ContentChecksum,
+  ContentReference,
+  WorkflowDefinitionReference,
+  WorkflowEvent,
+} from './workflowEvents.js'
 import type { WorkflowSnapshot } from './workflowState.js'
 
 /** Pure durable/wire DTOs shared by Node hosts and browser renderers. */
@@ -34,6 +39,29 @@ export type WorkflowRunManifest = {
   providerRecoveryFingerprint?: string
   cancellationReason?: string
   error?: string
+  /** Compact completion reference; full bytes remain in the run-owned result artifact. */
+  result?: ContentReference
+}
+
+export type WorkflowResultArtifact = {
+  artifactId: string
+  mediaType: string
+  sizeBytes: number
+  lineCount: number
+  checksum: ContentChecksum
+}
+
+export type WorkflowResultPage = {
+  runId: string
+  artifact: WorkflowResultArtifact
+  encoding: 'utf-8'
+  /** Inclusive byte offset in the immutable UTF-8 artifact. */
+  fromByte: number
+  /** Exclusive byte offset; use `nextCursor` instead of manufacturing offsets. */
+  toByte: number
+  content: string
+  hasMore: boolean
+  nextCursor?: string
 }
 
 export type StoredWorkflowEvent = {

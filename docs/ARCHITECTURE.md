@@ -80,6 +80,8 @@ from its strict cursor stream after a renderer reload or provider reconnect:
     agent-<id>.jsonl
   events.jsonl
   artifacts/
+    workflow-result.data
+    workflow-result.json
 ```
 
 ```ts
@@ -111,9 +113,10 @@ await service.initialize()
 registerWorkflowMcpTools(mcpServer, service, { cwd: projectDirectory, clientId: sessionId })
 ```
 
-The eight stable tools are `workflow_list`, `workflow_describe`, `workflow_validate`,
-`workflow_run`, `workflow_run_status`, `workflow_run_events`, `workflow_run_cancel`, and
-`workflow_resume`. Machine results are returned as both `structuredContent` and JSON text so Claude
+The nine stable tools are `workflow_list`, `workflow_describe`, `workflow_validate`,
+`workflow_run`, `workflow_run_status`, `workflow_run_events`, `workflow_result_read`,
+`workflow_run_cancel`, and `workflow_resume`. Machine results are returned as both
+`structuredContent` and JSON text so Claude
 and Codex transcript envelopes preserve the same run ID. `workflow_run_events` is bounded long
 polling over the durable cursor, not a transport-specific notification protocol.
 
@@ -899,6 +902,7 @@ workflow_validate
 workflow_run
 workflow_run_status
 workflow_run_events
+workflow_result_read
 workflow_run_cancel
 ```
 
@@ -922,6 +926,13 @@ notification must carry the last durable cursor, and reconnecting clients must f
 `workflow_run_events`. Live delivery is an optimization; correctness never depends on it.
 
 Do not add a separate WebSocket protocol initially.
+
+Completed results use a separate immutable artifact rather than making the terminal event an
+unbounded transport. The status manifest and `run.completed` event carry the same opaque artifact
+ID, UTF-8 byte/line totals, media type, truncation flag, and SHA-256 identity. Clients page with
+`workflow_result_read`; cursors bind the checksum plus next byte offset and page ends stay on UTF-8
+boundaries. The store opens fixed run-owned file names after project-scope authorization and only
+compares the opaque artifact ID, so no caller-controlled string is ever resolved as a path.
 
 ### MCP resources
 
