@@ -11,6 +11,7 @@ import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { registerWorkflowMcpTools } from '../src/workflowMcp.js'
 import { WorkflowService } from '../src/workflowService.js'
+import { createJournalKey } from '../src/workflowJournal.js'
 
 describe('workflow MCP facade', () => {
   it('registers the complete stable eight-tool surface', async () => {
@@ -142,4 +143,105 @@ describe('workflow MCP facade', () => {
     await server.close()
     await service.stop()
   })
+
+  it.each([
+    ['workflow_resume', 'wf_resume1'],
+    ['workflow_run', 'wf_run001'],
+  ] as const)('continues a real Claude run by ID through %s', async (toolName, claudeRunId) => {
+    const fixture = await createClaudeRunIdFixture(claudeRunId)
+    const provider = new FakeAgentProvider([])
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(fixture.root, 'state')),
+      provider,
+      claudeProjectsRoot: fixture.claudeProjectsRoot,
+    })
+    await service.initialize()
+    const server = new McpServer({ name: 'claude-resume-server', version: '1' })
+    registerWorkflowMcpTools(server, service, { cwd: fixture.cwd })
+    const client = new Client({ name: 'claude-resume-client', version: '1' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+
+    const resumed = await client.callTool({
+      name: toolName,
+      arguments: toolName === 'workflow_resume'
+        ? { runId: claudeRunId }
+        : { resumeFromRunId: claudeRunId },
+    })
+    expect(resumed.structuredContent, JSON.stringify(resumed)).toBeDefined()
+    const runId = (resumed.structuredContent as { run: { runId: string } }).run.runId
+    let terminalStatus: string | undefined
+    for (let index = 0; index < 100; index += 1) {
+      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
+      terminalStatus = (status.structuredContent as { run: { status: string } }).run.status
+      if (terminalStatus === 'completed') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+
+    expect(terminalStatus).toBe('completed')
+    expect(resumed.structuredContent).toMatchObject({
+      ok: true,
+      run: {
+        runId: expect.stringMatching(/^run_/),
+        resumedFromRunId: claudeRunId,
+        lineageId: claudeRunId,
+        recoveryMode: 'manual',
+      },
+    })
+    expect(provider.calls).toHaveLength(0)
+
+    await client.close()
+    await server.close()
+    await service.stop()
+  })
 })
+
+const CLAUDE_RESUME_SOURCE = `export const meta = {
+  name: 'claude-run-id-resume',
+  description: 'Claude run ID resume fixture',
+}
+return await agent('cached result', { schema: { type: 'object' } })
+`
+
+async function createClaudeRunIdFixture(runId: string): Promise<{
+  root: string
+  cwd: string
+  claudeProjectsRoot: string
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'workflow-mcp-claude-id-'))
+  const cwd = join(root, 'project')
+  const claudeProjectsRoot = join(root, 'claude-projects')
+  const projectKey = cwd.replace(/[^A-Za-z0-9]/g, '-')
+  const sessionRoot = join(claudeProjectsRoot, projectKey, 'session-one')
+  const metadataPath = join(sessionRoot, 'workflows', `${runId}.json`)
+  const scriptPath = join(sessionRoot, 'workflows', 'scripts', `claude-run-id-resume-${runId}.js`)
+  const journalPath = join(sessionRoot, 'subagents', 'workflows', runId, 'journal.jsonl')
+  await Promise.all([
+    mkdir(cwd, { recursive: true }),
+    mkdir(join(sessionRoot, 'workflows', 'scripts'), { recursive: true }),
+    mkdir(join(sessionRoot, 'subagents', 'workflows', runId), { recursive: true }),
+  ])
+  const key = createJournalKey('', 'cached result', { schema: { type: 'object' } })
+  await Promise.all([
+    writeFile(scriptPath, CLAUDE_RESUME_SOURCE),
+    writeFile(metadataPath, JSON.stringify({
+      runId,
+      workflowName: 'claude-run-id-resume',
+      status: 'completed',
+      scriptPath,
+      script: CLAUDE_RESUME_SOURCE,
+      agentCount: 1,
+    })),
+    writeFile(journalPath, `${JSON.stringify({
+      type: 'started',
+      key,
+      agentId: 'claude-agent-one',
+    })}\n${JSON.stringify({
+      type: 'result',
+      key,
+      agentId: 'claude-agent-one',
+      result: { cached: true },
+    })}\n`),
+  ])
+  return { root, cwd, claudeProjectsRoot }
+}

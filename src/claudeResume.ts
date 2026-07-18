@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
@@ -46,6 +46,68 @@ export function claudeResumeSidecarPath(metadataFilePath: string): string {
   // private state directory; Claude can keep reading and writing its native journal independently.
   const identity = createHash('sha256').update(resolve(metadataFilePath), 'utf8').digest('hex')
   return join(homedir(), '.workflow-mcp', 'journals', `${identity}.json`)
+}
+
+export async function findClaudeWorkflowRunMetadata(
+  projectRoot: string,
+  runId: string,
+): Promise<string> {
+  if (!/^wf_[a-z0-9-]{6,}$/.test(runId)) {
+    throw new ClaudeResumeError('invalid-run-id', `Invalid Claude workflow run ID: ${JSON.stringify(runId)}`)
+  }
+  const root = resolve(projectRoot)
+  let sessions
+  try {
+    sessions = await readdir(root, { withFileTypes: true })
+  } catch (cause) {
+    if (isMissing(cause)) {
+      throw new ClaudeResumeError('run-not-found', `Cannot find Claude workflow run ${runId}`, { cause })
+    }
+    throw new ClaudeResumeError('read-error', `Cannot inspect Claude project state: ${root}`, { cause })
+  }
+
+  // Claude nests workflow metadata beneath an opaque session directory. We inspect exactly that
+  // one documented level instead of recursively walking ~/.claude: bounded discovery keeps a typo
+  // from turning an MCP call into an unbounded home-directory scan, and it makes project scoping
+  // auditable from this function alone.
+  const candidates: string[] = []
+  for (const session of sessions) {
+    if (!session.isDirectory()) continue
+    const metadataPath = join(root, session.name, 'workflows', `${runId}.json`)
+    try {
+      if ((await stat(metadataPath)).isFile()) candidates.push(metadataPath)
+    } catch (cause) {
+      if (isMissing(cause)) continue
+      throw new ClaudeResumeError('read-error', `Cannot inspect Claude run metadata: ${metadataPath}`, {
+        cause,
+      })
+    }
+  }
+  if (candidates.length === 0) {
+    throw new ClaudeResumeError('run-not-found', `Cannot find Claude workflow run ${runId}`)
+  }
+  if (candidates.length > 1) {
+    // Run IDs are expected to identify one execution globally. Choosing the newest duplicate would
+    // silently attach historical agent results to whichever session happened to win an mtime race,
+    // so ambiguity is an integrity failure that requires the explicit claudeRunPath escape hatch.
+    throw new ClaudeResumeError(
+      'ambiguous-run',
+      `Claude workflow run ${runId} exists in multiple sessions; use claudeRunPath explicitly`,
+    )
+  }
+
+  const metadataPath = candidates[0] as string
+  const metadata = parseMetadata(
+    await readBoundedJson(metadataPath, MAX_CLAUDE_RUN_BYTES, 'Claude run metadata'),
+    metadataPath,
+  )
+  if (metadata.runId !== runId) {
+    throw new ClaudeResumeError(
+      'run-id-mismatch',
+      `Claude run metadata ${metadataPath} contains ${JSON.stringify(metadata.runId)}, not ${JSON.stringify(runId)}`,
+    )
+  }
+  return metadataPath
 }
 
 /**
@@ -213,4 +275,10 @@ function parseJournalRecord(value: unknown, line: number): JournalRecord {
     throw new ClaudeResumeError('journal-invalid-record', `Claude result line ${line} has no result`)
   }
   return { type: 'result', key: input.key, agentId: input.agentId, result: input.result }
+}
+
+function isMissing(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && 'code' in value && (
+    value.code === 'ENOENT' || value.code === 'ENOTDIR'
+  )
 }
