@@ -401,6 +401,44 @@ describe('InMemoryWorkflowJournal', () => {
     }).reused).toBe(false)
   })
 
+  it('bounds imported option proofs by cumulative prompt bytes before falling back to live work', () => {
+    // WHY the fixture uses one large prompt across many plausible predecessors: the old guard
+    // counted hashes but ignored their byte size. Its nominal one-million-iteration ceiling still
+    // permitted a legal 4 MiB prompt to request hundreds of gigabytes of synchronous hashing. Put
+    // the real predecessor beyond the byte budget and prove resume degrades to a miss instead of
+    // spending unbounded CPU to discover the cached result.
+    const prompt = 'x'.repeat(1024 * 1024)
+    const filler = Array.from({ length: 160 }, (_, index) => ({
+      type: 'started' as const,
+      key: `v2:${(index + 1).toString(16).padStart(64, '0')}`,
+      agentId: `historical-${index}`,
+    }))
+    const predecessor = filler.at(-1)!.key
+    const candidateKey = createJournalKey(predecessor, prompt, { model: 'same-model' })
+    const snapshot: JournalSnapshot = {
+      ...identity,
+      records: [
+        ...filler,
+        { type: 'started', key: candidateKey, agentId: 'old-candidate' },
+        { type: 'result', key: candidateKey, agentId: 'old-candidate', result: 'cached' },
+      ],
+      importedCalls: [{
+        key: candidateKey,
+        agentId: 'old-candidate',
+        promptKey: createImportedPromptKey(prompt),
+      }],
+    }
+    const resumed = new InMemoryWorkflowJournal([snapshot]).beginRun(identity, {
+      reuseMode: 'exact-source-sparse',
+    })
+
+    expect(resumed.admit({
+      agentId: 'new-candidate',
+      prompt,
+      options: { model: 'same-model' },
+    }).reused).toBe(false)
+  })
+
   it('distinguishes a successful null from the legacy provider-failure null sentinel', () => {
     const original = new InMemoryWorkflowJournal()
     const run = original.beginRun(identity)

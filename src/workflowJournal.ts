@@ -5,7 +5,14 @@ import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 
 const EXECUTION_OPTION_KEYS = ['schema', 'model', 'effort', 'isolation', 'agentType'] as const
 const OMIT = Symbol('omit-from-journal-key')
-const MAX_IMPORTED_OPTION_PROOF_HASHES = 1_000_000
+// Imported Claude transcripts do not retain the execution options that contributed to each
+// chained key, so the compatibility fallback has to try plausible historical predecessors. Both
+// limits are load-bearing. A count-only ceiling still lets one legal 4 MiB prompt force hundreds
+// of gigabytes of synchronous SHA-256 work, while a byte-only ceiling lets empty prompts create a
+// million tiny Hash instances. Resume reuse is an optimization: once either finite work budget is
+// exhausted, rerunning the remaining calls is safer than freezing the service's owning process.
+const MAX_IMPORTED_OPTION_PROOF_HASHES = 100_000
+const MAX_IMPORTED_OPTION_PROOF_BYTES = 128 * 1024 * 1024
 
 type CanonicalValue = null | boolean | number | string | CanonicalValue[] | { [key: string]: CanonicalValue }
 
@@ -222,8 +229,30 @@ export function createJournalKey(
   // Keep source identity outside this digest: Claude first checks that the stored workflow source is
   // compatible, then computes call keys from the sequential calls alone. That separation also lets a
   // durable store inspect why reuse failed (different workflow, source, or call) without reverse hashing.
-  const payload = `${previousKey}\0${prompt}\0${canonicalizeJournalValue(executionOptions(options))}`
-  return `v2:${createHash('sha256').update(payload, 'utf8').digest('hex')}`
+  return createJournalKeyFromCanonicalOptions(
+    previousKey,
+    prompt,
+    canonicalizeJournalValue(executionOptions(options)),
+  )
+}
+
+function createJournalKeyFromCanonicalOptions(
+  previousKey: string,
+  prompt: string,
+  canonicalOptions: string,
+): string {
+  // Feed the same framed UTF-8 bytes incrementally. Apart from avoiding one large concatenated
+  // allocation, this lets the imported-options proof canonicalize a potentially large schema once
+  // per call instead of once per predecessor candidate. Digest compatibility with Claude's v2 key
+  // remains byte-for-byte identical to `${previousKey}\0${prompt}\0${canonicalOptions}`.
+  const digest = createHash('sha256')
+    .update(previousKey, 'utf8')
+    .update('\0', 'utf8')
+    .update(prompt, 'utf8')
+    .update('\0', 'utf8')
+    .update(canonicalOptions, 'utf8')
+    .digest('hex')
+  return `v2:${digest}`
 }
 
 export function createImportedPromptKey(prompt: string): string {
@@ -356,6 +385,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
   readonly #reuseCoverageGaps: boolean
   readonly #trackImportedPrompts: boolean
   #remainingImportedOptionProofHashes = MAX_IMPORTED_OPTION_PROOF_HASHES
+  #remainingImportedOptionProofBytes = MAX_IMPORTED_OPTION_PROOF_BYTES
 
   constructor(
     identity: JournalIdentity,
@@ -539,12 +569,24 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     // that finite set succeeds only when schema/model/effort/isolation/agentType match the capture.
     //
     // A malicious near-limit journal must not turn this compatibility proof into quadratic CPU
-    // denial of service. Once the lineage-wide hash budget is spent, remaining semantic candidates
-    // simply rerun through the provider; correctness never depends on the optimization.
+    // denial of service. Count and byte budgets are both lineage-wide because many individually
+    // harmless candidates can otherwise accumulate the same unbounded work. Once either is spent,
+    // remaining semantic candidates simply rerun through the provider; correctness never depends on
+    // the optimization.
+    const canonicalOptions = canonicalizeJournalValue(executionOptions(call.options))
+    const sharedBytes = Buffer.byteLength(call.prompt, 'utf8') +
+      Buffer.byteLength(canonicalOptions, 'utf8') +
+      2 // The two NUL framing bytes in Claude's v2 digest payload.
     for (const previousKey of this.#historicalKeys) {
       if (this.#remainingImportedOptionProofHashes <= 0) return false
+      const hashBytes = sharedBytes + Buffer.byteLength(previousKey, 'utf8')
+      if (hashBytes > this.#remainingImportedOptionProofBytes) return false
       this.#remainingImportedOptionProofHashes -= 1
-      if (createJournalKey(previousKey, call.prompt, call.options) === candidate.key) return true
+      this.#remainingImportedOptionProofBytes -= hashBytes
+      if (
+        createJournalKeyFromCanonicalOptions(previousKey, call.prompt, canonicalOptions) ===
+        candidate.key
+      ) return true
     }
     return false
   }
