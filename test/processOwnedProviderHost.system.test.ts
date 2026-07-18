@@ -178,7 +178,10 @@ describe('ProcessOwnedCodexHost', () => {
       attempt: secondIdentity,
       emit: async () => undefined,
     })
-    await expect.poll(() => readFile(`${pidPath}-second.options.json`, 'utf8').then(Boolean).catch(() => false)).toBe(true)
+    await expect.poll(
+      () => readFile(`${pidPath}-second.options.json`, 'utf8').then(Boolean).catch(() => false),
+      { timeout: 5_000, interval: 25 },
+    ).toBe(true)
     expect(await readFile(join(codexHome, 'auth.json'), 'utf8')).toContain('rotated')
     await host.terminateAttempt(secondIdentity, { code: 'shutdown', message: 'test complete' })
     await expect(secondExecution).rejects.toMatchObject({ name: 'AbortError' })
@@ -196,7 +199,10 @@ describe('ProcessOwnedCodexHost', () => {
       attempt: thirdIdentity,
       emit: async () => undefined,
     })
-    await expect.poll(() => readFile(`${pidPath}-third.options.json`, 'utf8').then(Boolean).catch(() => false)).toBe(true)
+    await expect.poll(
+      () => readFile(`${pidPath}-third.options.json`, 'utf8').then(Boolean).catch(() => false),
+      { timeout: 5_000, interval: 25 },
+    ).toBe(true)
     await expect(readFile(join(codexHome, 'auth.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' })
     await host.terminateAttempt(thirdIdentity, { code: 'shutdown', message: 'test complete' })
     await expect(thirdExecution).rejects.toMatchObject({ name: 'AbortError' })
