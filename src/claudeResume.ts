@@ -1,16 +1,19 @@
 import { createHash } from 'node:crypto'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { open, readFile, readdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
 import { loadWorkflowFile } from './loadWorkflow.js'
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import { InMemoryWorkflowJournal } from './workflowJournal.js'
-import type { JournalRecord, JournalSnapshot } from './workflowJournal.js'
+import { createImportedPromptKey } from './workflowJournal.js'
+import type { JournalImportedCall, JournalRecord, JournalSnapshot } from './workflowJournal.js'
 
 const MAX_CLAUDE_RUN_BYTES = 16 * 1024 * 1024
 const MAX_CLAUDE_JOURNAL_BYTES = 256 * 1024 * 1024
 const MAX_CLAUDE_JOURNAL_RECORDS = 100_000
+const MAX_CLAUDE_AGENT_PROMPT_BYTES = 4 * 1024 * 1024
+const CLAUDE_TRANSCRIPT_READ_CONCURRENCY = 16
 
 export type ClaudeWorkflowRunMetadata = {
   runId: string
@@ -19,6 +22,7 @@ export type ClaudeWorkflowRunMetadata = {
   scriptPath: string
   script?: string
   agentCount?: number
+  args?: unknown
 }
 
 export type ClaudeWorkflowResume = {
@@ -28,6 +32,7 @@ export type ClaudeWorkflowResume = {
   metadataPath: string
   journalPath: string
   journalRecordCount: number
+  importedPromptCount: number
 }
 
 export class ClaudeResumeError extends Error {
@@ -156,11 +161,13 @@ export async function loadClaudeWorkflowResume(
     'journal.jsonl',
   )
   const records = await readClaudeJournal(journalPath)
+  const importedCalls = await readClaudeImportedCalls(dirname(journalPath), records)
   const workflowId = workflow.filePath ?? workflow.meta.name
   const snapshot: JournalSnapshot = {
     workflowId,
     sourceHash: workflow.sourceHash,
     records,
+    ...(importedCalls.length === 0 ? {} : { importedCalls }),
   }
 
   return {
@@ -170,6 +177,7 @@ export async function loadClaudeWorkflowResume(
     metadataPath,
     journalPath,
     journalRecordCount: records.length,
+    importedPromptCount: importedCalls.length,
   }
 }
 
@@ -210,6 +218,10 @@ function parseMetadata(value: unknown, path: string): ClaudeWorkflowRunMetadata 
     ...(Number.isSafeInteger(input.agentCount) && (input.agentCount as number) >= 0
       ? { agentCount: input.agentCount as number }
       : {}),
+    // Property presence matters: JSON null is a real workflow argument, while an absent field means
+    // the original invocation did not supply args at all. Keep that distinction so the service can
+    // recreate the same worker global before enabling exact-source sparse reuse.
+    ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
   }
 }
 
@@ -275,6 +287,121 @@ function parseJournalRecord(value: unknown, line: number): JournalRecord {
     throw new ClaudeResumeError('journal-invalid-record', `Claude result line ${line} has no result`)
   }
   return { type: 'result', key: input.key, agentId: input.agentId, result: input.result }
+}
+
+async function readClaudeImportedCalls(
+  runDirectory: string,
+  records: readonly JournalRecord[],
+): Promise<JournalImportedCall[]> {
+  let entries
+  try {
+    entries = await readdir(runDirectory, { withFileTypes: true })
+  } catch {
+    // Claude's journal remains sufficient for ordinary longest-prefix reuse. Transcript indexing is
+    // an optimization for dynamic fan-out, so an older or partially cleaned run must degrade to the
+    // existing behavior instead of making an otherwise valid resume impossible.
+    return []
+  }
+  const transcriptNames = new Set(
+    entries.filter((entry) => entry.isFile()).map((entry) => entry.name),
+  )
+  const seenStarts = new Set<string>()
+  const starts = records.filter((record): record is Extract<JournalRecord, { type: 'started' }> => {
+    if (record.type !== 'started') return false
+    const identity = `${record.key}\0${record.agentId}`
+    if (seenStarts.has(identity)) return false
+    // Claude may append the same logical start again around a provider retry. One transcript hash is
+    // enough to index that identity; emitting duplicate capability records would turn an otherwise
+    // conservatively resumable journal into a validation failure in the in-memory boundary.
+    seenStarts.add(identity)
+    return true
+  })
+  const imported: Array<JournalImportedCall | undefined> = new Array(starts.length)
+  let cursor = 0
+
+  const worker = async (): Promise<void> => {
+    while (cursor < starts.length) {
+      const index = cursor
+      cursor += 1
+      const record = starts[index]
+      if (record === undefined) continue
+      // Agent IDs belong to Claude's journal contract, which historically allowed any non-empty
+      // string. Keep accepting that journal, but only derive a sibling filename from the bounded
+      // filename-safe IDs emitted by real Claude versions; an exotic legacy ID simply keeps normal
+      // chained-prefix behavior instead of gaining a path traversal primitive.
+      if (!/^[A-Za-z0-9_-]{1,200}$/.test(record.agentId)) continue
+      const name = `agent-${record.agentId}.jsonl`
+      if (!transcriptNames.has(name)) continue
+      const prompt = await readClaudeAgentPrompt(join(runDirectory, name), record.agentId)
+      if (prompt === undefined) continue
+      imported[index] = {
+        key: record.key,
+        agentId: record.agentId,
+        promptKey: createImportedPromptKey(prompt),
+      }
+    }
+  }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(CLAUDE_TRANSCRIPT_READ_CONCURRENCY, starts.length) },
+      () => worker(),
+    ),
+  )
+  return imported.filter((record): record is JournalImportedCall => record !== undefined)
+}
+
+async function readClaudeAgentPrompt(path: string, expectedAgentId: string): Promise<string | undefined> {
+  const line = await readBoundedFirstLine(path)
+  if (line === undefined) return undefined
+  let value: unknown
+  try {
+    value = JSON.parse(line) as unknown
+  } catch {
+    return undefined
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const entry = value as Record<string, unknown>
+  if (entry.type !== 'user' || entry.agentId !== expectedAgentId) return undefined
+  if (typeof entry.message !== 'object' || entry.message === null || Array.isArray(entry.message)) {
+    return undefined
+  }
+  const message = entry.message as Record<string, unknown>
+  return message.role === 'user' && typeof message.content === 'string'
+    ? message.content
+    : undefined
+}
+
+async function readBoundedFirstLine(path: string): Promise<string | undefined> {
+  let file
+  try {
+    file = await open(path, 'r')
+  } catch {
+    return undefined
+  }
+  try {
+    const chunks: Buffer[] = []
+    let total = 0
+    let position = 0
+    while (total <= MAX_CLAUDE_AGENT_PROMPT_BYTES) {
+      const remaining = MAX_CLAUDE_AGENT_PROMPT_BYTES + 1 - total
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, remaining))
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, position)
+      if (bytesRead === 0) return Buffer.concat(chunks).toString('utf8')
+      position += bytesRead
+      const bytes = buffer.subarray(0, bytesRead)
+      const newline = bytes.indexOf(0x0a)
+      const firstLineBytes = newline === -1 ? bytes : bytes.subarray(0, newline)
+      if (total + firstLineBytes.length > MAX_CLAUDE_AGENT_PROMPT_BYTES) return undefined
+      chunks.push(firstLineBytes)
+      total += firstLineBytes.length
+      if (newline !== -1) return Buffer.concat(chunks).toString('utf8')
+    }
+    return undefined
+  } catch {
+    return undefined
+  } finally {
+    await file.close().catch(() => undefined)
+  }
 }
 
 function isMissing(value: unknown): boolean {

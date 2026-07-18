@@ -106,7 +106,10 @@ provider-neutral AgentProvider
   terminal coverage gaps, while an explicit manual resume retries those gaps.
   Edited source retains the longest unchanged prefix. MCP callers may pass a
   managed `run_*` ID or Claude's native `wf_*` ID; Claude's own files are never
-  rewritten.
+  rewritten. For exact-source Claude imports, bounded hashes of the original
+  subagent prompts preserve completed dynamic-pipeline siblings even when cached
+  parents settle in a different order; raw prompt text is not copied into the
+  workflow-mcp sidecar.
 - **An embeddable service** — the same `WorkflowService` and tool registrar that
   the CLI uses can be mounted inside another host (this is how
   [Agent Code](https://github.com/Juliusolsson05/agent-code) renders each run as

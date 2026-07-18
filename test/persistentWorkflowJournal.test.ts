@@ -8,7 +8,12 @@ import {
   PersistentJournalError,
   PersistentWorkflowJournal,
 } from '../src/persistentWorkflowJournal.js'
-import { createJournalKey, type JournalMiss, type JournalSnapshot } from '../src/workflowJournal.js'
+import {
+  createImportedPromptKey,
+  createJournalKey,
+  type JournalMiss,
+  type JournalSnapshot,
+} from '../src/workflowJournal.js'
 
 const identity = { workflowId: 'project:workflow', sourceHash: 'source-a' }
 
@@ -47,6 +52,63 @@ describe('PersistentWorkflowJournal', () => {
 
     const stored = JSON.parse(await readFile(filePath, 'utf8')) as Record<string, unknown>
     expect(stored).toMatchObject({ format: 'workflow-mcp-journal', version: 2 })
+  })
+
+  it('persists and validates imported prompt identities across successor journals', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-persistent-imported-prompts-'))
+    const filePath = join(root, 'resume.json')
+    const firstKey = createJournalKey('', 'historical-first')
+    const secondKey = createJournalKey(firstKey, 'historical-second')
+    const imported: JournalSnapshot = {
+      ...identity,
+      records: [
+        { type: 'started', key: firstKey, agentId: 'claude-first' },
+        { type: 'result', key: firstKey, agentId: 'claude-first', result: 'first-result' },
+        { type: 'started', key: secondKey, agentId: 'claude-second' },
+        { type: 'result', key: secondKey, agentId: 'claude-second', result: 'second-result' },
+      ],
+      importedCalls: [
+        {
+          key: firstKey,
+          agentId: 'claude-first',
+          promptKey: createImportedPromptKey('historical-first'),
+        },
+        {
+          key: secondKey,
+          agentId: 'claude-second',
+          promptKey: createImportedPromptKey('historical-second'),
+        },
+      ],
+    }
+    const journal = await PersistentWorkflowJournal.open(filePath, [imported])
+    const run = journal.beginRun(identity, { reuseMode: 'exact-source-sparse' })
+    expect(run.admit({ agentId: 'reordered', prompt: 'historical-second' })).toMatchObject({
+      reused: true,
+      result: 'second-result',
+    })
+
+    // The standalone CLI reopens its deterministic sidecar with the immutable Claude snapshot on
+    // every invocation. A semantically replaced old key must stay consumed during that merge.
+    const reopened = await PersistentWorkflowJournal.open(filePath, [imported])
+    expect(reopened.getSnapshot(identity.workflowId)?.importedCalls).toHaveLength(2)
+
+    const corruptPath = join(root, 'corrupt.json')
+    await writeFile(corruptPath, `${JSON.stringify({
+      format: 'workflow-mcp-journal',
+      version: 2,
+      snapshots: [{
+        ...identity,
+        records: [],
+        importedCalls: [{
+          key: firstKey,
+          agentId: 'missing-start',
+          promptKey: createImportedPromptKey('forged'),
+        }],
+      }],
+    })}\n`)
+    await expect(PersistentWorkflowJournal.open(corruptPath)).rejects.toMatchObject<
+      Partial<PersistentJournalError>
+    >({ code: 'invalid-imported-call' })
   })
 
   it('persists an interrupted provider session so the next run resumes that thread', async () => {

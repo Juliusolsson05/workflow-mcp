@@ -10,6 +10,7 @@ import {
   type JournalCall,
   type JournalDecision,
   type JournalIdentity,
+  type JournalImportedCall,
   type JournalMiss,
   type JournalRecord,
   type JournalReuseMode,
@@ -148,6 +149,19 @@ function mergeSnapshots(primary: JournalSnapshot, fallback: JournalSnapshot): Jo
     `${record.key}\0${record.agentId}\0${record.session.provider}\0${record.session.id}`
   )
   const primarySessions = new Set((primary.sessions ?? []).map(sessionIdentity))
+  const importedIdentity = (record: JournalImportedCall): string => `${record.key}\0${record.agentId}`
+  const primaryImported = new Set((primary.importedCalls ?? []).map(importedIdentity))
+  const primaryPromptKeys = new Set((primary.importedCalls ?? []).map((record) => record.promptKey))
+  const supersededFallbackCalls = new Set(
+    (fallback.importedCalls ?? [])
+      .filter((record) => (
+        primaryPromptKeys.has(record.promptKey) && !primaryImported.has(importedIdentity(record))
+      ))
+      .map(importedIdentity),
+  )
+  const isSuperseded = (key: string, agentId: string): boolean => (
+    supersededFallbackCalls.has(`${key}\0${agentId}`)
+  )
   return {
     workflowId: primary.workflowId,
     sourceHash: primary.sourceHash,
@@ -158,12 +172,29 @@ function mergeSnapshots(primary: JournalSnapshot, fallback: JournalSnapshot): Jo
     // only untouched fallback keys are needed to preserve a sparse tail after a partial replay.
     records: [
       ...primary.records,
-      ...fallback.records.filter((record) => !primaryKeys.has(record.key)),
+      ...fallback.records.filter((record) => (
+        !primaryKeys.has(record.key) && !isSuperseded(record.key, record.agentId)
+      )),
     ],
     sessions: [
       ...(primary.sessions ?? []),
-      ...(fallback.sessions ?? []).filter((record) => !primarySessions.has(sessionIdentity(record))),
+      ...(fallback.sessions ?? []).filter((record) => (
+        !primarySessions.has(sessionIdentity(record)) && !isSuperseded(record.key, record.agentId)
+      )),
     ],
+    ...(primary.importedCalls === undefined && fallback.importedCalls === undefined
+      ? {}
+      : {
+          importedCalls: [
+            ...(primary.importedCalls ?? []),
+            ...(fallback.importedCalls ?? []).filter(
+              (record) => (
+                !primaryImported.has(importedIdentity(record)) &&
+                !supersededFallbackCalls.has(importedIdentity(record))
+              ),
+            ),
+          ],
+        }),
   }
 }
 
@@ -334,11 +365,15 @@ function parseSnapshot(value: unknown, filePath: string, label: string): Journal
   const sessions = snapshot.sessions === undefined
     ? undefined
     : parseSessions(snapshot.sessions, filePath)
+  const importedCalls = snapshot.importedCalls === undefined
+    ? undefined
+    : parseImportedCalls(snapshot.importedCalls, filePath)
   return {
     workflowId: snapshot.workflowId,
     sourceHash: snapshot.sourceHash,
     records,
     ...(sessions === undefined ? {} : { sessions }),
+    ...(importedCalls === undefined ? {} : { importedCalls }),
   }
 }
 
@@ -348,12 +383,14 @@ function validateSnapshotCollection(
 ): void {
   const workflowIds = new Set<string>()
   let entries = 0
+  let importedEntries = 0
   for (const snapshot of snapshots) {
     if (
       snapshot.workflowId.length === 0 ||
       snapshot.sourceHash.length === 0 ||
       snapshot.records.length > MAX_RECORDS ||
-      (snapshot.sessions?.length ?? 0) > MAX_RECORDS
+      (snapshot.sessions?.length ?? 0) > MAX_RECORDS ||
+      (snapshot.importedCalls?.length ?? 0) > MAX_RECORDS
     ) {
       throw new PersistentJournalError(
         'invalid-snapshot',
@@ -367,13 +404,24 @@ function validateSnapshotCollection(
       )
     }
     workflowIds.add(snapshot.workflowId)
+    validateImportedCallReferences(snapshot, filePath)
     entries += snapshot.records.length + (snapshot.sessions?.length ?? 0)
+    importedEntries += snapshot.importedCalls?.length ?? 0
     if (entries > MAX_RECORDS) {
       // The cap is lineage-wide. Capping each child independently would let a deeply nested
       // workflow multiply the sidecar without bound and turn every admission into a huge sync write.
       throw new PersistentJournalError(
         'too-many-records',
         `Persistent journal exceeds ${MAX_RECORDS} aggregate records`,
+      )
+    }
+    if (importedEntries > MAX_RECORDS) {
+      // Imported prompt hashes are one bounded auxiliary index over existing starts, not additional
+      // provider history. Give that index its own lineage-wide cap so a valid near-limit Claude
+      // journal does not become unresumable merely because compatibility metadata was added.
+      throw new PersistentJournalError(
+        'too-many-imported-calls',
+        `Persistent journal exceeds ${MAX_RECORDS} aggregate imported calls`,
       )
     }
   }
@@ -463,6 +511,54 @@ function parseSessions(value: unknown, filePath: string): JournalSessionRecord[]
       session: { provider: entry.session.provider, id: entry.session.id },
     }
   })
+}
+
+function parseImportedCalls(value: unknown, filePath: string): JournalImportedCall[] {
+  if (!Array.isArray(value) || value.length > MAX_RECORDS) {
+    throw new PersistentJournalError(
+      'invalid-imported-calls',
+      `Workflow journal imported calls are invalid: ${filePath}`,
+    )
+  }
+  return value.map((entry, index) => {
+    if (
+      !isObject(entry) ||
+      typeof entry.key !== 'string' ||
+      !/^v2:[a-f0-9]{64}$/.test(entry.key) ||
+      typeof entry.agentId !== 'string' ||
+      entry.agentId.length === 0 ||
+      typeof entry.promptKey !== 'string' ||
+      !/^ip1:[a-f0-9]{64}$/.test(entry.promptKey)
+    ) {
+      throw new PersistentJournalError(
+        'invalid-imported-call',
+        `Workflow journal imported call ${index + 1} is invalid: ${filePath}`,
+      )
+    }
+    return { key: entry.key, agentId: entry.agentId, promptKey: entry.promptKey }
+  })
+}
+
+function validateImportedCallReferences(snapshot: JournalSnapshot, filePath: string): void {
+  const started = new Set(
+    snapshot.records
+      .filter((record) => record.type === 'started')
+      .map((record) => `${record.key}\0${record.agentId}`),
+  )
+  const seen = new Set<string>()
+  for (const imported of snapshot.importedCalls ?? []) {
+    const identity = `${imported.key}\0${imported.agentId}`
+    if (!started.has(identity) || seen.has(identity)) {
+      // The prompt hash is authority to reuse a result after its chained key changes. Requiring one
+      // mapping to a real start record prevents a damaged sidecar from manufacturing an alias to an
+      // unrelated result or making duplicate metadata order decide which prompt owns the call.
+      throw new PersistentJournalError(
+        'invalid-imported-call',
+        `Workflow journal imported call does not identify one started call: ${filePath}`,
+      )
+    }
+    seen.add(identity)
+  }
 }
 
 function isMissing(cause: unknown): boolean {

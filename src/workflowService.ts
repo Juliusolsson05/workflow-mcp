@@ -678,7 +678,9 @@ export class WorkflowService {
       claudeRunPath: metadataPath,
       ...(workflowPath === undefined ? {} : { workflowPath }),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
-    })
+    }, overrides !== undefined && Object.prototype.hasOwnProperty.call(overrides, 'args')
+      ? { provided: true, value: overrides.args }
+      : undefined)
   }
 
   async #resumeStored(
@@ -784,6 +786,7 @@ export class WorkflowService {
   async #resumeClaude(
     scope: WorkflowServiceScope,
     input: Extract<WorkflowResumeInput, { claudeRunPath: string }>,
+    argsOverride?: { provided: true; value: unknown },
   ): Promise<WorkflowRunStartResult> {
     const cwd = resolve(scope.cwd)
     const claudeProjectRoot = await this.#claudeProjectRoot(cwd)
@@ -815,12 +818,24 @@ export class WorkflowService {
     const imported = await loadClaudeWorkflowResume(metadataPath, {
       ...(workflowPath === undefined ? {} : { workflowPath }),
     })
+    const importedArgs = Object.prototype.hasOwnProperty.call(imported.metadata, 'args')
+      ? { provided: true as const, value: imported.metadata.args }
+      : { provided: false as const }
+    const args = argsOverride ?? importedArgs
+    const exactArgs = argsOverride === undefined || isDeepStrictEqual(argsOverride, importedArgs)
     const journalSnapshots = imported.journal.getSnapshots()
     return this.#startLoaded(scope, imported.workflow, {
+      ...(args.provided ? { args: args.value } : {}),
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
       resumedFromRunId: imported.metadata.runId,
       lineageId: imported.metadata.runId,
       recoveryMode: 'manual',
+      // loadClaudeWorkflowResume already refuses a source mismatch. When args also match, use the
+      // same sparse contract as an unchanged native manual resume so one failed Claude call does not
+      // invalidate successful siblings; imported prompt identities additionally repair chained-key
+      // changes caused solely by work-conserving pipeline completion order. A caller-provided args
+      // change falls back to Claude's conservative longest-prefix rule.
+      journalReuseMode: exactArgs ? 'exact-source-sparse' : 'longest-prefix',
       ...(journalSnapshots.length === 0 ? {} : { journalSnapshots }),
     })
   }

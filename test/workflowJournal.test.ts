@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   InMemoryWorkflowJournal,
   canonicalizeJournalValue,
+  createImportedPromptKey,
   createJournalKey,
   type JournalAgentOptions,
   type JournalMiss,
@@ -275,6 +276,129 @@ describe('InMemoryWorkflowJournal', () => {
       sparse.admit({ agentId: `sparse-${index}`, prompt: `call-${index}` }).reused
     ))
     expect(sparseHits).toEqual([true, true, true, true, false, true, true, true, true])
+  })
+
+  it('reuses unique Claude imports when dynamic pipeline completion changes chained call order', () => {
+    const original = new InMemoryWorkflowJournal()
+    const historical = original.beginRun(identity)
+    const prompts = {
+      slowFinder: 'find:slow',
+      fastFinder: 'find:fast',
+      fastVerifier: 'verify:fast',
+      slowVerifier: 'verify:slow',
+    }
+    const slowFinder = historical.admit({ agentId: 'old-find-slow', prompt: prompts.slowFinder }) as JournalMiss
+    const fastFinder = historical.admit({ agentId: 'old-find-fast', prompt: prompts.fastFinder }) as JournalMiss
+    // A live pipeline advances whichever item finishes first. The fast verifier was therefore
+    // admitted before the slow verifier even though the source array put the slow finder first.
+    const fastVerifier = historical.admit({ agentId: 'old-verify-fast', prompt: prompts.fastVerifier }) as JournalMiss
+    const slowVerifier = historical.admit({ agentId: 'old-verify-slow', prompt: prompts.slowVerifier }) as JournalMiss
+    historical.recordResult(slowFinder, { item: 'slow' })
+    historical.recordResult(fastFinder, { item: 'fast' })
+    historical.recordResult(fastVerifier, { verified: 'fast' })
+
+    const captured = historical.snapshot()
+    const imported = new InMemoryWorkflowJournal([{
+      ...captured,
+      importedCalls: [
+        [slowFinder, prompts.slowFinder],
+        [fastFinder, prompts.fastFinder],
+        [fastVerifier, prompts.fastVerifier],
+        [slowVerifier, prompts.slowVerifier],
+      ].map(([decision, prompt]) => ({
+        key: (decision as JournalMiss).key,
+        agentId: (decision as JournalMiss).agentId,
+        promptKey: createImportedPromptKey(prompt as string),
+      })),
+    }])
+    const resumed = imported.beginRun(identity, { reuseMode: 'exact-source-sparse' })
+
+    expect(resumed.admit({ agentId: 'new-find-slow', prompt: prompts.slowFinder }).reused).toBe(true)
+    expect(resumed.admit({ agentId: 'new-find-fast', prompt: prompts.fastFinder }).reused).toBe(true)
+    // Cached finders settle in source order, so the slow verifier now arrives first. Its historical
+    // call was incomplete and must run again; that miss changes the chained key of the fast verifier.
+    expect(resumed.admit({ agentId: 'new-verify-slow', prompt: prompts.slowVerifier }).reused).toBe(false)
+    expect(resumed.admit({ agentId: 'new-verify-fast', prompt: prompts.fastVerifier })).toMatchObject({
+      reused: true,
+      result: { verified: 'fast' },
+      sourceAgentId: 'old-verify-fast',
+    })
+
+    const changedSource = new InMemoryWorkflowJournal([{
+      ...captured,
+      importedCalls: [{
+        key: fastVerifier.key,
+        agentId: fastVerifier.agentId,
+        promptKey: createImportedPromptKey(prompts.fastVerifier),
+      }],
+    }]).beginRun({ ...identity, sourceHash: 'changed-source' }, {
+      reuseMode: 'exact-source-sparse',
+    })
+    changedSource.admit({ agentId: 'changed-find-slow', prompt: prompts.slowFinder })
+    changedSource.admit({ agentId: 'changed-find-fast', prompt: prompts.fastFinder })
+    changedSource.admit({ agentId: 'changed-verify-slow', prompt: prompts.slowVerifier })
+    expect(changedSource.admit({ agentId: 'changed-verify-fast', prompt: prompts.fastVerifier }).reused).toBe(false)
+  })
+
+  it('does not use the imported prompt fallback when the historical prompt is ambiguous', () => {
+    const firstKey = createJournalKey('', 'duplicate')
+    const secondKey = createJournalKey(firstKey, 'duplicate')
+    const snapshot: JournalSnapshot = {
+      ...identity,
+      records: [
+        { type: 'started', key: firstKey, agentId: 'old-first' },
+        { type: 'result', key: firstKey, agentId: 'old-first', result: 'first' },
+        { type: 'started', key: secondKey, agentId: 'old-second' },
+        { type: 'result', key: secondKey, agentId: 'old-second', result: 'second' },
+      ],
+      importedCalls: [
+        { key: firstKey, agentId: 'old-first', promptKey: createImportedPromptKey('duplicate') },
+        { key: secondKey, agentId: 'old-second', promptKey: createImportedPromptKey('duplicate') },
+      ],
+    }
+    const resumed = new InMemoryWorkflowJournal([snapshot]).beginRun(identity, {
+      reuseMode: 'exact-source-sparse',
+    })
+    resumed.admit({ agentId: 'new-prefix', prompt: 'runtime-dependent-prefix' })
+
+    expect(resumed.admit({ agentId: 'new-duplicate', prompt: 'duplicate' }).reused).toBe(false)
+  })
+
+  it('proves imported execution options against the historical chained key before reuse', () => {
+    const prefixKey = createJournalKey('', 'historical-prefix')
+    const candidateKey = createJournalKey(prefixKey, 'same-prompt', { model: 'model-a' })
+    const snapshot: JournalSnapshot = {
+      ...identity,
+      records: [
+        { type: 'started', key: prefixKey, agentId: 'old-prefix' },
+        { type: 'result', key: prefixKey, agentId: 'old-prefix', result: 'prefix' },
+        { type: 'started', key: candidateKey, agentId: 'old-candidate' },
+        { type: 'result', key: candidateKey, agentId: 'old-candidate', result: 'model-a-result' },
+      ],
+      importedCalls: [{
+        key: candidateKey,
+        agentId: 'old-candidate',
+        promptKey: createImportedPromptKey('same-prompt'),
+      }],
+    }
+    const beginReordered = (): ReturnType<InMemoryWorkflowJournal['beginRun']> => {
+      const run = new InMemoryWorkflowJournal([snapshot]).beginRun(identity, {
+        reuseMode: 'exact-source-sparse',
+      })
+      run.admit({ agentId: 'new-prefix', prompt: 'different-runtime-prefix' })
+      return run
+    }
+
+    expect(beginReordered().admit({
+      agentId: 'same-options',
+      prompt: 'same-prompt',
+      options: { model: 'model-a' },
+    })).toMatchObject({ reused: true, result: 'model-a-result' })
+    expect(beginReordered().admit({
+      agentId: 'changed-options',
+      prompt: 'same-prompt',
+      options: { model: 'model-b' },
+    }).reused).toBe(false)
   })
 
   it('distinguishes a successful null from the legacy provider-failure null sentinel', () => {

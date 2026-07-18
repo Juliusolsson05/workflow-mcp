@@ -5,6 +5,7 @@ import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
 
 const EXECUTION_OPTION_KEYS = ['schema', 'model', 'effort', 'isolation', 'agentType'] as const
 const OMIT = Symbol('omit-from-journal-key')
+const MAX_IMPORTED_OPTION_PROOF_HASHES = 1_000_000
 
 type CanonicalValue = null | boolean | number | string | CanonicalValue[] | { [key: string]: CanonicalValue }
 
@@ -62,12 +63,29 @@ export type JournalSessionRecord = {
   session: ProviderSessionReference
 }
 
+/**
+ * A privacy-preserving bridge from Claude's per-agent transcript to its v2 journal result.
+ *
+ * Claude's journal key is chained through the global call-admission order. A work-conserving
+ * pipeline can legitimately admit its next stage in a different order when cached parents settle
+ * faster than live parents did, so the chained key alone cannot identify those unchanged calls
+ * across runtimes. The importer records only a hash of the exact prompt—not the prompt bytes—and
+ * the runtime consults it only under the existing exact-source sparse gate.
+ */
+export type JournalImportedCall = {
+  key: string
+  agentId: string
+  promptKey: string
+}
+
 export type JournalRecord = JournalStartedRecord | JournalResultRecord
 
 export type JournalSnapshot = JournalIdentity & {
   records: readonly JournalRecord[]
   /** Runtime-owned resume metadata; kept outside Claude-compatible v2 record bytes. */
   sessions?: readonly JournalSessionRecord[]
+  /** Runtime-owned prompt identities recovered from Claude's sibling transcript files. */
+  importedCalls?: readonly JournalImportedCall[]
 }
 
 type JournalDecisionBase = {
@@ -208,6 +226,14 @@ export function createJournalKey(
   return `v2:${createHash('sha256').update(payload, 'utf8').digest('hex')}`
 }
 
+export function createImportedPromptKey(prompt: string): string {
+  // Do not persist provider prompts merely to repair an ordering artifact. The imported result
+  // already contains potentially sensitive data and lives in a 0600 sidecar, but hashing here
+  // keeps the new compatibility index from duplicating entire review prompts (often hundreds of
+  // kilobytes each) or making them easier to discover in generic state inspection.
+  return `ip1:${createHash('sha256').update(prompt, 'utf8').digest('hex')}`
+}
+
 type HistoricalCall = {
   key: string
   agentId: string
@@ -216,6 +242,7 @@ type HistoricalCall = {
   coverageGap: boolean
   result?: unknown
   providerSession?: ProviderSessionReference
+  importedPromptKey?: string
 }
 
 function assertCoverageGapRecord(record: JournalRecord): void {
@@ -231,9 +258,36 @@ function assertCoverageGapRecord(record: JournalRecord): void {
   }
 }
 
+function assertImportedCalls(snapshot: JournalSnapshot): void {
+  if (snapshot.importedCalls === undefined) return
+  const starts = new Set(
+    snapshot.records
+      .filter((record) => record.type === 'started')
+      .map((record) => `${record.key}\0${record.agentId}`),
+  )
+  const seen = new Set<string>()
+  for (const imported of snapshot.importedCalls) {
+    const identity = `${imported.key}\0${imported.agentId}`
+    if (
+      !/^v2:[a-f0-9]{64}$/.test(imported.key) ||
+      imported.agentId.length === 0 ||
+      !/^ip1:[a-f0-9]{64}$/.test(imported.promptKey) ||
+      !starts.has(identity) ||
+      seen.has(identity)
+    ) {
+      // Imported prompt identities authorize reuse when the ordinary chained key does not match.
+      // Validate this capability in the in-memory seam as well as the durable parser because tests,
+      // embedders, and the Claude importer can inject snapshots without touching disk first.
+      throw new TypeError('Journal imported calls must uniquely identify started records')
+    }
+    seen.add(identity)
+  }
+}
+
 function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
   const calls: HistoricalCall[] = []
   const pending = new Map<string, HistoricalCall[]>()
+  const byIdentity = new Map<string, HistoricalCall[]>()
 
   for (const record of snapshot.records) {
     assertCoverageGapRecord(record)
@@ -250,6 +304,9 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
       const matches = pending.get(recordId)
       if (matches) matches.push(call)
       else pending.set(recordId, [call])
+      const identityMatches = byIdentity.get(recordId)
+      if (identityMatches) identityMatches.push(call)
+      else byIdentity.set(recordId, [call])
       continue
     }
 
@@ -269,10 +326,13 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
   }
 
   for (const record of snapshot.sessions ?? []) {
-    const call = calls.find(
-      (candidate) => candidate.key === record.key && candidate.agentId === record.agentId,
-    )
+    const call = byIdentity.get(`${record.key}\0${record.agentId}`)?.[0]
     if (call) call.providerSession = { ...record.session }
+  }
+
+  for (const record of snapshot.importedCalls ?? []) {
+    const call = byIdentity.get(`${record.key}\0${record.agentId}`)?.[0]
+    if (call) call.importedPromptKey = record.promptKey
   }
 
   return calls
@@ -281,21 +341,28 @@ function historicalCalls(snapshot: JournalSnapshot): HistoricalCall[] {
 class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
   readonly #identity: JournalIdentity
   readonly #previous: ReadonlyMap<string, readonly HistoricalCall[]>
+  readonly #previousImported: ReadonlyMap<string, readonly HistoricalCall[]>
+  readonly #historicalKeys: readonly string[]
   readonly #records: JournalRecord[]
   readonly #sessions: JournalSessionRecord[]
+  readonly #importedCalls: JournalImportedCall[]
   readonly #pending = new Map<number, JournalMiss & { completed: boolean }>()
+  readonly #consumedHistorical = new Set<HistoricalCall>()
   #previousKey: string
   #nextCallIndex = 0
   #canReusePrefix: boolean
   readonly #exactSourceSparse: boolean
   readonly #retainSparseHistory: boolean
   readonly #reuseCoverageGaps: boolean
+  readonly #trackImportedPrompts: boolean
+  #remainingImportedOptionProofHashes = MAX_IMPORTED_OPTION_PROOF_HASHES
 
   constructor(
     identity: JournalIdentity,
     previous: JournalSnapshot | undefined,
     records: JournalRecord[],
     sessions: JournalSessionRecord[],
+    importedCalls: JournalImportedCall[],
     reuseMode: JournalReuseMode,
     retainSparseHistory = false,
     reuseCoverageGaps = false,
@@ -313,9 +380,19 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       if (matches) matches.push(call)
       else byKey.set(call.key, [call])
     }
+    const byImportedPrompt = new Map<string, HistoricalCall[]>()
+    for (const call of historical) {
+      if (call.importedPromptKey === undefined) continue
+      const matches = byImportedPrompt.get(call.importedPromptKey)
+      if (matches) matches.push(call)
+      else byImportedPrompt.set(call.importedPromptKey, [call])
+    }
     this.#previous = byKey
+    this.#previousImported = byImportedPrompt
+    this.#historicalKeys = ['', ...new Set(historical.map((call) => call.key))]
     this.#records = records
     this.#sessions = sessions
+    this.#importedCalls = importedCalls
     this.#previousKey = ''
     this.#canReusePrefix = previous !== undefined
     this.#exactSourceSparse =
@@ -324,6 +401,7 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       previous.sourceHash === identity.sourceHash
     this.#retainSparseHistory = retainSparseHistory
     this.#reuseCoverageGaps = reuseCoverageGaps
+    this.#trackImportedPrompts = previous?.importedCalls !== undefined
   }
 
   admit(call: JournalCall): JournalDecision {
@@ -333,15 +411,42 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
 
     // Parallel calls are admitted in deterministic JavaScript order, but Claude appends `started`
     // records when scheduler/provider work actually begins. File order is therefore not call order.
-    // The chained v2 key already commits to every preceding call, so key lookup is both sufficient
-    // and the only ordering rule that survives a saturated or retried parallel phase.
+    // The chained v2 key commits to every preceding call and remains the primary compatibility
+    // identity. Claude-import prompt hashes below are a narrowly gated repair for one case that the
+    // global chain cannot survive: a dynamic pipeline admitting unchanged children in a new order.
     const candidates = this.#previous.get(key) ?? []
     const mayReuse = this.#canReusePrefix || this.#exactSourceSparse
-    const historicalResult = mayReuse
+    let historicalResult = mayReuse
       ? candidates.find((candidate) => (
-          candidate.hasResult && (candidate.reusable || (this.#reuseCoverageGaps && candidate.coverageGap))
+          !this.#consumedHistorical.has(candidate) &&
+          candidate.hasResult &&
+          (candidate.reusable || (this.#reuseCoverageGaps && candidate.coverageGap))
         ))
       : undefined
+    const promptKey = this.#trackImportedPrompts ? createImportedPromptKey(call.prompt) : undefined
+    let importedMatch: HistoricalCall | undefined
+    if (historicalResult === undefined && this.#exactSourceSparse && promptKey !== undefined) {
+      const importedCandidates = this.#previousImported.get(promptKey) ?? []
+      // A prompt hash is deliberately weaker than Claude's chained key because Claude does not
+      // persist execution options beside the transcript. Requiring one unique historical call
+      // prevents same-prompt branches from donating each other's result; the chained-key proof in
+      // importedOptionsMatch then verifies every execution-affecting option before reuse.
+      const candidate = importedCandidates.length === 1 ? importedCandidates[0] : undefined
+      if (
+        candidate !== undefined &&
+        !this.#consumedHistorical.has(candidate) &&
+        this.#importedOptionsMatch(candidate, call)
+      ) {
+        importedMatch = candidate
+      }
+      if (
+        importedMatch !== undefined &&
+        importedMatch.hasResult &&
+        (importedMatch.reusable || (this.#reuseCoverageGaps && importedMatch.coverageGap))
+      ) {
+        historicalResult = importedMatch
+      }
+    }
     const historicalSession = mayReuse
       ? candidates.find((candidate) => candidate.providerSession !== undefined)
       : undefined
@@ -356,6 +461,36 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       for (let index = this.#sessions.length - 1; index >= 0; index -= 1) {
         if (this.#sessions[index]?.key === key) this.#sessions.splice(index, 1)
       }
+    }
+    const replacedHistorical = historicalResult ?? importedMatch
+    if (replacedHistorical !== undefined) {
+      this.#consumedHistorical.add(replacedHistorical)
+      if (this.#retainSparseHistory && replacedHistorical.key !== key) {
+        // A semantic Claude-import hit replaces a historical call whose chained key was computed
+        // under a different pipeline completion order. Remove that exact source call only after we
+        // know its result will be materialized under the current key below; untouched imported tail
+        // calls remain available if the host crashes before JavaScript reaches them.
+        for (let index = this.#records.length - 1; index >= 0; index -= 1) {
+          const record = this.#records[index]
+          if (record?.key === replacedHistorical.key && record.agentId === replacedHistorical.agentId) {
+            this.#records.splice(index, 1)
+          }
+        }
+      }
+    }
+    if (promptKey !== undefined) {
+      for (let index = this.#importedCalls.length - 1; index >= 0; index -= 1) {
+        const imported = this.#importedCalls[index]
+        if (
+          imported?.key === key ||
+          (replacedHistorical !== undefined &&
+            imported?.key === replacedHistorical.key &&
+            imported.agentId === replacedHistorical.agentId)
+        ) {
+          this.#importedCalls.splice(index, 1)
+        }
+      }
+      this.#importedCalls.push({ key, agentId: call.agentId, promptKey })
     }
     this.#records.push({ type: 'started', key, agentId: call.agentId })
 
@@ -394,6 +529,24 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
     }
     this.#pending.set(callIndex, { ...decision, completed: false })
     return decision
+  }
+
+  #importedOptionsMatch(candidate: HistoricalCall, call: JournalCall): boolean {
+    // Claude's transcript gives us the exact prompt but not the agent() options. We can still prove
+    // option identity without guessing or persisting raw schemas: candidate.key was SHA-256 over
+    // (historical predecessor, prompt, execution options), and its real predecessor must be one of
+    // the journal's started-call keys (or empty for call zero). Trying the current options against
+    // that finite set succeeds only when schema/model/effort/isolation/agentType match the capture.
+    //
+    // A malicious near-limit journal must not turn this compatibility proof into quadratic CPU
+    // denial of service. Once the lineage-wide hash budget is spent, remaining semantic candidates
+    // simply rerun through the provider; correctness never depends on the optimization.
+    for (const previousKey of this.#historicalKeys) {
+      if (this.#remainingImportedOptionProofHashes <= 0) return false
+      this.#remainingImportedOptionProofHashes -= 1
+      if (createJournalKey(previousKey, call.prompt, call.options) === candidate.key) return true
+    }
+    return false
   }
 
   recordProviderSession(decision: JournalMiss, session: ProviderSessionReference): void {
@@ -479,6 +632,9 @@ class InMemoryWorkflowJournalRun implements WorkflowJournalRun {
       ...(this.#sessions.length === 0
         ? {}
         : { sessions: this.#sessions.map((record) => ({ ...record, session: { ...record.session } })) }),
+      ...(this.#importedCalls.length === 0
+        ? {}
+        : { importedCalls: this.#importedCalls.map((record) => ({ ...record })) }),
     }
   }
 }
@@ -489,6 +645,7 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
   constructor(snapshots: Iterable<JournalSnapshot> = []) {
     for (const snapshot of snapshots) {
       for (const record of snapshot.records) assertCoverageGapRecord(record)
+      assertImportedCalls(snapshot)
       this.#snapshots.set(snapshot.workflowId, copySnapshot(snapshot))
     }
   }
@@ -515,15 +672,24 @@ export class InMemoryWorkflowJournal implements WorkflowJournal {
     const sessions: JournalSessionRecord[] = retainSparseHistory
       ? (previous.sessions ?? []).map((record) => ({ ...record, session: { ...record.session } }))
       : []
+    const importedCalls: JournalImportedCall[] = retainSparseHistory
+      ? (previous.importedCalls ?? []).map((record) => ({ ...record }))
+      : []
     // Install the new append-only record array immediately. If the process stops after admission but
     // before provider completion, getSnapshot() must expose the started-only record that forces respawn.
-    const current: JournalSnapshot = { ...identity, records, sessions }
+    const current: JournalSnapshot = {
+      ...identity,
+      records,
+      sessions,
+      ...(previous?.importedCalls === undefined ? {} : { importedCalls }),
+    }
     this.#snapshots.set(identity.workflowId, current)
     return new InMemoryWorkflowJournalRun(
       identity,
       previous,
       records,
       sessions,
+      importedCalls,
       options.reuseMode ?? 'longest-prefix',
       retainSparseHistory,
       options.reuseCoverageGaps ?? false,
@@ -551,5 +717,8 @@ function copySnapshot(snapshot: JournalSnapshot): JournalSnapshot {
     ...(snapshot.sessions === undefined
       ? {}
       : { sessions: snapshot.sessions.map((record) => ({ ...record, session: { ...record.session } })) }),
+    ...(snapshot.importedCalls === undefined
+      ? {}
+      : { importedCalls: snapshot.importedCalls.map((record) => ({ ...record })) }),
   }
 }
