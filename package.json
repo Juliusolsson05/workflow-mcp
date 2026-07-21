@@ -51,8 +51,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
-    "@openai/codex-sdk": "0.144.4",
-    "acorn": "8.15.0",
+    "@openai/codex-sdk": "0.144.6",
+    "acorn": "8.17.0",
     "ajv": "8.20.0",
     "zod": "4.4.3"
   },
