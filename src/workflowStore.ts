@@ -1,5 +1,6 @@
 import type { LoadedWorkflow } from './loadWorkflow.js'
 import type {
+  ContentChecksum,
   ContentReference,
   WorkflowEvent,
   WorkflowResultMaterialization,
@@ -7,6 +8,7 @@ import type {
 import type { JournalSnapshot } from './workflowJournal.js'
 import type {
   StoredWorkflowEvent,
+  WorkflowAgentResultPage,
   WorkflowEventPage,
   WorkflowResultArtifact,
   WorkflowResultPage,
@@ -15,6 +17,11 @@ import type {
 } from './workflowProtocol.js'
 export type {
   StoredWorkflowEvent,
+  WorkflowAgentListEntry,
+  WorkflowAgentListPage,
+  WorkflowAgentResultPage,
+  WorkflowAgentResultsPage,
+  WorkflowAgentTranscriptPage,
   WorkflowEventPage,
   WorkflowResultArtifact,
   WorkflowResultPage,
@@ -59,6 +66,23 @@ export type WorkflowResultReadInput = {
   maxBytes: number
 }
 
+export type WorkflowAgentResultReadInput = {
+  /**
+   * Optional, unlike the run-result equivalent. A completed run always has exactly one artifact to
+   * name; an agent served from the journal fallback has none. Supplied values are still enforced as
+   * an integrity fence.
+   */
+  artifactId?: string
+  cursor?: string
+  maxBytes: number
+  /**
+   * The agent's journal key, when the caller already resolved it from the snapshot. It is the
+   * stable join column across a recovery lineage — a successor journal keeps its predecessor's
+   * agent ids until each key is re-admitted, so agentId alone can miss.
+   */
+  cacheKey?: string
+}
+
 export interface WorkflowStore {
   initialize(): Promise<void>
   /** Corrupt histories are isolated per run so one cannot make the whole service unavailable. */
@@ -78,6 +102,27 @@ export interface WorkflowStore {
   ): Promise<ContentReference>
   /** Read one bounded UTF-8 page without loading the complete artifact. */
   readResult(runId: string, input: WorkflowResultReadInput): Promise<WorkflowResultPage>
+  /**
+   * Persist one agent's terminal value. Optional because it is observability, not execution: a
+   * store that cannot do it must not stop workflows from running, and callers must treat a
+   * rejection as non-fatal.
+   */
+  persistAgentResult?(
+    runId: string,
+    agentId: string,
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference>
+  /** Artifact-first with a journal fallback, so agents remain readable when the artifact is absent. */
+  readAgentResult?(
+    runId: string,
+    agentId: string,
+    input: WorkflowAgentResultReadInput,
+  ): Promise<WorkflowAgentResultPage>
+  /** Bulk locators for the list tool; reads the journal once for the whole run. */
+  agentResultLocators?(
+    runId: string,
+    agents: readonly { agentId: string; cacheKey: string }[],
+  ): Promise<Map<string, { source: 'artifact' | 'journal'; metadata?: { artifactId: string; mediaType: string; sizeBytes: number; lineCount: number; checksum: ContentChecksum }; coverageGap: boolean }>>
   snapshot(runId: string): Promise<WorkflowRunSnapshot>
   loadWorkflow(runId: string): Promise<LoadedWorkflow>
   loadArgs(runId: string): Promise<{ provided: boolean; value?: unknown }>

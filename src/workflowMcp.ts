@@ -20,6 +20,8 @@ Inline source is saved under the current Git project's .claude/workflows and the
 
 workflow_run uses Claude precedence: scriptPath overrides script, which overrides name. resumeFromRunId accepts a native Agent Code run_* ID or discovers a real Claude wf_* run inside the scoped project, then creates a new linked run; workflow_resume remains a compatibility alias and keeps claudeRunPath as an explicit-path escape hatch. A manual resume reuses successful work but retries coverage gaps, while automatic host-crash recovery preserves terminal gaps without unsafe replay. workflow_run returns immediately. Poll workflow_run_events with the last toCursor as after (waitMs may long-poll), and use workflow_run_status for terminal status and health. Continue until completed, completed_with_errors, failed, cancelled, or interrupted. A completed run's run.result and run.completed payload carry an artifactId, byte/line counts, media type, and SHA-256 checksum. When result.truncated is true, call workflow_result_read with that runId and artifactId, then follow nextCursor until hasMore is false; never reconstruct a filesystem path. Retryable replay-safe work starts a fresh provider thread beneath the same logical assignment; the abandoned physical attempt remains in the audit stream. Exhausted or replay-unsafe assignments return a versioned __workflowAgentFailure coverage-gap value, while independent siblings and final synthesis continue. Only persistence or supervisor faults fail the complete run. An untouched queued run, or a replay-safe run interrupted by a host crash, is automatically continued as a new run in the same lineage.
 
+After a run finishes, inspect its constituent agents rather than only its final result. workflow_agent_list returns the logical agents with labels, phases, statuses and attempt history; workflow_agent_result_read returns one agent's complete untruncated value, and workflow_agent_results_read sweeps them all in callIndex order, optionally filtered to one phase. Prefer these over reading agent.completed previews, which are bounded, and never read journal.jsonl or the agent-<id>.jsonl mirrors directly — they are private storage and unavailable to a remote client. Use workflow_agent_transcript_read when a result alone does not explain what an agent did.
+
 The service has a shared provider capacity of nine by default. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed batches of nine: when only two slow agents remain in such a batch, JavaScript has not admitted the next batch and the scheduler cannot fill the other seven slots. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`
 
 export type WorkflowMcpRegistrationHooks = {
@@ -228,6 +230,99 @@ export function registerWorkflowMcpTools(
       hooks.onRunStarted?.(run)
       return result({ ok: true, run })
     },
+  )
+
+  server.registerTool(
+    'workflow_agent_list',
+    {
+      title: 'List workflow agents',
+      description: 'List a run\'s logical agents with label, phase, status, attempt history, and a result locator each. Abandoned retry attempts appear as history inside their agent, never as separate agents. Works while the run is still executing. Returns every agent in one response (not paginated); the returned cursor is the run\'s event position, not a paging token — compare it across calls to tell whether a live run has advanced. result.source is artifact (durable per-agent bytes), journal (recorded value, no artifact), or none (no terminal value yet).',
+      inputSchema: {
+        runId: z.string().min(1),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ runId }) => result({ ok: true, agents: await service.listAgents(scope, { runId }) }),
+  )
+
+  server.registerTool(
+    'workflow_agent_result_read',
+    {
+      title: 'Read one agent result',
+      description: 'Read one bounded UTF-8 page of a single agent\'s complete terminal value — the untruncated result behind agent.completed\'s bounded preview. Take agentId from workflow_agent_list; follow nextCursor while hasMore. artifactId is optional and acts as an integrity fence when supplied. Journal-served agents get a content-addressed id synthesized at read time, which is valid here but is not listed by workflow_agent_list and is never valid in workflow_result_read. Coverage-gap placeholders are returned as the honest terminal value rather than hidden. The locator is run-scoped and never accepts filesystem paths.',
+      inputSchema: {
+        runId: z.string().min(1),
+        agentId: z.string().min(1).max(200),
+        artifactId: z.string().min(1).max(200).optional(),
+        cursor: z.string().min(1).max(200).optional(),
+        maxBytes: z.number().int()
+          .min(MIN_WORKFLOW_RESULT_PAGE_BYTES)
+          .max(MAX_WORKFLOW_RESULT_PAGE_BYTES)
+          .optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ runId, agentId, artifactId, cursor, maxBytes }) => result({
+      ok: true,
+      page: await service.readAgentResult(scope, {
+        runId,
+        agentId,
+        ...(artifactId === undefined ? {} : { artifactId }),
+        ...(cursor === undefined ? {} : { cursor }),
+        ...(maxBytes === undefined ? {} : { maxBytes }),
+      }),
+    }),
+  )
+
+  server.registerTool(
+    'workflow_agent_results_read',
+    {
+      title: 'Read all agent results',
+      description: 'Walk every readable agent result in one paginated sweep, ordered by callIndex. Optionally filter to one phase by id or title. Each item is the same page shape workflow_agent_result_read returns; follow nextCursor while hasMore. A page stops at the first agent with more bytes, so each agent\'s content arrives contiguously rather than interleaved. An agent whose bytes cannot be read is reported in skipped[] and the sweep continues. Keep phase constant across a paged sweep: the cursor names an agent, so changing the filter mid-walk invalidates it.',
+      inputSchema: {
+        runId: z.string().min(1),
+        phase: z.string().min(1).max(200).optional(),
+        cursor: z.string().min(1).max(400).optional(),
+        maxBytes: z.number().int()
+          .min(MIN_WORKFLOW_RESULT_PAGE_BYTES)
+          .max(MAX_WORKFLOW_RESULT_PAGE_BYTES)
+          .optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ runId, phase, cursor, maxBytes }) => result({
+      ok: true,
+      page: await service.readAgentResults(scope, {
+        runId,
+        ...(phase === undefined ? {} : { phase }),
+        ...(cursor === undefined ? {} : { cursor }),
+        ...(maxBytes === undefined ? {} : { maxBytes }),
+      }),
+    }),
+  )
+
+  server.registerTool(
+    'workflow_agent_transcript_read',
+    {
+      title: 'Read one agent transcript',
+      description: 'Read one agent\'s slice of the canonical event stream — admission, attempts, activity, retries, and terminal outcome — for deeper investigation than a result alone allows. Page with after set to the previous toCursor while hasMore. This reads the durable event log, not the best-effort agent-<id>.jsonl mirror.',
+      inputSchema: {
+        runId: z.string().min(1),
+        agentId: z.string().min(1).max(200),
+        after: z.number().int().min(0).optional(),
+        limit: z.number().int().min(1).max(1_000).optional(),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ runId, agentId, after, limit }) => result({
+      ok: true,
+      page: await service.readAgentTranscript(scope, {
+        runId,
+        agentId,
+        ...(after === undefined ? {} : { after }),
+        ...(limit === undefined ? {} : { limit }),
+      }),
+    }),
   )
 }
 

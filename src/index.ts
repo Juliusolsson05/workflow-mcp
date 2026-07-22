@@ -193,6 +193,12 @@ export {
 export type {
   CreateWorkflowRunInput,
   StoredWorkflowEvent,
+  WorkflowAgentListEntry,
+  WorkflowAgentListPage,
+  WorkflowAgentResultPage,
+  WorkflowAgentResultReadInput as WorkflowStoreAgentResultReadInput,
+  WorkflowAgentResultsPage,
+  WorkflowAgentTranscriptPage,
   WorkflowEventPage,
   WorkflowResultArtifact,
   WorkflowResultPage,

@@ -19,22 +19,30 @@ import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 
 import { parseWorkflowSource } from './loadWorkflow.js'
-import { writeInitialWorkflowJournal } from './persistentWorkflowJournal.js'
+import {
+  readWorkflowJournalSnapshots,
+  writeInitialWorkflowJournal,
+} from './persistentWorkflowJournal.js'
+import type { JournalSnapshot } from './workflowJournal.js'
 import type { WorkflowEvent } from './workflowEvents.js'
 import {
   MAX_WORKFLOW_RESULT_PAGE_BYTES,
   MIN_WORKFLOW_RESULT_PAGE_BYTES,
 } from './workflowStore.js'
+import type { WorkflowAgentResultReadInput } from './workflowStore.js'
 import type {
   ContentChecksum,
   ContentReference,
   WorkflowResultMaterialization,
 } from './workflowEvents.js'
+import { serializeWorkflowValue } from './workflowEvents.js'
 import { createWorkflowState, reduceWorkflowState } from './workflowState.js'
 import type {
   CreateWorkflowRunInput,
   StoredWorkflowEvent,
+  WorkflowAgentResultPage,
   WorkflowEventPage,
+  WorkflowResultArtifact,
   WorkflowResultPage,
   WorkflowRunManifest,
   WorkflowRunSnapshot,
@@ -90,6 +98,7 @@ export class WorkflowStoreError extends Error {
     | 'result-too-large'
     | 'invalid-result'
     | 'result-not-found'
+    | 'agent-not-found'
     | 'invalid-cursor'
 
   constructor(code: WorkflowStoreError['code'], message: string, options?: { cause?: unknown }) {
@@ -111,6 +120,19 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly rootDirectory: string
   readonly runsDirectory: string
   readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
+  /**
+   * The most recently parsed journal, and nothing else.
+   *
+   * ONE entry on purpose. A Map keyed by runId grew without bound — every parsed journal holds
+   * every agent's full result value, so a client walking its run history with workflow_agent_list
+   * pinned the whole on-disk journal corpus in heap (measured: +10 MB retained per 10 MB journal,
+   * perfectly linear, never released). Journals cap at 256 MiB each, so that OOMs a server from a
+   * read-only tool. A single slot still serves the access pattern that matters — paging through one
+   * run's agents — while bounding retention to one journal.
+   */
+  #journalResultCache: { runId: string; identity: string; located: Map<string, JournalResultLocator> } | undefined
+  /** Why the last journal read failed, if it did. Surfaced so absence is distinguishable from damage. */
+  #journalReadFailure: string | undefined
   readonly #eventOffsets = new Map<string, Map<number, number>>()
   readonly #appendTails = new Map<string, Promise<void>>()
   #createTail: Promise<void> = Promise.resolve()
@@ -1054,6 +1076,397 @@ export class FileWorkflowStore implements WorkflowStore {
   #resultMetadataPath(runId: string): string {
     return join(this.#artifactsDirectory(runId), 'workflow-result.json')
   }
+
+  /**
+   * Validate an agent ID before it can influence a path.
+   *
+   * The transcript mirror sanitizes with a character-class replace, which is only safe because ids
+   * happen to be `agent_N` today. The store's rule is stricter and stated at #runDirectory: a
+   * caller value is validated, never laundered. A sanitizer silently maps two different ids onto one
+   * file; this refuses instead.
+   */
+  #assertAgentId(agentId: string): string {
+    if (!/^agent_[0-9]+$/.test(agentId)) {
+      throw new WorkflowStoreError('agent-not-found', `Invalid workflow agent ID: ${JSON.stringify(agentId)}`)
+    }
+    return agentId
+  }
+
+  #agentResultDataPath(runId: string, agentId: string): string {
+    return join(this.#artifactsDirectory(runId), `agent-${this.#assertAgentId(agentId)}.data`)
+  }
+
+  #agentResultMetadataPath(runId: string, agentId: string): string {
+    return join(this.#artifactsDirectory(runId), `agent-${this.#assertAgentId(agentId)}.json`)
+  }
+
+  async #readAgentResultMetadata(
+    runId: string,
+    agentId: string,
+  ): Promise<StoredWorkflowResultMetadata | undefined> {
+    const path = this.#agentResultMetadataPath(runId, agentId)
+    let raw
+    try {
+      raw = await readBoundedFile(path, MAX_RESULT_METADATA_BYTES)
+    } catch (cause) {
+      if (isMissing(cause)) return undefined
+      throw new WorkflowStoreError('io-error', `Cannot read agent result metadata: ${runId}`, { cause })
+    }
+    let value: unknown
+    try {
+      value = JSON.parse(raw.toString('utf8')) as unknown
+    } catch (cause) {
+      throw new WorkflowStoreError('corrupt-store', `Agent result metadata is not valid JSON: ${runId}`, { cause })
+    }
+    return parseResultMetadata(value, path, runId, this.#maxResultBytes, agentResultArtifactId)
+  }
+
+  /**
+   * Persist one agent's terminal value as its own artifact.
+   *
+   * Deliberately NOT an overload of persistResult: that method is a run-scoped singleton on fixed
+   * filenames which refuses a second value and refuses to write once the manifest is terminal. Both
+   * are correct for the run result and wrong here — a run has many agents, and they complete while
+   * the run is still very much alive.
+   *
+   * Callers must treat failure as non-fatal. Persisting an agent result is observability, and an
+   * observability failure that could fail agent 147 of a 200-agent fan-out would be a far worse bug
+   * than the one this feature fixes. The journal fallback exists precisely so this is allowed to
+   * fail.
+   */
+  async persistAgentResult(
+    runId: string,
+    agentId: string,
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference> {
+    await this.#assertLease()
+    await this.#requiredManifest(runId)
+    this.#assertAgentId(agentId)
+    const mediaType = result.reference.mediaType
+    if (typeof mediaType !== 'string' || mediaType.length === 0 || mediaType.length > 255) {
+      throw new WorkflowStoreError('corrupt-store', `Agent result media type is invalid: ${runId}/${agentId}`)
+    }
+    const sizeBytes = Buffer.byteLength(result.serializedContent, 'utf8')
+    if (sizeBytes > this.#maxResultBytes) {
+      throw new WorkflowStoreError(
+        'result-too-large',
+        `Agent result exceeds ${this.#maxResultBytes} UTF-8 bytes: ${runId}/${agentId}`,
+      )
+    }
+    const bytes = Buffer.from(result.serializedContent, 'utf8')
+    if (bytes.toString('utf8') !== result.serializedContent) {
+      // Lone UTF-16 surrogates cannot round-trip through UTF-8. For the RUN result this fails the
+      // run, because a completed run promises byte-faithful bytes. For an AGENT it must not: the
+      // agent genuinely succeeded and its value is already safe in the journal. Refusing the
+      // artifact here leaves the journal fallback to serve it.
+      throw new WorkflowStoreError(
+        'invalid-result',
+        `Agent result cannot be represented losslessly as UTF-8: ${runId}/${agentId}`,
+      )
+    }
+    const checksum: ContentChecksum = {
+      algorithm: 'sha256',
+      value: createHash('sha256').update(bytes).digest('hex'),
+    }
+    const metadata: StoredWorkflowResultMetadata = {
+      schemaVersion: 1,
+      runId,
+      artifactId: agentResultArtifactId(checksum.value),
+      mediaType,
+      sizeBytes,
+      lineCount: countUtf8Lines(bytes),
+      checksum,
+      createdAt: new Date().toISOString(),
+    }
+
+    const existing = await this.#readAgentResultMetadata(runId, agentId)
+    if (existing !== undefined) {
+      // Retried attempts under one logical agent can materialize the same value twice. Identical
+      // bytes are idempotent; a genuinely different value for a settled agent means the id was
+      // reused, which would make an already-published cursor point at unrelated content.
+      if (existing.checksum.value !== metadata.checksum.value) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow agent ${agentId} already has a different result artifact: ${runId}`,
+        )
+      }
+      return agentResultReference(result.reference, existing)
+    }
+
+    try {
+      await writePrivateFileAtomically(this.#agentResultDataPath(runId, agentId), bytes)
+      await writePrivateFileAtomically(
+        this.#agentResultMetadataPath(runId, agentId),
+        Buffer.from(`${JSON.stringify(metadata)}\n`, 'utf8'),
+      )
+      await syncDirectory(this.#artifactsDirectory(runId))
+    } catch (cause) {
+      if (cause instanceof WorkflowStoreError) throw cause
+      throw new WorkflowStoreError('io-error', `Cannot persist agent result artifact: ${runId}/${agentId}`, { cause })
+    }
+    return agentResultReference(result.reference, metadata)
+  }
+
+  /**
+   * Locate every agent's terminal bytes, artifact-first with a journal fallback.
+   *
+   * Returned map is keyed by the JOURNAL KEY (`v2:<sha256>`), not by agentId. Under
+   * `exact-source-sparse` recovery a successor journal begins as a copy of its predecessor's
+   * records and keeps the PREDECESSOR's agent ids until each key is re-admitted, so agentId is not
+   * a stable join column across a lineage. cacheKey is.
+   */
+  async #journalResultsByKey(runId: string): Promise<Map<string, JournalResultLocator>> {
+    // Cached on the journal file's identity (size + mtime), because the document is rewritten
+    // wholesale on every admit and result, so any change moves both.
+    //
+    // WHY this cache is not optional: reading ONE agent from the journal parses EVERY agent's
+    // result. Without it, paging a 1 MB value at the 16 KB default re-parsed the whole journal 64
+    // times, and a bulk sweep of a resumed 200-agent run did it once per agent. Resumed runs are
+    // both the worst case and the common one: reused agents complete through the agent.reused path,
+    // which never materializes an artifact, so every agent in them is journal-served.
+    const path = this.journalPath(runId)
+    let identity = ''
+    try {
+      const info = await stat(path)
+      identity = `${info.size}:${info.mtimeMs}`
+      const cached = this.#journalResultCache
+      if (cached?.runId === runId && cached.identity === identity) return cached.located
+    } catch {
+      // A journal we cannot stat is handled by the read below, which degrades to an empty map.
+    }
+
+    const located = new Map<string, JournalResultLocator>()
+    let snapshots: readonly JournalSnapshot[]
+    try {
+      snapshots = await readWorkflowJournalSnapshots(path)
+    } catch (cause) {
+      // A journal this reader cannot parse must not take down inspection of a run whose artifacts
+      // and events are perfectly readable — but it must not be reported as "no result yet" either.
+      // That swallowed a corrupt file, a >256 MiB journal, EACCES and a torn write into the same
+      // answer as a still-running agent, on runs that were already complete. An inspection tool
+      // silently restating an integrity failure as absence is the one thing it must never do.
+      this.#journalReadFailure = cause instanceof Error ? cause.message : String(cause)
+      return located
+    }
+    this.#journalReadFailure = undefined
+    for (const snapshot of snapshots) {
+      for (const record of snapshot.records) {
+        if (record.type !== 'result') continue
+        located.set(record.key, {
+          key: record.key,
+          agentId: record.agentId,
+          value: record.result,
+          coverageGap: record.coverageGap === true,
+        })
+      }
+    }
+    if (identity !== '') this.#journalResultCache = { runId, identity, located }
+    return located
+  }
+
+  async #agentResultBytes(
+    runId: string,
+    agentId: string,
+    cacheKey: string | undefined,
+  ): Promise<{ metadata: StoredWorkflowResultMetadata; source: 'artifact' | 'journal'; bytes?: Buffer }> {
+    // A torn artifact (unreadable metadata, or metadata whose data file is gone) must fall through
+    // to the journal rather than fail the read. Those are precisely the "the artifact write was
+    // dropped or the disk filled" states the fallback exists for, and the journal still holds the
+    // bytes. Previously only a MISSING metadata file fell through, so a half-written pair made
+    // workflow_agent_list advertise a result that every read then refused.
+    const artifact = await this.#readAgentResultMetadata(runId, agentId).catch(() => undefined)
+    if (artifact !== undefined && await this.#agentArtifactDataUsable(runId, agentId, artifact)) {
+      return { metadata: artifact, source: 'artifact' }
+    }
+
+    const journal = await this.#journalResultsByKey(runId)
+    // cacheKey ONLY. Never fall back to scanning for a matching agentId: under exact-source-sparse
+    // recovery a successor journal starts as a copy of its predecessor's records and keeps the
+    // PREDECESSOR's agent ids until each key is re-admitted. Agent ids are positional (one runtime
+    // counter), so agent_5 in this run and agent_5 in its parent are routinely different logical
+    // calls. Review proved the scan served a predecessor's value as the terminal result of an agent
+    // that had produced nothing at all, with the list reporting available: true beside it. A missing
+    // result is a fine answer; a confidently wrong one is not.
+    const record = cacheKey === undefined ? undefined : journal.get(cacheKey)
+    if (record === undefined) {
+      if (this.#journalReadFailure !== undefined) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow agent ${agentId} result is unreadable because the run journal could not be read: ${runId} (${this.#journalReadFailure})`,
+        )
+      }
+      throw new WorkflowStoreError(
+        'result-not-found',
+        `Workflow agent ${agentId} has no readable result: ${runId}`,
+      )
+    }
+    const serialized = serializeWorkflowValue(record.value)
+    const bytes = Buffer.from(serialized.content, 'utf8')
+    return {
+      source: 'journal',
+      bytes,
+      metadata: {
+        schemaVersion: 1,
+        runId,
+        artifactId: agentResultArtifactId(createHash('sha256').update(bytes).digest('hex')),
+        mediaType: serialized.mediaType,
+        sizeBytes: bytes.byteLength,
+        lineCount: countUtf8Lines(bytes),
+        checksum: { algorithm: 'sha256', value: createHash('sha256').update(bytes).digest('hex') },
+        createdAt: new Date().toISOString(),
+      },
+    }
+  }
+
+  /**
+   * Read one bounded UTF-8 page of an agent's terminal value.
+   *
+   * `artifactId` is optional here and required by readResult, on purpose: a completed run always
+   * has exactly one result artifact to name, whereas a journal-served agent has no artifact at all.
+   * When supplied it is still enforced as an integrity fence.
+   */
+  async readAgentResult(
+    runId: string,
+    agentId: string,
+    input: WorkflowAgentResultReadInput,
+  ): Promise<WorkflowAgentResultPage> {
+    await this.#requiredManifest(runId)
+    this.#assertAgentId(agentId)
+    // Bounded here as well as at the MCP edge: WorkflowStore is exported public API, so the zod
+    // schema is not the only door into this method. Mirrors readResult's guard.
+    if (input.artifactId !== undefined && (input.artifactId.length === 0 || input.artifactId.length > 200)) {
+      throw new WorkflowStoreError(
+        'result-not-found',
+        `Workflow agent result artifact does not exist for ${runId}/${agentId}`,
+      )
+    }
+    if (input.cursor !== undefined && (input.cursor.length === 0 || input.cursor.length > 200)) {
+      throw new WorkflowStoreError('invalid-cursor', 'Agent result cursor is malformed')
+    }
+    if (
+      !Number.isSafeInteger(input.maxBytes) ||
+      input.maxBytes < MIN_WORKFLOW_RESULT_PAGE_BYTES ||
+      input.maxBytes > MAX_WORKFLOW_RESULT_PAGE_BYTES
+    ) {
+      throw new TypeError(
+        `maxBytes must be an integer from ${MIN_WORKFLOW_RESULT_PAGE_BYTES} through ${MAX_WORKFLOW_RESULT_PAGE_BYTES}`,
+      )
+    }
+    const located = await this.#agentResultBytes(runId, agentId, input.cacheKey)
+    const { metadata, source } = located
+    if (input.artifactId !== undefined && input.artifactId !== metadata.artifactId) {
+      throw new WorkflowStoreError(
+        'result-not-found',
+        `Workflow agent result artifact does not exist for ${runId}/${agentId}`,
+      )
+    }
+    const fromByte = parseResultCursor(input.cursor, metadata)
+
+    if (located.bytes !== undefined) {
+      // Journal path: the bytes are already resident, so slice in memory using the identical
+      // boundary rules the file path uses. Recomputed per page — see readWorkflowJournalSnapshots
+      // for why that is acceptable only as a fallback.
+      return agentResultPage(runId, agentId, source, metadata, located.bytes, fromByte, input.maxBytes)
+    }
+
+    const path = this.#agentResultDataPath(runId, agentId)
+    let handle
+    try {
+      handle = await open(path, 'r')
+    } catch (cause) {
+      if (isMissing(cause)) {
+        throw new WorkflowStoreError(
+          'result-not-found',
+          `Workflow agent result artifact is missing: ${runId}/${agentId}`,
+          { cause },
+        )
+      }
+      throw new WorkflowStoreError('io-error', `Cannot open agent result: ${runId}/${agentId}`, { cause })
+    }
+    try {
+      const info = await handle.stat()
+      if (info.size !== metadata.sizeBytes || info.size > MAX_WORKFLOW_RESULT_BYTES) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Agent result size does not match its integrity metadata: ${runId}/${agentId}`,
+        )
+      }
+      if (fromByte === metadata.sizeBytes) {
+        return agentResultPage(runId, agentId, source, metadata, Buffer.alloc(0), fromByte, input.maxBytes)
+      }
+      const requestedBytes = Math.min(input.maxBytes, metadata.sizeBytes - fromByte)
+      const buffer = Buffer.allocUnsafe(requestedBytes)
+      const { bytesRead } = await handle.read(buffer, 0, requestedBytes, fromByte)
+      if (bytesRead <= 0) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Agent result ended before byte ${fromByte}: ${runId}/${agentId}`,
+        )
+      }
+      return agentResultPageFromSelection(
+        runId,
+        agentId,
+        source,
+        metadata,
+        buffer.subarray(0, bytesRead),
+        fromByte,
+      )
+    } finally {
+      await handle.close()
+    }
+  }
+
+  /**
+   * Is this agent's artifact actually servable, or only half-present?
+   *
+   * Checked before advertising `source: 'artifact'` anywhere, because metadata and data are two
+   * files written in sequence: a crash or a full disk between them leaves a locator pointing at
+   * bytes that are absent or the wrong length. Cheaper to stat once here than to let the caller
+   * discover it as a mid-pagination corrupt-store error.
+   */
+  async #agentArtifactDataUsable(
+    runId: string,
+    agentId: string,
+    metadata: StoredWorkflowResultMetadata,
+  ): Promise<boolean> {
+    try {
+      const info = await stat(this.#agentResultDataPath(runId, agentId))
+      return info.isFile() && info.size === metadata.sizeBytes
+    } catch {
+      return false
+    }
+  }
+
+  /** Locators for every agent, for the list tool. Absent entries mean "no terminal value yet". */
+  async agentResultLocators(
+    runId: string,
+    agents: readonly { agentId: string; cacheKey: string }[],
+  ): Promise<Map<string, { source: 'artifact' | 'journal'; metadata?: StoredWorkflowResultMetadata; coverageGap: boolean }>> {
+    const locators = new Map<
+      string,
+      { source: 'artifact' | 'journal'; metadata?: StoredWorkflowResultMetadata; coverageGap: boolean }
+    >()
+    // Read the journal once for the whole list rather than once per agent — it is a single document
+    // holding every result, so per-agent reads would be quadratic in the run's total output.
+    const journal = await this.#journalResultsByKey(runId)
+    for (const agent of agents) {
+      const artifact = await this.#readAgentResultMetadata(runId, agent.agentId).catch(() => undefined)
+      // cacheKey only — see the WHY in #agentResultBytes. The list must not advertise a result the
+      // read would refuse to serve, so both sites resolve identically.
+      const record = journal.get(agent.cacheKey)
+      if (artifact !== undefined && await this.#agentArtifactDataUsable(runId, agent.agentId, artifact)) {
+        locators.set(agent.agentId, {
+          source: 'artifact',
+          metadata: artifact,
+          coverageGap: record?.coverageGap ?? false,
+        })
+        continue
+      }
+      if (record === undefined) continue
+      locators.set(agent.agentId, { source: 'journal', coverageGap: record.coverageGap })
+    }
+    return locators
+  }
 }
 
 async function readOwner(path: string): Promise<{
@@ -1239,6 +1652,10 @@ function parseResultMetadata(
   path: string,
   runId: string,
   maxResultBytes: number,
+  // The scheme is injected rather than hardcoded because run results and per-agent results use
+  // different ID namespaces over the same metadata shape. Two agents returning identical bytes
+  // would otherwise mint identical IDs in one run-wide space.
+  artifactIdFor: (checksum: string) => string = resultArtifactId,
 ): StoredWorkflowResultMetadata {
   if (
     !isObject(value) ||
@@ -1255,7 +1672,7 @@ function parseResultMetadata(
     (value.lineCount as number) < 0 ||
     typeof value.createdAt !== 'string' ||
     !isContentChecksum(value.checksum) ||
-    value.artifactId !== resultArtifactId(value.checksum.value)
+    value.artifactId !== artifactIdFor(value.checksum.value)
   ) {
     throw new WorkflowStoreError('corrupt-store', `Workflow result metadata is invalid: ${path}`)
   }
@@ -1274,6 +1691,112 @@ function resultArtifactId(checksum: string): string {
   // The ID is content-derived for stable integrity identity, but the file name is intentionally
   // fixed. A caller can hand back this opaque value; it can never turn into path traversal.
   return `result_sha256_${checksum}`
+}
+
+function agentResultArtifactId(checksum: string): string {
+  // Namespaced away from the run result. Both are content-addressed, so two agents returning the
+  // same bytes legitimately share an ID; that is safe only because lookup is equality against a
+  // specific agent's own metadata, never a run-wide index keyed by ID.
+  return `agent_result_sha256_${checksum}`
+}
+
+type JournalResultLocator = {
+  key: string
+  agentId: string
+  value: unknown
+  coverageGap: boolean
+}
+
+function agentResultReference(
+  inline: ContentReference,
+  metadata: StoredWorkflowResultMetadata,
+): ContentReference {
+  // Carries the same integrity metadata the run-result reference does. Publishing a bare artifactId
+  // with no size or checksum beside it left a consumer unable to tell a complete read from a torn
+  // one. Note the id lives in the agent_result_sha256_* namespace and is readable ONLY through
+  // workflow_agent_result_read — handing it to workflow_result_read yields result-not-found.
+  return {
+    ...inline,
+    artifactId: metadata.artifactId,
+    mediaType: metadata.mediaType,
+    lineCount: metadata.lineCount,
+    sizeBytes: metadata.sizeBytes,
+    checksum: metadata.checksum,
+  }
+}
+
+/** Slice resident bytes with the same UTF-8 boundary rules the file path applies. */
+function agentResultPage(
+  runId: string,
+  agentId: string,
+  source: 'artifact' | 'journal',
+  metadata: StoredWorkflowResultMetadata,
+  bytes: Buffer,
+  fromByte: number,
+  maxBytes: number,
+): WorkflowAgentResultPage {
+  if (fromByte >= metadata.sizeBytes) {
+    return {
+      runId,
+      agentId,
+      source,
+      artifact: publicArtifact(metadata),
+      encoding: 'utf-8',
+      fromByte,
+      toByte: fromByte,
+      content: '',
+      hasMore: false,
+    }
+  }
+  const selected = bytes.subarray(fromByte, Math.min(fromByte + maxBytes, metadata.sizeBytes))
+  return agentResultPageFromSelection(runId, agentId, source, metadata, selected, fromByte)
+}
+
+function agentResultPageFromSelection(
+  runId: string,
+  agentId: string,
+  source: 'artifact' | 'journal',
+  metadata: StoredWorkflowResultMetadata,
+  selected: Buffer,
+  fromByte: number,
+): WorkflowAgentResultPage {
+  if (isUtf8ContinuationByte(selected[0]!)) {
+    throw new WorkflowStoreError(
+      'invalid-cursor',
+      `Agent result cursor is not on a UTF-8 boundary: ${runId}/${agentId}`,
+    )
+  }
+  const decoded = decodeCompleteUtf8Prefix(selected, runId)
+  const toByte = fromByte + decoded.bytes
+  if (toByte <= fromByte) {
+    throw new WorkflowStoreError(
+      'corrupt-store',
+      `Agent result contains invalid UTF-8 at byte ${fromByte}: ${runId}/${agentId}`,
+    )
+  }
+  const hasMore = toByte < metadata.sizeBytes
+  return {
+    runId,
+    agentId,
+    source,
+    artifact: publicArtifact(metadata),
+    encoding: 'utf-8',
+    fromByte,
+    toByte,
+    content: decoded.content,
+    hasMore,
+    ...(hasMore ? { nextCursor: resultCursor(metadata, toByte) } : {}),
+  }
+}
+
+function publicArtifact(metadata: StoredWorkflowResultMetadata): WorkflowResultArtifact {
+  return {
+    artifactId: metadata.artifactId,
+    mediaType: metadata.mediaType,
+    sizeBytes: metadata.sizeBytes,
+    lineCount: metadata.lineCount,
+    checksum: metadata.checksum,
+  }
 }
 
 function resultCursor(metadata: StoredWorkflowResultMetadata, offset: number): string {

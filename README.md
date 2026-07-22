@@ -89,10 +89,15 @@ provider-neutral AgentProvider
 ## What you get
 
 - **Portable workflow files** — the same `.js` runs here and in Claude Code.
-- **A durable MCP server** — nine stable tools (`workflow_list`,
+- **A durable MCP server** — thirteen stable tools (`workflow_list`,
   `workflow_describe`, `workflow_validate`, `workflow_run`,
   `workflow_run_status`, `workflow_run_events`, `workflow_result_read`, `workflow_run_cancel`,
-  `workflow_resume`) over stdio or an authenticated loopback HTTP transport.
+  `workflow_resume`, `workflow_agent_list`, `workflow_agent_result_read`,
+  `workflow_agent_results_read`, `workflow_agent_transcript_read`) over stdio or an authenticated
+  loopback HTTP transport.
+- **Per-agent inspection** — a finished run is not just its final value. List its logical agents
+  with attempt history, then read any single agent's complete untruncated output, or sweep them
+  all in one paginated walk.
 - **Immediate run handles** — `workflow_run` returns a run ID at once; clients
   follow progress by polling a durable cursor, not a transport-specific push.
 - **Unattended best-effort completion** — retryable read-only work restarts in a
