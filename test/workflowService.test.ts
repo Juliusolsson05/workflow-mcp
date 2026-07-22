@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 
 import { FakeAgentProvider } from '../src/fakeProvider.js'
 import type { FakeProviderScript } from '../src/fakeProvider.js'
+import type { AgentProvider, AgentProviderResult } from '../src/agentProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
 import { WorkflowService, WorkflowServiceError } from '../src/workflowService.js'
@@ -22,7 +23,7 @@ async function project(source: string): Promise<{ cwd: string; storeRoot: string
 async function terminal(service: WorkflowService, cwd: string, runId: string) {
   for (let index = 0; index < 200; index += 1) {
     const status = await service.status({ cwd }, runId)
-    if (['completed', 'failed', 'cancelled', 'interrupted'].includes(status.status)) return status
+    if (['completed', 'completed_with_errors', 'failed', 'cancelled', 'interrupted'].includes(status.status)) return status
     await new Promise((resolveWait) => setTimeout(resolveWait, 10))
   }
   throw new Error(`Run ${runId} did not become terminal`)
@@ -38,6 +39,58 @@ phase('Verify')
 return await agent('verify it', { label: 'verifier' })`
 
 describe('WorkflowService', () => {
+  it('continues an explicitly abandoned unconfirmed read-only provider execution', async () => {
+    const fixture = await project(`export const meta = {
+      name: 'continue-read-only', description: 'Manual continuation fixture'
+    }
+    return await agent('inspect without writing')`)
+    let calls = 0
+    const provider: AgentProvider = {
+      name: 'unconfirmed-read-only',
+      terminationBoundary: 'unconfirmed-descendants',
+      execute: async (_request, context): Promise<AgentProviderResult> => {
+        calls += 1
+        if (calls === 1) return new Promise<AgentProviderResult>(() => undefined)
+        await context.emit({
+          type: 'session.started',
+          session: { provider: 'unconfirmed-read-only', id: 'continued-session' },
+        })
+        return { output: { type: 'text', text: 'continued safely' } }
+      },
+      terminateAttempt: async () => undefined,
+    }
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(fixture.storeRoot),
+      provider,
+      sandbox: { mode: 'read-only', approvalPolicy: 'never', network: false },
+      limits: { cancellationGraceMs: 2 },
+      reliability: {
+        maxAttempts: 1,
+        startupTimeoutMs: 5,
+        hardTerminationGraceMs: 2,
+      },
+    })
+    await service.initialize()
+
+    const first = await service.start({ cwd: fixture.cwd }, { name: 'continue-read-only' })
+    await expect(terminal(service, fixture.cwd, first.runId)).resolves.toMatchObject({
+      status: 'completed_with_errors',
+    })
+    await expect(service.resume({ cwd: fixture.cwd }, { runId: first.runId })).rejects.toMatchObject({
+      code: 'unsafe-provider-active',
+    })
+
+    const resumed = await service.resume({ cwd: fixture.cwd }, {
+      runId: first.runId,
+      abandonUnconfirmedProvider: true,
+    })
+    await expect(terminal(service, fixture.cwd, resumed.runId)).resolves.toMatchObject({
+      status: 'completed',
+    })
+    expect(calls).toBe(2)
+    await service.stop()
+  })
+
   it('requires source-hash approval before worker launch and invalidates it after an edit', async () => {
     const fixture = await project(`export const meta = { name: 'approved', description: 'Approval fixture' }
       return null`)

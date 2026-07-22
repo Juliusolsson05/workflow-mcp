@@ -162,6 +162,12 @@ export type WorkflowRun = {
   ownershipReleaseSafe?(): boolean
   /** Settles only after every already-quarantined adapter execution has actually stopped. */
   waitForOwnershipRelease?(): Promise<void>
+  /**
+   * Explicitly retire process-lifetime fences for provider descendants whose termination cannot
+   * be proven. Hosts must expose this only behind an operator acknowledgement and a non-mutating
+   * sandbox policy; it is not evidence that the abandoned descendants stopped.
+   */
+  abandonUnconfirmedProviderExecutions?(): number
 }
 
 export class WorkflowCancelledError extends Error {
@@ -398,6 +404,7 @@ class WorkflowRuntime {
   readonly #childCounts = new Map<string, number>()
   readonly #pendingWorkerRequests = new Map<WorkflowWorkerHandle, Set<string>>()
   readonly #quarantinedExecutions = new Set<Promise<unknown>>()
+  readonly #abandonableProviderQuarantines = new Set<() => void>()
   readonly #warnedModelAliases = new Set<string>()
   #warnedBudgetExceeded = false
   #eventSequence = 0
@@ -479,6 +486,11 @@ class WorkflowRuntime {
         while (this.#tasks.size > 0 || this.#quarantinedExecutions.size > 0) {
           await Promise.allSettled([...this.#tasks, ...this.#quarantinedExecutions])
         }
+      },
+      abandonUnconfirmedProviderExecutions: () => {
+        const releases = [...this.#abandonableProviderQuarantines]
+        for (const release of releases) release()
+        return releases.length
       },
     }
   }
@@ -869,8 +881,9 @@ class WorkflowRuntime {
     let stderr = ''
     let settled = false
     let ready = false
-    const launchedAt = Date.now()
+    let launchedAt = Date.now()
     let lastHeartbeatAt = launchedAt
+    let lastWatchdogAt = launchedAt
     let idleSince: number | undefined
     let messageTail: Promise<void> = Promise.resolve()
     const outcome = deferred<unknown>()
@@ -903,6 +916,19 @@ class WorkflowRuntime {
     const watchdog = setInterval(() => {
       if (settled) return
       const now = Date.now()
+      const watchdogGapMs = now - lastWatchdogAt
+      lastWatchdogAt = now
+      if (watchdogGapMs > Math.max(5_000, watchdogIntervalMs * 5)) {
+        // The parent timer pauses during macOS sleep and can also be delayed by a suspended
+        // Electron utility process. Charging that wall-clock gap to the worker causes the first
+        // watchdog tick after wake to kill a healthy evaluator before its own queued heartbeat can
+        // run. Give startup, heartbeat, and idle detection one fresh policy window; a genuinely
+        // dead worker will still fail normally if it remains silent after wake.
+        launchedAt = now
+        lastHeartbeatAt = now
+        if (idleSince !== undefined) idleSince = now
+        return
+      }
       if (!ready && now - launchedAt >= this.#reliability.workerStartupTimeoutMs) {
         settleReject(new WorkflowExecutionError(
           'workflow-worker-startup-timeout',
@@ -2163,9 +2189,29 @@ class WorkflowRuntime {
     // those tools exited. Keep the fence until process exit instead of pretending the already-
     // settled wrapper promise is evidence. The replacement process can then reclaim the PID-bound
     // store lease and recover from the durable interrupted boundary.
-    const quarantine = this.#options.provider.terminationBoundary === 'unconfirmed-descendants'
-      ? new Promise<never>(() => undefined)
-      : execution
+    if (this.#options.provider.terminationBoundary === 'unconfirmed-descendants') {
+      let resolveQuarantine!: () => void
+      const quarantine = new Promise<void>((resolvePromise) => {
+        resolveQuarantine = resolvePromise
+      })
+      let released = false
+      const release = (): void => {
+        if (released) return
+        released = true
+        this.#abandonableProviderQuarantines.delete(release)
+        // Delete synchronously so a service resume in the same turn can verify ownership transfer
+        // before the promise-finally microtask runs.
+        this.#quarantinedExecutions.delete(quarantine)
+        resolveQuarantine()
+      }
+      this.#abandonableProviderQuarantines.add(release)
+      this.#quarantinedExecutions.add(quarantine)
+      void quarantine.finally(() => this.#quarantinedExecutions.delete(quarantine)).catch(() => undefined)
+      // Observe late rejection even though it cannot prove escaped descendants stopped.
+      void execution.catch(() => undefined)
+      return quarantine
+    }
+    const quarantine = execution
     this.#quarantinedExecutions.add(quarantine)
     // WHY removal follows the original execution rather than a timer: only adapter settlement is
     // evidence that the old credentialed process boundary has stopped. A timeout would recreate
