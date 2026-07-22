@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -476,6 +476,27 @@ describe('workflow MCP facade', () => {
       agents: { agents: { agentId: string; result: { source: string; available: boolean } }[] }
     }).agents.agents.find((agent) => agent.agentId === big.agentId)!
     expect(relistedBig.result).toMatchObject({ available: true, source: 'journal' })
+
+    // Review blocker: a lineage journal keeps its PREDECESSOR's agent ids until each key is
+    // re-admitted, and agent ids are positional, so a stale agent_N routinely names a different
+    // logical call. Joining on agentId served that predecessor value as this agent's result — with
+    // the list advertising available: true beside it. Rewriting this run's journal so its records
+    // carry a foreign key must now make the agent unreadable, not confidently wrong.
+    const journalPath = join(cwd, 'state', 'runs', runId, 'transcripts', 'journal.jsonl')
+    const journal = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      snapshots: { records: { type: string; key: string; agentId: string; result?: unknown }[] }[]
+    }
+    for (const snapshot of journal.snapshots) {
+      for (const record of snapshot.records) {
+        if (record.type === 'result') record.key = `v2:${'e'.repeat(64)}`
+      }
+    }
+    await writeFile(journalPath, JSON.stringify(journal), 'utf8')
+    const foreign = await client.callTool({
+      name: 'workflow_agent_result_read',
+      arguments: { runId, agentId: big.agentId },
+    })
+    expect(foreign.isError).toBe(true)
 
     // The transcript is the agent's slice of the canonical stream, not the best-effort mirror.
     const transcript = await client.callTool({

@@ -910,15 +910,30 @@ export class WorkflowService {
     }
 
     const items: WorkflowAgentResultPage[] = []
+    const skipped: { agentId: string; reason: string }[] = []
     for (let index = startIndex; index < readable.length; index += 1) {
       const agent = readable[index]!
       const inner = index === startIndex ? parsed?.cursor : undefined
-      const page = await this.readAgentResult(scope, {
-        runId: input.runId,
-        agentId: agent.agentId,
-        maxBytes,
-        ...(inner === undefined ? {} : { cursor: inner }),
-      })
+      let page: WorkflowAgentResultPage
+      try {
+        page = await this.readAgentResult(scope, {
+          runId: input.runId,
+          agentId: agent.agentId,
+          maxBytes,
+          ...(inner === undefined ? {} : { cursor: inner }),
+        })
+      } catch (cause) {
+        // One damaged agent must not make the whole run uninspectable. Aborting stranded the
+        // caller: the composite cursor names an agent, so stepping past a poisoned one meant
+        // hand-forging `v1.<next_agent>.` — a shape no tool description documents. This tool's job
+        // is post-mortem inspection of runs that may well have had storage trouble, so a partial
+        // answer that names what it could not read beats an error for everything.
+        skipped.push({
+          agentId: agent.agentId,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        })
+        continue
+      }
       items.push(page)
       if (page.hasMore) {
         return {
@@ -926,6 +941,7 @@ export class WorkflowService {
           items,
           hasMore: true,
           nextCursor: `v1.${agent.agentId}.${page.nextCursor!}`,
+          ...(skipped.length === 0 ? {} : { skipped }),
         }
       }
       // One page per agent per call keeps the response bounded by maxBytes × agents rather than by
@@ -937,10 +953,16 @@ export class WorkflowService {
           items,
           hasMore: next !== undefined,
           ...(next === undefined ? {} : { nextCursor: `v1.${next.agentId}.` }),
+          ...(skipped.length === 0 ? {} : { skipped }),
         }
       }
     }
-    return { runId: input.runId, items, hasMore: false }
+    return {
+      runId: input.runId,
+      items,
+      hasMore: false,
+      ...(skipped.length === 0 ? {} : { skipped }),
+    }
   }
 
   /**
@@ -989,9 +1011,12 @@ export class WorkflowService {
       runId: input.runId,
       agentId: input.agentId,
       fromCursor: after,
-      toCursor: events.at(-1)?.cursor ?? after,
+      // The SCAN position, not the last matching event. Most events in a fan-out belong to other
+      // agents; reporting the last match made a polling client re-scan the same rejected span of
+      // events.jsonl forever instead of advancing past it.
+      toCursor: cursor,
       events,
-      hasMore: hasMore || events.length >= limit,
+      hasMore,
     }
   }
 

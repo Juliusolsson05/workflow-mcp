@@ -236,7 +236,7 @@ export function registerWorkflowMcpTools(
     'workflow_agent_list',
     {
       title: 'List workflow agents',
-      description: 'List a run\'s logical agents with label, phase, status, attempt history, and a result locator each. Abandoned retry attempts appear as history inside their agent, never as separate agents. Works while the run is still executing; poll using the returned runStatus and cursor. result.source is artifact (durable per-agent bytes), journal (recorded value, no artifact), or none (no terminal value yet).',
+      description: 'List a run\'s logical agents with label, phase, status, attempt history, and a result locator each. Abandoned retry attempts appear as history inside their agent, never as separate agents. Works while the run is still executing. Returns every agent in one response (not paginated); the returned cursor is the run\'s event position, not a paging token — compare it across calls to tell whether a live run has advanced. result.source is artifact (durable per-agent bytes), journal (recorded value, no artifact), or none (no terminal value yet).',
       inputSchema: {
         runId: z.string().min(1),
       },
@@ -278,7 +278,7 @@ export function registerWorkflowMcpTools(
     'workflow_agent_results_read',
     {
       title: 'Read all agent results',
-      description: 'Walk every readable agent result in one paginated sweep, ordered by callIndex. Optionally filter to one phase by id or title. Each item is the same page shape workflow_agent_result_read returns; follow nextCursor while hasMore. A page stops at the first agent with more bytes, so each agent\'s content arrives contiguously rather than interleaved.',
+      description: 'Walk every readable agent result in one paginated sweep, ordered by callIndex. Optionally filter to one phase by id or title. Each item is the same page shape workflow_agent_result_read returns; follow nextCursor while hasMore. A page stops at the first agent with more bytes, so each agent\'s content arrives contiguously rather than interleaved. An agent whose bytes cannot be read is reported in skipped[] and the sweep continues. Keep phase constant across a paged sweep: the cursor names an agent, so changing the filter mid-walk invalidates it.',
       inputSchema: {
         runId: z.string().min(1),
         phase: z.string().min(1).max(200).optional(),

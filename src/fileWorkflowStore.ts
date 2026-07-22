@@ -120,6 +120,11 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly rootDirectory: string
   readonly runsDirectory: string
   readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
+  /** runId → parsed journal results, invalidated by the journal file's size+mtime. */
+  readonly #journalResultCache = new Map<
+    string,
+    { identity: string; located: Map<string, JournalResultLocator> }
+  >()
   readonly #eventOffsets = new Map<string, Map<number, number>>()
   readonly #appendTails = new Map<string, Promise<void>>()
   #createTail: Promise<void> = Promise.resolve()
@@ -1203,10 +1208,29 @@ export class FileWorkflowStore implements WorkflowStore {
    * a stable join column across a lineage. cacheKey is.
    */
   async #journalResultsByKey(runId: string): Promise<Map<string, JournalResultLocator>> {
+    // Cached on the journal file's identity (size + mtime), because the document is rewritten
+    // wholesale on every admit and result, so any change moves both.
+    //
+    // WHY this cache is not optional: reading ONE agent from the journal parses EVERY agent's
+    // result. Without it, paging a 1 MB value at the 16 KB default re-parsed the whole journal 64
+    // times, and a bulk sweep of a resumed 200-agent run did it once per agent. Resumed runs are
+    // both the worst case and the common one: reused agents complete through the agent.reused path,
+    // which never materializes an artifact, so every agent in them is journal-served.
+    const path = this.journalPath(runId)
+    let identity = ''
+    try {
+      const info = await stat(path)
+      identity = `${info.size}:${info.mtimeMs}`
+      const cached = this.#journalResultCache.get(runId)
+      if (cached !== undefined && cached.identity === identity) return cached.located
+    } catch {
+      // A journal we cannot stat is handled by the read below, which degrades to an empty map.
+    }
+
     const located = new Map<string, JournalResultLocator>()
     let snapshots: readonly JournalSnapshot[]
     try {
-      snapshots = await readWorkflowJournalSnapshots(this.journalPath(runId))
+      snapshots = await readWorkflowJournalSnapshots(path)
     } catch {
       // A journal this reader cannot parse must not take down inspection of a run whose artifacts
       // and events are perfectly readable. Callers degrade to `source: 'none'`.
@@ -1223,6 +1247,7 @@ export class FileWorkflowStore implements WorkflowStore {
         })
       }
     }
+    if (identity !== '') this.#journalResultCache.set(runId, { identity, located })
     return located
   }
 
@@ -1231,12 +1256,25 @@ export class FileWorkflowStore implements WorkflowStore {
     agentId: string,
     cacheKey: string | undefined,
   ): Promise<{ metadata: StoredWorkflowResultMetadata; source: 'artifact' | 'journal'; bytes?: Buffer }> {
-    const artifact = await this.#readAgentResultMetadata(runId, agentId)
-    if (artifact !== undefined) return { metadata: artifact, source: 'artifact' }
+    // A torn artifact (unreadable metadata, or metadata whose data file is gone) must fall through
+    // to the journal rather than fail the read. Those are precisely the "the artifact write was
+    // dropped or the disk filled" states the fallback exists for, and the journal still holds the
+    // bytes. Previously only a MISSING metadata file fell through, so a half-written pair made
+    // workflow_agent_list advertise a result that every read then refused.
+    const artifact = await this.#readAgentResultMetadata(runId, agentId).catch(() => undefined)
+    if (artifact !== undefined && await this.#agentArtifactDataUsable(runId, agentId, artifact)) {
+      return { metadata: artifact, source: 'artifact' }
+    }
 
     const journal = await this.#journalResultsByKey(runId)
-    const record = (cacheKey === undefined ? undefined : journal.get(cacheKey)) ??
-      [...journal.values()].find(candidate => candidate.agentId === agentId)
+    // cacheKey ONLY. Never fall back to scanning for a matching agentId: under exact-source-sparse
+    // recovery a successor journal starts as a copy of its predecessor's records and keeps the
+    // PREDECESSOR's agent ids until each key is re-admitted. Agent ids are positional (one runtime
+    // counter), so agent_5 in this run and agent_5 in its parent are routinely different logical
+    // calls. Review proved the scan served a predecessor's value as the terminal result of an agent
+    // that had produced nothing at all, with the list reporting available: true beside it. A missing
+    // result is a fine answer; a confidently wrong one is not.
+    const record = cacheKey === undefined ? undefined : journal.get(cacheKey)
     if (record === undefined) {
       throw new WorkflowStoreError(
         'result-not-found',
@@ -1275,6 +1313,14 @@ export class FileWorkflowStore implements WorkflowStore {
   ): Promise<WorkflowAgentResultPage> {
     await this.#requiredManifest(runId)
     this.#assertAgentId(agentId)
+    // Bounded here as well as at the MCP edge: WorkflowStore is exported public API, so the zod
+    // schema is not the only door into this method. Mirrors readResult's guard.
+    if (input.artifactId !== undefined && (input.artifactId.length === 0 || input.artifactId.length > 200)) {
+      throw new WorkflowStoreError(
+        'result-not-found',
+        `Workflow agent result artifact does not exist for ${runId}/${agentId}`,
+      )
+    }
     if (input.cursor !== undefined && (input.cursor.length === 0 || input.cursor.length > 200)) {
       throw new WorkflowStoreError('invalid-cursor', 'Agent result cursor is malformed')
     }
@@ -1351,6 +1397,27 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  /**
+   * Is this agent's artifact actually servable, or only half-present?
+   *
+   * Checked before advertising `source: 'artifact'` anywhere, because metadata and data are two
+   * files written in sequence: a crash or a full disk between them leaves a locator pointing at
+   * bytes that are absent or the wrong length. Cheaper to stat once here than to let the caller
+   * discover it as a mid-pagination corrupt-store error.
+   */
+  async #agentArtifactDataUsable(
+    runId: string,
+    agentId: string,
+    metadata: StoredWorkflowResultMetadata,
+  ): Promise<boolean> {
+    try {
+      const info = await stat(this.#agentResultDataPath(runId, agentId))
+      return info.isFile() && info.size === metadata.sizeBytes
+    } catch {
+      return false
+    }
+  }
+
   /** Locators for every agent, for the list tool. Absent entries mean "no terminal value yet". */
   async agentResultLocators(
     runId: string,
@@ -1365,9 +1432,10 @@ export class FileWorkflowStore implements WorkflowStore {
     const journal = await this.#journalResultsByKey(runId)
     for (const agent of agents) {
       const artifact = await this.#readAgentResultMetadata(runId, agent.agentId).catch(() => undefined)
-      const record = journal.get(agent.cacheKey) ??
-        [...journal.values()].find(candidate => candidate.agentId === agent.agentId)
-      if (artifact !== undefined) {
+      // cacheKey only — see the WHY in #agentResultBytes. The list must not advertise a result the
+      // read would refuse to serve, so both sites resolve identically.
+      const record = journal.get(agent.cacheKey)
+      if (artifact !== undefined && await this.#agentArtifactDataUsable(runId, agent.agentId, artifact)) {
         locators.set(agent.agentId, {
           source: 'artifact',
           metadata: artifact,
@@ -1624,11 +1692,17 @@ function agentResultReference(
   inline: ContentReference,
   metadata: StoredWorkflowResultMetadata,
 ): ContentReference {
+  // Carries the same integrity metadata the run-result reference does. Publishing a bare artifactId
+  // with no size or checksum beside it left a consumer unable to tell a complete read from a torn
+  // one. Note the id lives in the agent_result_sha256_* namespace and is readable ONLY through
+  // workflow_agent_result_read — handing it to workflow_result_read yields result-not-found.
   return {
     ...inline,
     artifactId: metadata.artifactId,
     mediaType: metadata.mediaType,
     lineCount: metadata.lineCount,
+    sizeBytes: metadata.sizeBytes,
+    checksum: metadata.checksum,
   }
 }
 

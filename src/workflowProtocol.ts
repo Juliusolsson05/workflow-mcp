@@ -118,14 +118,17 @@ export type WorkflowAgentListEntry = {
   result: WorkflowAgentResultLocator
 }
 
+/**
+ * The complete agent list for a run. NOT paginated — every agent is returned every time.
+ *
+ * `cursor` is the run's EVENT cursor, not a paging token: there is no input that accepts it back.
+ * It is here so a caller inspecting a live fan-out can tell whether the run has advanced since the
+ * last look, which matters because per-agent reads deliberately do not require a terminal run.
+ */
 export type WorkflowAgentListPage = {
   runId: string
-  /**
-   * Echoed with `cursor` so a caller can poll deterministically while the run is still moving.
-   * Per-agent reads deliberately do not require a terminal run — inspecting a live fan-out is the
-   * point — so the caller needs the run's position to know whether to look again.
-   */
   runStatus: WorkflowRunStatus
+  /** The run's event cursor at the time of the listing. Not a paging token. */
   cursor: number
   agents: WorkflowAgentListEntry[]
 }
@@ -151,6 +154,11 @@ export type WorkflowAgentResultsPage = {
   hasMore: boolean
   /** Composite `v1.<agentId>.<sha256>.<offset>`; advances to the next agent when one is exhausted. */
   nextCursor?: string
+  /**
+   * Agents whose bytes could not be read on this page, with the reason. Present only when
+   * non-empty: one damaged agent degrades to a named omission rather than failing the sweep.
+   */
+  skipped?: { agentId: string; reason: string }[]
 }
 
 export type WorkflowAgentTranscriptPage = {
