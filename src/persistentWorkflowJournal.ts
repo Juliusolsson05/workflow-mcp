@@ -289,6 +289,26 @@ function persistAtomically(filePath: string, snapshots: readonly JournalSnapshot
   }
 }
 
+/**
+ * Read a run's durable journal snapshots without constructing a live journal.
+ *
+ * WHY this exists as a separate door: `PersistentWorkflowJournal` is a write-capable, run-owning
+ * object, and observability must never take that role — a reader that could admit or persist would
+ * be able to mutate the execution history it is inspecting. This returns the parsed records and
+ * nothing else, going through the same validation the recovery path uses so a corrupt journal fails
+ * identically for a reader and for a resume.
+ *
+ * Cost note: the journal is one atomic JSON document, so this materializes EVERY agent's result in
+ * the run. That is acceptable for a fallback read of a finished run and unacceptable as a hot path
+ * — which is exactly why per-agent artifacts exist.
+ */
+export async function readWorkflowJournalSnapshots(
+  filePath: string,
+): Promise<readonly JournalSnapshot[]> {
+  const stored = await readStoredSnapshots(filePath)
+  return stored?.snapshots ?? []
+}
+
 async function readStoredSnapshots(filePath: string): Promise<ReadStoredJournal | undefined> {
   let info
   try {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -14,7 +14,7 @@ import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
 
 describe('workflow MCP facade', () => {
-  it('registers the complete stable nine-tool surface', async () => {
+  it('registers the complete stable thirteen-tool surface', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-mcp-tools-'))
     const service = new WorkflowService({
       store: new FileWorkflowStore(join(cwd, 'state')),
@@ -29,6 +29,10 @@ describe('workflow MCP facade', () => {
 
     const tools = await client.listTools()
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
+      'workflow_agent_list',
+      'workflow_agent_result_read',
+      'workflow_agent_results_read',
+      'workflow_agent_transcript_read',
       'workflow_describe',
       'workflow_list',
       'workflow_result_read',
@@ -305,6 +309,189 @@ describe('workflow MCP facade', () => {
       'verify:fast:FAST-LIVE',
     ])
     provider.assertExhausted()
+    await service.stop()
+  })
+
+  it('exposes each agent result in full even though agent.completed is truncated', async () => {
+    // The regression this whole surface exists for: a result larger than the event-stream cap.
+    // 50 000 characters is comfortably past DEFAULT_LIMITS.maxLogCharacters (10 000), so the event
+    // copy MUST be truncated while the tools MUST still return every byte.
+    const large = 'x'.repeat(50_000)
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-mcp-agent-results-'))
+    const workflows = join(cwd, '.claude', 'workflows')
+    await mkdir(workflows, { recursive: true })
+    await writeFile(join(workflows, 'fanout.js'), `export const meta = {
+      name: 'fanout', description: 'agent result fixture', phases: [{ title: 'Collect' }]
+    }
+    phase('Collect')
+    const both = await parallel([
+      () => agent('big one', { label: 'big' }),
+      () => agent('small one', { label: 'small' }),
+    ])
+    return both.length`)
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(cwd, 'state')),
+      provider: new FakeAgentProvider([
+        { outcome: { type: 'result', output: { type: 'text', text: large } } },
+        { outcome: { type: 'result', output: { type: 'text', text: 'tiny' } } },
+      ]),
+    })
+    await service.initialize()
+    const server = new McpServer({ name: 'agent-results-server', version: '1' })
+    registerWorkflowMcpTools(server, service, { cwd })
+    const client = new Client({ name: 'agent-results-client', version: '1' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
+
+    const started = await client.callTool({ name: 'workflow_run', arguments: { name: 'fanout' } })
+    const runId = (started.structuredContent as { run: { runId: string } }).run.runId
+    for (let index = 0; index < 400; index += 1) {
+      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
+      const state = (status.structuredContent as { run: { status: string } }).run.status
+      if (state === 'completed' || state === 'completed_with_errors') break
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+    }
+
+    const listed = await client.callTool({ name: 'workflow_agent_list', arguments: { runId } })
+    const agents = (listed.structuredContent as {
+      agents: {
+        agents: {
+          agentId: string
+          label: string
+          phaseTitle?: string
+          status: string
+          coverageGap: boolean
+          attempts: unknown[]
+          result: { available: boolean; source: string; sizeBytes?: number }
+        }[]
+      }
+    }).agents.agents
+    expect(agents).toHaveLength(2)
+    expect(agents.map((agent) => agent.label).sort()).toEqual(['big', 'small'])
+    for (const agent of agents) {
+      expect(agent.status).toBe('completed')
+      expect(agent.coverageGap).toBe(false)
+      expect(agent.phaseTitle).toBe('Collect')
+      expect(agent.attempts).toHaveLength(1)
+      expect(agent.result.available).toBe(true)
+    }
+    const big = agents.find((agent) => agent.label === 'big')!
+    expect(big.result.source).toBe('artifact')
+    expect(big.result.sizeBytes).toBe(50_000)
+
+    // Prove the premise: the event stream really is bounded for this agent.
+    const events = await client.callTool({
+      name: 'workflow_run_events',
+      arguments: { runId, after: 0, limit: 500 },
+    })
+    const completed = (events.structuredContent as {
+      page: { events: { event: { type: string; agentId?: string; payload?: { result?: { truncated?: boolean; content?: string } } } }[] }
+    }).page.events.find((stored) =>
+      stored.event.type === 'agent.completed' && stored.event.agentId === big.agentId)
+    expect(completed?.event.payload?.result?.truncated).toBe(true)
+    expect((completed?.event.payload?.result?.content as string).length).toBeLessThan(large.length)
+
+    // Page the full value back and prove concatenation reproduces it byte for byte.
+    let assembled = ''
+    let cursor: string | undefined
+    for (let page = 0; page < 100; page += 1) {
+      const read = await client.callTool({
+        name: 'workflow_agent_result_read',
+        arguments: { runId, agentId: big.agentId, maxBytes: 4_096, ...(cursor === undefined ? {} : { cursor }) },
+      })
+      const value = (read.structuredContent as {
+        page: { content: string; hasMore: boolean; nextCursor?: string; agentId: string; source: string }
+      }).page
+      expect(value.agentId).toBe(big.agentId)
+      assembled += value.content
+      if (!value.hasMore) break
+      cursor = value.nextCursor
+    }
+    expect(assembled).toBe(large)
+
+    // A cursor whose embedded checksum does not match must be refused rather than silently
+    // reinterpreted against different content.
+    const stale = await client.callTool({
+      name: 'workflow_agent_result_read',
+      arguments: { runId, agentId: big.agentId, cursor: `v1.${'0'.repeat(64)}.0` },
+    })
+    expect(stale.isError).toBe(true)
+
+    const unknown = await client.callTool({
+      name: 'workflow_agent_result_read',
+      arguments: { runId, agentId: 'agent_9999' },
+    })
+    expect(unknown.isError).toBe(true)
+
+    // Bulk sweep reaches both agents and keeps each one's bytes contiguous.
+    const collected = new Map<string, string>()
+    let bulkCursor: string | undefined
+    for (let page = 0; page < 100; page += 1) {
+      const bulk = await client.callTool({
+        name: 'workflow_agent_results_read',
+        arguments: { runId, maxBytes: 8_192, ...(bulkCursor === undefined ? {} : { cursor: bulkCursor }) },
+      })
+      const value = (bulk.structuredContent as {
+        page: { items: { agentId: string; content: string }[]; hasMore: boolean; nextCursor?: string }
+      }).page
+      for (const item of value.items) {
+        collected.set(item.agentId, (collected.get(item.agentId) ?? '') + item.content)
+      }
+      if (!value.hasMore) break
+      bulkCursor = value.nextCursor
+    }
+    expect(collected.get(big.agentId)).toBe(large)
+    expect([...collected.values()]).toContain('tiny')
+
+    // Journal fallback. Deleting the artifact simulates both a run created before per-agent
+    // artifacts existed and a completion whose best-effort write was dropped — the case that lets
+    // persistAgentResult fail without failing an agent. The same bytes must still come back.
+    await rm(join(cwd, 'state', 'runs', runId, 'artifacts', `agent-${big.agentId}.data`))
+    await rm(join(cwd, 'state', 'runs', runId, 'artifacts', `agent-${big.agentId}.json`))
+    let fallback = ''
+    let fallbackCursor: string | undefined
+    let fallbackSource = ''
+    for (let page = 0; page < 100; page += 1) {
+      const read = await client.callTool({
+        name: 'workflow_agent_result_read',
+        arguments: {
+          runId,
+          agentId: big.agentId,
+          maxBytes: 16_384,
+          ...(fallbackCursor === undefined ? {} : { cursor: fallbackCursor }),
+        },
+      })
+      const value = (read.structuredContent as {
+        page: { content: string; hasMore: boolean; nextCursor?: string; source: string }
+      }).page
+      fallbackSource = value.source
+      fallback += value.content
+      if (!value.hasMore) break
+      fallbackCursor = value.nextCursor
+    }
+    expect(fallbackSource).toBe('journal')
+    expect(fallback).toBe(large)
+    const relisted = await client.callTool({ name: 'workflow_agent_list', arguments: { runId } })
+    const relistedBig = (relisted.structuredContent as {
+      agents: { agents: { agentId: string; result: { source: string; available: boolean } }[] }
+    }).agents.agents.find((agent) => agent.agentId === big.agentId)!
+    expect(relistedBig.result).toMatchObject({ available: true, source: 'journal' })
+
+    // The transcript is the agent's slice of the canonical stream, not the best-effort mirror.
+    const transcript = await client.callTool({
+      name: 'workflow_agent_transcript_read',
+      arguments: { runId, agentId: big.agentId },
+    })
+    const page = (transcript.structuredContent as {
+      page: { events: { event: { type: string; agentId: string } }[]; agentId: string }
+    }).page
+    expect(page.agentId).toBe(big.agentId)
+    expect(page.events.length).toBeGreaterThan(0)
+    expect(page.events.every((stored) => stored.event.agentId === big.agentId)).toBe(true)
+    expect(page.events.map((stored) => stored.event.type)).toContain('agent.completed')
+
+    await client.close()
+    await server.close()
     await service.stop()
   })
 })

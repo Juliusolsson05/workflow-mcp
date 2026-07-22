@@ -228,6 +228,27 @@ export function isWorkflowAgentFailurePlaceholder(
     candidate.coverageGap === true
 }
 
+export type SerializedWorkflowValue = {
+  content: string
+  mediaType: 'text/plain' | 'application/json'
+}
+
+/**
+ * The single spelling of "this workflow value as durable UTF-8".
+ *
+ * WHY centralized: the same value is now serialized in three places — the final run result, the
+ * per-agent result artifact, and the journal fallback that serves agents whose artifact write was
+ * dropped. If those drifted, an agent read from the journal would return different bytes than the
+ * same agent read from its artifact, and the checksum-fenced cursors would silently disagree about
+ * what the content even is. `undefined` keeps its explicit 'undefined' spelling rather than being
+ * coerced to null, because JSON has no way to say it and lying is worse than a sentinel.
+ */
+export function serializeWorkflowValue(value: unknown): SerializedWorkflowValue {
+  if (value === undefined) return { content: 'undefined', mediaType: 'text/plain' }
+  if (typeof value === 'string') return { content: value, mediaType: 'text/plain' }
+  return { content: JSON.stringify(value, null, 2), mediaType: 'application/json' }
+}
+
 export type RunFailedEvent = EventEnvelope<
   'run.failed',
   {
