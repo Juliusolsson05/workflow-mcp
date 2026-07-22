@@ -194,6 +194,9 @@ export function registerWorkflowMcpTools(
         z.object({
           runId: z.string().min(1),
           idempotencyKey: z.string().min(1).max(200).optional(),
+          abandonUnconfirmedProvider: z.boolean().optional().describe(
+            'Explicit operator acknowledgement for continuing a read-only offline run while an old provider descendant may still be alive',
+          ),
         }),
         z.object({
           claudeRunPath: z.string().min(1),
@@ -210,6 +213,9 @@ export function registerWorkflowMcpTools(
           ? {
               runId: input.runId,
               ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
+              ...(input.abandonUnconfirmedProvider === undefined
+                ? {}
+                : { abandonUnconfirmedProvider: input.abandonUnconfirmedProvider }),
             }
           : {
               claudeRunPath: input.claudeRunPath,

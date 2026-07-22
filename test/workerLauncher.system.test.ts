@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
@@ -18,9 +18,11 @@ class SyntheticWorker implements WorkflowWorkerHandle {
   readonly events = new EventEmitter()
   running = true
 
+  constructor(private readonly autoComplete = true) {}
+
   postMessage(message: ParentToWorkerMessage): void {
     if (message.type === 'start') {
-      queueMicrotask(() => this.events.emit('message', { type: 'complete', value: 'embedded' }))
+      if (this.autoComplete) this.complete()
     }
     if (message.type === 'cancel') this.terminate()
   }
@@ -43,6 +45,10 @@ class SyntheticWorker implements WorkflowWorkerHandle {
 
   isRunning(): boolean {
     return this.running
+  }
+
+  complete(): void {
+    queueMicrotask(() => this.events.emit('message', { type: 'complete', value: 'embedded' }))
   }
 
   terminate(): void {
@@ -190,5 +196,37 @@ describe('WorkflowWorkerLauncher boundary', () => {
 
     await expect(run.result).rejects.toMatchObject({ code: 'workflow-worker-idle' })
     expect(worker.running).toBe(false)
+  })
+
+  it('does not charge a system-sleep timer gap to evaluator heartbeat health', async () => {
+    vi.useFakeTimers()
+    try {
+      const worker = new SyntheticWorker(false)
+      const run = runWorkflow({
+        workflow: parseWorkflowSource(`export const meta = {
+          name: 'sleep-gap', description: 'System suspension fixture'
+        }
+        return 'source evaluator is replaced by the synthetic transport'`),
+        cwd: process.cwd(),
+        provider: new FakeAgentProvider([]),
+        workerLauncher: { launch: () => worker },
+        reliability: {
+          workerStartupTimeoutMs: 100,
+          workerHeartbeatTimeoutMs: 100,
+          workerIdleTimeoutMs: 100,
+        },
+      })
+
+      await vi.advanceTimersByTimeAsync(0)
+      const beforeSleep = Date.now()
+      vi.setSystemTime(beforeSleep + 10_000)
+      await vi.advanceTimersByTimeAsync(25)
+      worker.complete()
+      await vi.advanceTimersByTimeAsync(0)
+
+      await expect(run.result).resolves.toBe('embedded')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
