@@ -25,7 +25,7 @@ import {
   persistInlineWorkflow,
   WorkflowAuthoringError,
 } from './workflowAuthoring.js'
-import type { WorkflowEvent } from './workflowEvents.js'
+import type { WorkflowEvent, WorkflowResultMaterialization } from './workflowEvents.js'
 import type { WorkflowWorkerLauncher } from './workerLauncher.js'
 import type {
   StoredWorkflowEvent,
@@ -33,6 +33,11 @@ import type {
   WorkflowRunManifest,
   WorkflowRunSnapshot,
   WorkflowRunStatus,
+  WorkflowAgentListEntry,
+  WorkflowAgentListPage,
+  WorkflowAgentResultPage,
+  WorkflowAgentResultsPage,
+  WorkflowAgentTranscriptPage,
   WorkflowResultPage,
   WorkflowStore,
   WorkflowStoreLease,
@@ -194,6 +199,7 @@ export type WorkflowServiceErrorCode =
   | 'result-not-ready'
   | 'result-unavailable'
   | 'result-not-found'
+  | 'agent-not-found'
   | 'result-expired'
   | 'invalid-cursor'
   | 'invalid-request'
@@ -245,6 +251,46 @@ export type WorkflowResultReadInput = {
   artifactId: string
   cursor?: string
   maxBytes?: number
+}
+
+export type WorkflowAgentResultReadServiceInput = {
+  runId: string
+  agentId: string
+  artifactId?: string
+  cursor?: string
+  maxBytes?: number
+}
+
+/** One page per agent per bulk call, so a response is bounded by agents, not by total output. */
+const AGENT_RESULTS_PAGE_ITEMS = 20
+const DEFAULT_AGENT_TRANSCRIPT_EVENTS = 200
+const MAX_AGENT_TRANSCRIPT_EVENTS = 1_000
+/** Raw events scanned per filtered batch; most events in a fan-out belong to other agents. */
+const TRANSCRIPT_SCAN_BATCH = 500
+/**
+ * Batches scanned per call. Bounds WORK, not output: without it, an agent with three events in a
+ * long run scanned from `after` to the end of the stream every call, which a read-only client could
+ * repeat at will against a 512 MiB event log.
+ */
+const MAX_TRANSCRIPT_SCAN_BATCHES = 20
+
+/**
+ * Split `v1.<agentId>.<innerCursor>`.
+ *
+ * The inner cursor keeps its own `v1.<sha256>.<offset>` shape untouched, so the single-artifact
+ * staleness fence still applies inside a bulk walk. A trailing empty inner cursor means "start this
+ * agent from the beginning", which is how the walk advances past a fully-read agent.
+ */
+function parseAgentResultsCursor(
+  cursor: string | undefined,
+): { agentId: string; cursor?: string } | undefined {
+  if (cursor === undefined) return undefined
+  const match = /^v1\.(agent_[0-9]+)\.(.*)$/.exec(cursor)
+  if (match === null) {
+    throw new WorkflowServiceError('invalid-cursor', 'Bulk agent result cursor is malformed')
+  }
+  const inner = match[2]!
+  return { agentId: match[1]!, ...(inner.length === 0 ? {} : { cursor: inner }) }
 }
 
 export type WorkflowServiceListener = (event: StoredWorkflowEvent) => void
@@ -708,6 +754,307 @@ export class WorkflowService {
     }
   }
 
+  /**
+   * List the run's LOGICAL agents with attempt history and a result locator each.
+   *
+   * No terminal-run gate, unlike readResult. Inspecting a fan-out while it is still moving is the
+   * whole point, so the response echoes the run's status and cursor and the caller polls.
+   */
+  async listAgents(
+    scope: WorkflowServiceScope,
+    input: { runId: string },
+  ): Promise<WorkflowAgentListPage> {
+    const snapshot = await this.snapshot(scope, input.runId)
+    const phaseTitles = new Map(snapshot.state.phases.map(phase => [phase.id, phase.title]))
+    const store = this.#options.store
+    const locators = store.agentResultLocators === undefined
+      ? new Map()
+      : await store.agentResultLocators(
+        input.runId,
+        snapshot.state.agents.map(agent => ({ agentId: agent.id, cacheKey: agent.cacheKey })),
+      )
+    const agents: WorkflowAgentListEntry[] = snapshot.state.agents.map(agent => {
+      const located = locators.get(agent.id)
+      const phaseTitle = agent.phaseId === undefined ? undefined : phaseTitles.get(agent.phaseId)
+      return {
+        agentId: agent.id,
+        callIndex: agent.callIndex,
+        label: agent.label,
+        ...(agent.phaseId === undefined ? {} : { phaseId: agent.phaseId }),
+        ...(phaseTitle === undefined ? {} : { phaseTitle }),
+        status: agent.status,
+        reused: agent.outcome?.source === 'journal',
+        coverageGap: located?.coverageGap ?? false,
+        attempts: agent.attempts.map(attempt => ({
+          attemptId: attempt.id,
+          attemptNumber: attempt.number,
+          status: attempt.status,
+          ...(attempt.startedAt === undefined ? {} : { startedAt: attempt.startedAt }),
+          ...(attempt.completedAt === undefined ? {} : { completedAt: attempt.completedAt }),
+        })),
+        result: located === undefined
+          ? { available: false, source: 'none' as const }
+          : {
+            available: true,
+            source: located.source,
+            ...(located.metadata === undefined ? {} : {
+              artifactId: located.metadata.artifactId,
+              mediaType: located.metadata.mediaType,
+              sizeBytes: located.metadata.sizeBytes,
+              lineCount: located.metadata.lineCount,
+              checksum: located.metadata.checksum,
+            }),
+          },
+      }
+    })
+    return {
+      runId: input.runId,
+      runStatus: snapshot.manifest.status,
+      cursor: snapshot.cursor,
+      agents,
+    }
+  }
+
+  async readAgentResult(
+    scope: WorkflowServiceScope,
+    input: WorkflowAgentResultReadServiceInput,
+  ): Promise<WorkflowAgentResultPage> {
+    const maxBytes = boundedInteger(
+      input.maxBytes ?? DEFAULT_WORKFLOW_RESULT_PAGE_BYTES,
+      'maxBytes',
+      MIN_WORKFLOW_RESULT_PAGE_BYTES,
+      MAX_WORKFLOW_RESULT_PAGE_BYTES,
+    )
+    if (input.cursor !== undefined && (input.cursor.length === 0 || input.cursor.length > 200)) {
+      throw new WorkflowServiceError('invalid-cursor', 'Agent result cursor is malformed')
+    }
+    // snapshot() carries the scope assertion; it also gives the cacheKey, which is the stable join
+    // column into the journal across a recovery lineage.
+    const snapshot = await this.snapshot(scope, input.runId)
+    const agent = snapshot.state.agents.find(candidate => candidate.id === input.agentId)
+    if (agent === undefined) {
+      throw new WorkflowServiceError(
+        'agent-not-found',
+        `Workflow run ${input.runId} has no agent ${input.agentId}`,
+      )
+    }
+    const store = this.#options.store
+    if (store.readAgentResult === undefined) {
+      throw new WorkflowServiceError(
+        'result-unavailable',
+        'This workflow store cannot read per-agent results',
+      )
+    }
+    try {
+      return await store.readAgentResult(input.runId, input.agentId, {
+        maxBytes,
+        cacheKey: agent.cacheKey,
+        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+        ...(input.artifactId === undefined ? {} : { artifactId: input.artifactId }),
+      })
+    } catch (cause) {
+      if (hasErrorCode(cause, 'invalid-cursor')) {
+        throw new WorkflowServiceError(
+          'invalid-cursor',
+          `Agent result cursor is malformed or stale for ${input.runId}/${input.agentId}`,
+          { cause },
+        )
+      }
+      if (hasErrorCode(cause, 'agent-not-found')) {
+        throw new WorkflowServiceError(
+          'agent-not-found',
+          `Workflow run ${input.runId} has no agent ${input.agentId}`,
+          { cause },
+        )
+      }
+      if (hasErrorCode(cause, 'result-not-found')) {
+        throw new WorkflowServiceError(
+          'result-unavailable',
+          `Workflow agent ${input.agentId} has no result recorded in ${input.runId}`,
+          { cause },
+        )
+      }
+      if (hasErrorCode(cause, 'corrupt-store')) {
+        // Damage, not absence. Previously this escaped as a raw WorkflowStoreError, unlike every
+        // other error from this path.
+        throw new WorkflowServiceError(
+          'result-unavailable',
+          `Workflow agent ${input.agentId} result is unreadable in ${input.runId}: storage is damaged`,
+          { cause },
+        )
+      }
+      throw cause
+    }
+  }
+
+  /**
+   * Page every agent's result in one walk, ordered by callIndex.
+   *
+   * The composite cursor is `v1.<agentId>.<inner>` where `<inner>` is an ordinary single-artifact
+   * cursor. A page stops at the first agent that still has more bytes, so a caller following
+   * nextCursor sees each agent's content contiguously rather than interleaved.
+   */
+  async readAgentResults(
+    scope: WorkflowServiceScope,
+    input: { runId: string; phase?: string; cursor?: string; maxBytes?: number },
+  ): Promise<WorkflowAgentResultsPage> {
+    const maxBytes = boundedInteger(
+      input.maxBytes ?? DEFAULT_WORKFLOW_RESULT_PAGE_BYTES,
+      'maxBytes',
+      MIN_WORKFLOW_RESULT_PAGE_BYTES,
+      MAX_WORKFLOW_RESULT_PAGE_BYTES,
+    )
+    const listing = await this.listAgents(scope, { runId: input.runId })
+    const readable = listing.agents
+      .filter(agent => agent.result.available)
+      .filter(agent => input.phase === undefined ||
+        agent.phaseId === input.phase ||
+        agent.phaseTitle === input.phase)
+      .sort((left, right) => left.callIndex - right.callIndex)
+
+    const parsed = parseAgentResultsCursor(input.cursor)
+    let startIndex = 0
+    if (parsed !== undefined) {
+      startIndex = readable.findIndex(agent => agent.agentId === parsed.agentId)
+      if (startIndex < 0) {
+        throw new WorkflowServiceError(
+          'invalid-cursor',
+          `Bulk agent cursor names an agent that is not readable in ${input.runId}`,
+        )
+      }
+    }
+
+    const items: WorkflowAgentResultPage[] = []
+    const skipped: { agentId: string; reason: string }[] = []
+    for (let index = startIndex; index < readable.length; index += 1) {
+      const agent = readable[index]!
+      const inner = index === startIndex ? parsed?.cursor : undefined
+      let page: WorkflowAgentResultPage
+      try {
+        page = await this.readAgentResult(scope, {
+          runId: input.runId,
+          agentId: agent.agentId,
+          maxBytes,
+          ...(inner === undefined ? {} : { cursor: inner }),
+        })
+      } catch (cause) {
+        // One damaged agent must not make the whole run uninspectable. Aborting stranded the
+        // caller: the composite cursor names an agent, so stepping past a poisoned one meant
+        // hand-forging `v1.<next_agent>.` — a shape no tool description documents. This tool's job
+        // is post-mortem inspection of runs that may well have had storage trouble, so a partial
+        // answer that names what it could not read beats an error for everything.
+        skipped.push({
+          agentId: agent.agentId,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        })
+        continue
+      }
+      items.push(page)
+      if (page.hasMore) {
+        return {
+          runId: input.runId,
+          items,
+          hasMore: true,
+          nextCursor: `v1.${agent.agentId}.${page.nextCursor!}`,
+          ...(skipped.length === 0 ? {} : { skipped }),
+        }
+      }
+      // One page per agent per call keeps the response bounded by maxBytes × agents rather than by
+      // the run's total output, which is unbounded.
+      if (items.length >= AGENT_RESULTS_PAGE_ITEMS) {
+        const next = readable[index + 1]
+        return {
+          runId: input.runId,
+          items,
+          hasMore: next !== undefined,
+          ...(next === undefined ? {} : { nextCursor: `v1.${next.agentId}.` }),
+          ...(skipped.length === 0 ? {} : { skipped }),
+        }
+      }
+    }
+    return {
+      runId: input.runId,
+      items,
+      hasMore: false,
+      ...(skipped.length === 0 ? {} : { skipped }),
+    }
+  }
+
+  /**
+   * Page a single agent's slice of the canonical event stream.
+   *
+   * Reads events.jsonl filtered by agentId rather than transcripts/agent-<id>.jsonl. That mirror is
+   * appended best-effort after the canonical write, is never fsynced, and its own comment calls it
+   * "a discoverability aid, never a second source of truth" — it has no checksum to fence a cursor
+   * against and can silently be short.
+   */
+  async readAgentTranscript(
+    scope: WorkflowServiceScope,
+    input: { runId: string; agentId: string; after?: number; limit?: number },
+  ): Promise<WorkflowAgentTranscriptPage> {
+    const after = input.after === undefined ? 0 : boundedInteger(input.after, 'after', 0, Number.MAX_SAFE_INTEGER)
+    const limit = boundedInteger(input.limit ?? DEFAULT_AGENT_TRANSCRIPT_EVENTS, 'limit', 1, MAX_AGENT_TRANSCRIPT_EVENTS)
+    const snapshot = await this.snapshot(scope, input.runId)
+    if (!snapshot.state.agents.some(candidate => candidate.id === input.agentId)) {
+      throw new WorkflowServiceError(
+        'agent-not-found',
+        `Workflow run ${input.runId} has no agent ${input.agentId}`,
+      )
+    }
+    const events: StoredWorkflowEvent[] = []
+    // Three positions, deliberately not one. `scanCursor` is how far the raw stream has been read;
+    // `lastReturned` is the last event actually handed to the caller. They diverge because most
+    // events in a fan-out belong to other agents, and conflating them loses data in one direction
+    // or spins in the other:
+    //   - reporting the last MATCH re-scans the same rejected span on every poll (the original bug)
+    //   - reporting the SCAN position when the budget filled mid-batch skips the matching events in
+    //     the rest of that batch, silently, while hasMore still says true (the fix's own bug)
+    // So: if the budget filled, resume from the last returned event; otherwise the batch was fully
+    // consumed and the scan position is safe.
+    let scanCursor = after
+    let lastReturned = after
+    let budgetFilled = false
+    let streamExhausted = false
+    let batches = 0
+    while (events.length < limit && batches < MAX_TRANSCRIPT_SCAN_BATCHES) {
+      const page = await this.#options.store.readEvents(input.runId, scanCursor, TRANSCRIPT_SCAN_BATCH)
+      batches += 1
+      if (page.events.length === 0) {
+        streamExhausted = true
+        break
+      }
+      for (const stored of page.events) {
+        const event = stored.event as { agentId?: unknown }
+        if (event.agentId !== input.agentId) continue
+        if (events.length >= limit) {
+          budgetFilled = true
+          break
+        }
+        events.push(stored)
+        lastReturned = stored.cursor
+      }
+      if (budgetFilled) break
+      // Only advance once the whole batch has been consumed, so a mid-batch stop cannot strand the
+      // events behind it.
+      scanCursor = page.toCursor
+      if (!page.hasMore) {
+        streamExhausted = true
+        break
+      }
+    }
+    return {
+      runId: input.runId,
+      agentId: input.agentId,
+      fromCursor: after,
+      toCursor: budgetFilled ? lastReturned : scanCursor,
+      events,
+      // A batch budget stop is also "more available". `limit` bounds the RESPONSE; the batch cap
+      // bounds the WORK, so a sparse agent in a million-event run returns promptly with a cursor
+      // instead of scanning to the end of the stream on every call.
+      hasMore: budgetFilled || !streamExhausted,
+    }
+  }
+
   async cancel(
     scope: WorkflowServiceScope,
     runId: string,
@@ -1108,6 +1455,12 @@ export class WorkflowService {
       // can expose their locator. This hook is deliberately adjacent to the durable event sink:
       // together they make completion publication one ordered artifact-then-event protocol.
       materializeResult: result => this.#options.store.persistResult(runId, result),
+      // Non-fatal by contract on the runner side; a store that cannot do this at all simply omits
+      // the capability and every agent read falls back to the journal.
+      ...(this.#options.store.persistAgentResult === undefined ? {} : {
+        materializeAgentResult: (agentId: string, result: WorkflowResultMaterialization) =>
+          this.#options.store.persistAgentResult!(runId, agentId, result),
+      }),
       eventSink: async (event) => {
         const stored = await this.#options.store.appendEvent(runId, event)
         this.#publish(stored)

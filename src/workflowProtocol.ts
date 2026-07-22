@@ -4,7 +4,11 @@ import type {
   WorkflowDefinitionReference,
   WorkflowEvent,
 } from './workflowEvents.js'
-import type { WorkflowSnapshot } from './workflowState.js'
+import type {
+  WorkflowAgentStatus,
+  WorkflowAttemptStatus,
+  WorkflowSnapshot,
+} from './workflowState.js'
 
 /** Pure durable/wire DTOs shared by Node hosts and browser renderers. */
 export type WorkflowRunStatus =
@@ -62,6 +66,108 @@ export type WorkflowResultPage = {
   content: string
   hasMore: boolean
   nextCursor?: string
+}
+
+/**
+ * Where an agent's bytes came from.
+ *
+ * `artifact` is the fsynced per-agent blob written at completion. `journal` is the untruncated
+ * value recorded in the run journal, which is the only source for runs created before per-agent
+ * artifacts existed — and the fallback whenever an artifact write was dropped (that write is
+ * deliberately best-effort so an observability failure can never fail an agent). `none` means the
+ * agent has not produced a terminal value yet.
+ */
+export type WorkflowAgentResultSource = 'artifact' | 'journal' | 'none'
+
+export type WorkflowAgentResultLocator = {
+  available: boolean
+  source: WorkflowAgentResultSource
+  artifactId?: string
+  mediaType?: string
+  /** UTF-8 bytes. Event previews count UTF-16 units; these two never have to agree. */
+  sizeBytes?: number
+  lineCount?: number
+  checksum?: ContentChecksum
+}
+
+/** One physical attempt. Abandoned attempts stay here as history; the agent above is logical. */
+export type WorkflowAgentAttemptEntry = {
+  attemptId: string
+  attemptNumber: number
+  status: WorkflowAttemptStatus
+  startedAt?: string
+  completedAt?: string
+}
+
+export type WorkflowAgentListEntry = {
+  agentId: string
+  callIndex: number
+  label: string
+  phaseId?: string
+  phaseTitle?: string
+  status: WorkflowAgentStatus
+  /** Served from the journal without re-running the agent (a cache hit, not a fresh execution). */
+  reused: boolean
+  /**
+   * The terminal value is a `__workflowAgentFailure` placeholder rather than provider output. Kept
+   * readable rather than filtered: it is the honest outcome for an exhausted assignment, and a run
+   * where a handful of agents gapped is exactly when those values need reading.
+   */
+  coverageGap: boolean
+  attempts: WorkflowAgentAttemptEntry[]
+  result: WorkflowAgentResultLocator
+}
+
+/**
+ * The complete agent list for a run. NOT paginated — every agent is returned every time.
+ *
+ * `cursor` is the run's EVENT cursor, not a paging token: there is no input that accepts it back.
+ * It is here so a caller inspecting a live fan-out can tell whether the run has advanced since the
+ * last look, which matters because per-agent reads deliberately do not require a terminal run.
+ */
+export type WorkflowAgentListPage = {
+  runId: string
+  runStatus: WorkflowRunStatus
+  /** The run's event cursor at the time of the listing. Not a paging token. */
+  cursor: number
+  agents: WorkflowAgentListEntry[]
+}
+
+/** Identical paging contract to `WorkflowResultPage`, plus which agent and which source. */
+export type WorkflowAgentResultPage = {
+  runId: string
+  agentId: string
+  source: 'artifact' | 'journal'
+  artifact: WorkflowResultArtifact
+  encoding: 'utf-8'
+  fromByte: number
+  toByte: number
+  content: string
+  hasMore: boolean
+  nextCursor?: string
+}
+
+export type WorkflowAgentResultsPage = {
+  runId: string
+  /** Ordered by `callIndex` ascending — the canonical agent order everywhere else in this package. */
+  items: WorkflowAgentResultPage[]
+  hasMore: boolean
+  /** Composite `v1.<agentId>.<sha256>.<offset>`; advances to the next agent when one is exhausted. */
+  nextCursor?: string
+  /**
+   * Agents whose bytes could not be read on this page, with the reason. Present only when
+   * non-empty: one damaged agent degrades to a named omission rather than failing the sweep.
+   */
+  skipped?: { agentId: string; reason: string }[]
+}
+
+export type WorkflowAgentTranscriptPage = {
+  runId: string
+  agentId: string
+  fromCursor: number
+  toCursor: number
+  events: StoredWorkflowEvent[]
+  hasMore: boolean
 }
 
 export type StoredWorkflowEvent = {

@@ -113,9 +113,16 @@ await service.initialize()
 registerWorkflowMcpTools(mcpServer, service, { cwd: projectDirectory, clientId: sessionId })
 ```
 
-The nine stable tools are `workflow_list`, `workflow_describe`, `workflow_validate`,
+The thirteen stable tools are `workflow_list`, `workflow_describe`, `workflow_validate`,
 `workflow_run`, `workflow_run_status`, `workflow_run_events`, `workflow_result_read`,
-`workflow_run_cancel`, and `workflow_resume`. Machine results are returned as both
+`workflow_run_cancel`, `workflow_resume`, `workflow_agent_list`,
+`workflow_agent_result_read`, `workflow_agent_results_read`, and
+`workflow_agent_transcript_read`. The last four exist because a run used to be inspectable only
+as a whole: `workflow_result_read` returns the workflow's single returned value, while every
+constituent agent's output was reachable only through `agent.completed`, whose inline content is
+bounded and whose overflow sets `truncated: true` with no locator to follow. Reading those results
+therefore required opening the server's private `journal.jsonl` — possible only for a client
+sharing the server's filesystem, and impossible for a remote one. Machine results are returned as both
 `structuredContent` and JSON text so Claude
 and Codex transcript envelopes preserve the same run ID. `workflow_run_events` is bounded long
 polling over the durable cursor, not a transport-specific notification protocol.

@@ -51,7 +51,7 @@ import type {
   WorkflowAgentFailurePlaceholder,
   WorkflowResultMaterialization,
 } from './workflowEvents.js'
-import { isWorkflowAgentFailurePlaceholder } from './workflowEvents.js'
+import { isWorkflowAgentFailurePlaceholder, serializeWorkflowValue } from './workflowEvents.js'
 import type {
   ParentToWorkerMessage,
   SerializedWorkerError,
@@ -141,6 +141,19 @@ export type RunWorkflowOptions = {
    * Low-level callers may omit this; WorkflowService always delegates it to the run store.
    */
   materializeResult?(
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference>
+  /**
+   * Persist ONE agent's terminal value before its agent.completed locator is published.
+   *
+   * Separate from materializeResult because the failure contract is opposite. A run result that
+   * cannot be persisted must fail the run — a completed run promises readable bytes. An agent
+   * result that cannot be persisted must NOT fail the agent: it is observability, the agent
+   * genuinely succeeded, and the value is already safe in the journal, which is what serves the
+   * read when this is absent. The runner therefore swallows every rejection here.
+   */
+  materializeAgentResult?(
+    agentId: string,
     result: WorkflowResultMaterialization,
   ): Promise<ContentReference>
   /**
@@ -1585,6 +1598,11 @@ class WorkflowRuntime {
             })
           }
 
+          // Durable per-agent bytes are published BEFORE the terminal agent event, mirroring the
+          // run-result ordering: every advertised locator already names fsynced content. Best
+          // effort by contract — see materializeAgentResult.
+          const agentResultReference = await this.#materializeAgentResult(admission.agentId, value)
+
           await this.#emit({
             type: 'agent.completed',
             agentId: admission.agentId,
@@ -1592,7 +1610,7 @@ class WorkflowRuntime {
             ...(admission.phaseId === undefined ? {} : { phaseId: admission.phaseId }),
             payload: {
               source: resumeSession === undefined ? 'live' : 'provider-resume',
-              result: contentReference(value, this.#limits),
+              result: agentResultReference ?? contentReference(value, this.#limits),
               structured: result.output.type === 'structured',
               ...(result.usage === undefined ? {} : { usage: result.usage }),
               ...(completedSession === undefined ? {} : { providerSession: completedSession }),
@@ -2605,6 +2623,54 @@ class WorkflowRuntime {
     else this.#pendingWorkerRequests.set(worker, new Set([requestId]))
   }
 
+  /**
+   * Persist one agent's value and return the locator-bearing reference, or undefined.
+   *
+   * Every failure path returns undefined rather than throwing. That is the entire point: this runs
+   * inside the success path of an agent that has already produced a validated value and already
+   * recorded it in the journal. Letting a full disk, a read-only artifacts directory, or a lone
+   * surrogate that cannot survive UTF-8 fail the agent would convert an inspection convenience into
+   * a cause of coverage gaps — at agent 147 of 200, with retry amplification behind it.
+   *
+   * The corresponding read path falls back to the journal, so an absent artifact costs speed, never
+   * access.
+   */
+  async #materializeAgentResult(
+    agentId: string,
+    value: unknown,
+  ): Promise<ContentReference | undefined> {
+    if (this.#options.materializeAgentResult === undefined) return undefined
+    const materialization = workflowResultMaterialization(value, this.#limits)
+    let reference: ContentReference
+    try {
+      reference = await this.#options.materializeAgentResult(agentId, materialization)
+    } catch (cause) {
+      console.warn(`[workflow-mcp] Cannot persist agent result artifact for ${agentId}:`, cause)
+      return undefined
+    }
+    if (reference.artifactId === undefined) return reference
+    try {
+      await this.#emit({
+        type: 'artifact.created',
+        agentId,
+        payload: {
+          artifactId: reference.artifactId,
+          name: reference.mediaType === 'application/json'
+            ? `agent-${agentId}.json`
+            : `agent-${agentId}.txt`,
+          ...(reference.mediaType === undefined ? {} : { mediaType: reference.mediaType }),
+          ...(reference.sizeBytes === undefined ? {} : { sizeBytes: reference.sizeBytes }),
+        },
+      })
+    } catch (cause) {
+      // The bytes are already durable; only the discovery record failed. The result read resolves
+      // artifacts from the artifact metadata itself, not from this event, so the locator on the
+      // returned reference stays truthful.
+      console.warn(`[workflow-mcp] Cannot publish agent artifact record for ${agentId}:`, cause)
+    }
+    return reference
+  }
+
   #completeWorkerRequest(
     worker: WorkflowWorkerHandle,
     requestId: string,
@@ -2940,11 +3006,8 @@ function workflowResultMaterialization(
   // `undefined` is a valid JavaScript workflow result even though JSON has no spelling for it.
   // Giving it an explicit preview keeps list UIs useful while leaving `content` absent rather than
   // lying by coercing the actual result to null.
-  const full = cloned === undefined
-    ? 'undefined'
-    : typeof cloned === 'string'
-      ? cloned
-      : JSON.stringify(cloned, null, 2)
+  const serialized = serializeWorkflowValue(cloned)
+  const full = serialized.content
   const previewLimit = Math.min(4_000, limits.maxLogCharacters)
   const contentWasCapped = full.length > limits.maxLogCharacters
 
@@ -2964,9 +3027,7 @@ function workflowResultMaterialization(
       // Media type describes the complete value behind the reference, not the bounded inline
       // prefix. A clipped JSON prefix is not independently parseable, but callers can now follow
       // its artifactId and concatenate pages into the advertised application/json document.
-      mediaType: typeof cloned === 'string' || cloned === undefined
-        ? 'text/plain'
-        : 'application/json',
+      mediaType: serialized.mediaType,
       // `preview` is always allowed to be shorter than complete inline `content`. `truncated`
       // specifically means the inline content is incomplete and the artifact must be followed;
       // conflating those two states made 4-10 KB values look irrecoverably clipped when they were
