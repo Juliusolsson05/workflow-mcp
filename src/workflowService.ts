@@ -222,7 +222,15 @@ export type WorkflowStartInput = {
 }
 
 export type WorkflowResumeInput =
-  | { runId: string; idempotencyKey?: string }
+  | {
+      runId: string
+      idempotencyKey?: string
+      /**
+       * Operator acknowledgement that an unconfirmed provider descendant may still be alive.
+       * Accepted only for a read-only, offline sandbox; mutable runs retain the hard fence.
+       */
+      abandonUnconfirmedProvider?: boolean
+    }
   | { claudeRunPath: string; workflowPath?: string; idempotencyKey?: string }
 
 type ReadInput = {
@@ -783,9 +791,28 @@ export class WorkflowService {
   ): Promise<WorkflowRunStartResult> {
     const owned = this.#ownedRuns.get(input.runId)
     if (owned?.ownershipReleaseSafe?.() === false) {
-      throw new WorkflowServiceError(
-        'unsafe-provider-active',
-        `Workflow run ${input.runId} still has an unconfirmed provider execution`,
+      const sandbox = this.#options.sandbox
+      const canAbandonReadOnlyProvider =
+        recoveryMode === 'manual' &&
+        input.abandonUnconfirmedProvider === true &&
+        (sandbox?.mode ?? 'read-only') === 'read-only' &&
+        (sandbox?.network ?? false) === false &&
+        (sandbox?.additionalWritableDirectories?.length ?? 0) === 0
+      if (!canAbandonReadOnlyProvider) {
+        throw new WorkflowServiceError(
+          'unsafe-provider-active',
+          `Workflow run ${input.runId} still has an unconfirmed provider execution; explicitly acknowledge abandonment to continue this read-only offline run`,
+        )
+      }
+      const abandoned = owned.abandonUnconfirmedProviderExecutions?.() ?? 0
+      if (abandoned === 0 || owned.ownershipReleaseSafe?.() === false) {
+        throw new WorkflowServiceError(
+          'unsafe-provider-active',
+          `Workflow run ${input.runId} still owns provider or workspace operations that cannot be abandoned safely`,
+        )
+      }
+      console.warn(
+        `[workflow-mcp] Operator abandoned ${abandoned} unconfirmed provider execution(s) before resuming ${input.runId}`,
       )
     }
     const original = await this.status(scope, input.runId)
