@@ -249,7 +249,7 @@ export function registerWorkflowMcpTools(
     'workflow_agent_result_read',
     {
       title: 'Read one agent result',
-      description: 'Read one bounded UTF-8 page of a single agent\'s complete terminal value — the untruncated result behind agent.completed\'s bounded preview. Take agentId from workflow_agent_list; follow nextCursor while hasMore. artifactId is optional and acts as an integrity fence when supplied; agents served from the journal have none. Coverage-gap placeholders are returned as the honest terminal value rather than hidden. The locator is run-scoped and never accepts filesystem paths.',
+      description: 'Read one bounded UTF-8 page of a single agent\'s complete terminal value — the untruncated result behind agent.completed\'s bounded preview. Take agentId from workflow_agent_list; follow nextCursor while hasMore. artifactId is optional and acts as an integrity fence when supplied. Journal-served agents get a content-addressed id synthesized at read time, which is valid here but is not listed by workflow_agent_list and is never valid in workflow_result_read. Coverage-gap placeholders are returned as the honest terminal value rather than hidden. The locator is run-scoped and never accepts filesystem paths.',
       inputSchema: {
         runId: z.string().min(1),
         agentId: z.string().min(1).max(200),

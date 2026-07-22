@@ -120,11 +120,19 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly rootDirectory: string
   readonly runsDirectory: string
   readonly #snapshotCache = new Map<string, { cursor: number; state: WorkflowRunSnapshot['state'] }>()
-  /** runId → parsed journal results, invalidated by the journal file's size+mtime. */
-  readonly #journalResultCache = new Map<
-    string,
-    { identity: string; located: Map<string, JournalResultLocator> }
-  >()
+  /**
+   * The most recently parsed journal, and nothing else.
+   *
+   * ONE entry on purpose. A Map keyed by runId grew without bound — every parsed journal holds
+   * every agent's full result value, so a client walking its run history with workflow_agent_list
+   * pinned the whole on-disk journal corpus in heap (measured: +10 MB retained per 10 MB journal,
+   * perfectly linear, never released). Journals cap at 256 MiB each, so that OOMs a server from a
+   * read-only tool. A single slot still serves the access pattern that matters — paging through one
+   * run's agents — while bounding retention to one journal.
+   */
+  #journalResultCache: { runId: string; identity: string; located: Map<string, JournalResultLocator> } | undefined
+  /** Why the last journal read failed, if it did. Surfaced so absence is distinguishable from damage. */
+  #journalReadFailure: string | undefined
   readonly #eventOffsets = new Map<string, Map<number, number>>()
   readonly #appendTails = new Map<string, Promise<void>>()
   #createTail: Promise<void> = Promise.resolve()
@@ -1221,8 +1229,8 @@ export class FileWorkflowStore implements WorkflowStore {
     try {
       const info = await stat(path)
       identity = `${info.size}:${info.mtimeMs}`
-      const cached = this.#journalResultCache.get(runId)
-      if (cached !== undefined && cached.identity === identity) return cached.located
+      const cached = this.#journalResultCache
+      if (cached?.runId === runId && cached.identity === identity) return cached.located
     } catch {
       // A journal we cannot stat is handled by the read below, which degrades to an empty map.
     }
@@ -1231,11 +1239,16 @@ export class FileWorkflowStore implements WorkflowStore {
     let snapshots: readonly JournalSnapshot[]
     try {
       snapshots = await readWorkflowJournalSnapshots(path)
-    } catch {
+    } catch (cause) {
       // A journal this reader cannot parse must not take down inspection of a run whose artifacts
-      // and events are perfectly readable. Callers degrade to `source: 'none'`.
+      // and events are perfectly readable — but it must not be reported as "no result yet" either.
+      // That swallowed a corrupt file, a >256 MiB journal, EACCES and a torn write into the same
+      // answer as a still-running agent, on runs that were already complete. An inspection tool
+      // silently restating an integrity failure as absence is the one thing it must never do.
+      this.#journalReadFailure = cause instanceof Error ? cause.message : String(cause)
       return located
     }
+    this.#journalReadFailure = undefined
     for (const snapshot of snapshots) {
       for (const record of snapshot.records) {
         if (record.type !== 'result') continue
@@ -1247,7 +1260,7 @@ export class FileWorkflowStore implements WorkflowStore {
         })
       }
     }
-    if (identity !== '') this.#journalResultCache.set(runId, { identity, located })
+    if (identity !== '') this.#journalResultCache = { runId, identity, located }
     return located
   }
 
@@ -1276,6 +1289,12 @@ export class FileWorkflowStore implements WorkflowStore {
     // result is a fine answer; a confidently wrong one is not.
     const record = cacheKey === undefined ? undefined : journal.get(cacheKey)
     if (record === undefined) {
+      if (this.#journalReadFailure !== undefined) {
+        throw new WorkflowStoreError(
+          'corrupt-store',
+          `Workflow agent ${agentId} result is unreadable because the run journal could not be read: ${runId} (${this.#journalReadFailure})`,
+        )
+      }
       throw new WorkflowStoreError(
         'result-not-found',
         `Workflow agent ${agentId} has no readable result: ${runId}`,

@@ -267,6 +267,12 @@ const DEFAULT_AGENT_TRANSCRIPT_EVENTS = 200
 const MAX_AGENT_TRANSCRIPT_EVENTS = 1_000
 /** Raw events scanned per filtered batch; most events in a fan-out belong to other agents. */
 const TRANSCRIPT_SCAN_BATCH = 500
+/**
+ * Batches scanned per call. Bounds WORK, not output: without it, an agent with three events in a
+ * long run scanned from `after` to the end of the stream every call, which a read-only client could
+ * repeat at will against a 512 MiB event log.
+ */
+const MAX_TRANSCRIPT_SCAN_BATCHES = 20
 
 /**
  * Split `v1.<agentId>.<innerCursor>`.
@@ -864,7 +870,16 @@ export class WorkflowService {
       if (hasErrorCode(cause, 'result-not-found')) {
         throw new WorkflowServiceError(
           'result-unavailable',
-          `Workflow agent ${input.agentId} has no readable result yet in ${input.runId}`,
+          `Workflow agent ${input.agentId} has no result recorded in ${input.runId}`,
+          { cause },
+        )
+      }
+      if (hasErrorCode(cause, 'corrupt-store')) {
+        // Damage, not absence. Previously this escaped as a raw WorkflowStoreError, unlike every
+        // other error from this path.
+        throw new WorkflowServiceError(
+          'result-unavailable',
+          `Workflow agent ${input.agentId} result is unreadable in ${input.runId}: storage is damaged`,
           { cause },
         )
       }
@@ -987,36 +1002,56 @@ export class WorkflowService {
       )
     }
     const events: StoredWorkflowEvent[] = []
-    let cursor = after
-    let hasMore = false
-    // Scan forward until the filtered budget is filled. The underlying reader is cursor-indexed, so
-    // this walks the stream once rather than replaying state per page.
-    while (events.length < limit) {
-      const page = await this.#options.store.readEvents(input.runId, cursor, TRANSCRIPT_SCAN_BATCH)
-      if (page.events.length === 0) break
-      cursor = page.toCursor
+    // Three positions, deliberately not one. `scanCursor` is how far the raw stream has been read;
+    // `lastReturned` is the last event actually handed to the caller. They diverge because most
+    // events in a fan-out belong to other agents, and conflating them loses data in one direction
+    // or spins in the other:
+    //   - reporting the last MATCH re-scans the same rejected span on every poll (the original bug)
+    //   - reporting the SCAN position when the budget filled mid-batch skips the matching events in
+    //     the rest of that batch, silently, while hasMore still says true (the fix's own bug)
+    // So: if the budget filled, resume from the last returned event; otherwise the batch was fully
+    // consumed and the scan position is safe.
+    let scanCursor = after
+    let lastReturned = after
+    let budgetFilled = false
+    let streamExhausted = false
+    let batches = 0
+    while (events.length < limit && batches < MAX_TRANSCRIPT_SCAN_BATCHES) {
+      const page = await this.#options.store.readEvents(input.runId, scanCursor, TRANSCRIPT_SCAN_BATCH)
+      batches += 1
+      if (page.events.length === 0) {
+        streamExhausted = true
+        break
+      }
       for (const stored of page.events) {
         const event = stored.event as { agentId?: unknown }
         if (event.agentId !== input.agentId) continue
         if (events.length >= limit) {
-          hasMore = true
+          budgetFilled = true
           break
         }
         events.push(stored)
+        lastReturned = stored.cursor
       }
-      if (hasMore) break
-      if (!page.hasMore) break
+      if (budgetFilled) break
+      // Only advance once the whole batch has been consumed, so a mid-batch stop cannot strand the
+      // events behind it.
+      scanCursor = page.toCursor
+      if (!page.hasMore) {
+        streamExhausted = true
+        break
+      }
     }
     return {
       runId: input.runId,
       agentId: input.agentId,
       fromCursor: after,
-      // The SCAN position, not the last matching event. Most events in a fan-out belong to other
-      // agents; reporting the last match made a polling client re-scan the same rejected span of
-      // events.jsonl forever instead of advancing past it.
-      toCursor: cursor,
+      toCursor: budgetFilled ? lastReturned : scanCursor,
       events,
-      hasMore,
+      // A batch budget stop is also "more available". `limit` bounds the RESPONSE; the batch cap
+      // bounds the WORK, so a sparse agent in a million-event run returns promptly with a cursor
+      // instead of scanning to the end of the stream on every call.
+      hasMore: budgetFilled || !streamExhausted,
     }
   }
 

@@ -504,12 +504,34 @@ describe('workflow MCP facade', () => {
       arguments: { runId, agentId: big.agentId },
     })
     const page = (transcript.structuredContent as {
-      page: { events: { event: { type: string; agentId: string } }[]; agentId: string }
+      page: { events: { cursor: number; event: { type: string; agentId: string } }[]; agentId: string }
     }).page
     expect(page.agentId).toBe(big.agentId)
     expect(page.events.length).toBeGreaterThan(0)
     expect(page.events.every((stored) => stored.event.agentId === big.agentId)).toBe(true)
     expect(page.events.map((stored) => stored.event.type)).toContain('agent.completed')
+
+    // Review blocker: paging the transcript dropped events. toCursor reported the SCAN position,
+    // which had already advanced past the whole 500-event batch, so when the per-page budget filled
+    // mid-batch the matching events behind it were skipped — silently, with hasMore correctly true.
+    // Drive it exactly as the tool description instructs and require every event back.
+    const paged: number[] = []
+    let after = 0
+    for (let round = 0; round < 50; round += 1) {
+      const chunk = await client.callTool({
+        name: 'workflow_agent_transcript_read',
+        arguments: { runId, agentId: big.agentId, after, limit: 2 },
+      })
+      const value = (chunk.structuredContent as {
+        page: { events: { cursor: number }[]; toCursor: number; hasMore: boolean }
+      }).page
+      paged.push(...value.events.map((stored) => stored.cursor))
+      if (!value.hasMore) break
+      expect(value.toCursor).toBeGreaterThanOrEqual(after)
+      after = value.toCursor
+    }
+    const everyCursor = page.events.map((stored) => stored.cursor)
+    expect(paged).toEqual(everyCursor)
 
     await client.close()
     await server.close()
