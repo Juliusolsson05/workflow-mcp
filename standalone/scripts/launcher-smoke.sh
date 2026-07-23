@@ -211,13 +211,33 @@ test ! -e "$project/.workflow-mcp/.upgrade-transaction"
 "$installed" status --json > "$temporary/status.json"
 grep -q '^{' "$temporary/status.json"
 grep -q '"lifecycle":"READY"' "$temporary/status.json"
-# The default profile turns the read-only dashboard on with no token. Prove the three properties
-# that replaced the bearer: loopback API answers unauthenticated, the daemon reports the default
-# authoring posture, and a foreign Host header is still refused (the DNS-rebinding guard stays).
-curl -fsS http://127.0.0.1:7331/readyz | grep -q '"status":"ready"'
-curl -fsS http://127.0.0.1:7331/api/v1/instance > "$temporary/web-instance.json"
-grep -q '"sourceMode":"authoring"' "$temporary/web-instance.json"
-[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:7331/api/v1/instance)" = 421 ]
+# The default profile turns the read-only dashboard on with no token — but only on engines at or
+# above the 28.3.3 loopback-publication floor; older engines must DOWNGRADE the default instead of
+# blocking the install (GitHub's ubuntu-24.04 runner currently ships 28.0.4, so CI exercises the
+# downgrade branch while developer machines exercise the web branch). Branch on what the install
+# actually recorded, and keep the downgrade branch honest by proving the engine really is old.
+if grep -q '"webPort"' "$project/.workflow-mcp/instance.json"; then
+  # Prove the three properties that replaced the bearer: loopback API answers unauthenticated,
+  # the daemon reports the default authoring posture, and a foreign Host header is still refused
+  # (the DNS-rebinding guard stays).
+  curl -fsS http://127.0.0.1:7331/readyz | grep -q '"status":"ready"'
+  curl -fsS http://127.0.0.1:7331/api/v1/instance > "$temporary/web-instance.json"
+  grep -q '"sourceMode":"authoring"' "$temporary/web-instance.json"
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:7331/api/v1/instance)" = 421 ]
+else
+  smoke_engine=$(docker version --format '{{.Server.Version}}' | sed 's/[^0-9.].*$//')
+  old_ifs=$IFS; IFS=.
+  # Deliberate POSIX field split of an already digits-and-dots value; cannot glob.
+  # shellcheck disable=SC2086
+  set -- $smoke_engine; smoke_major=${1:-0}; smoke_minor=${2:-0}; smoke_patch=${3:-0}
+  IFS=$old_ifs
+  if [ "$smoke_major" -gt 28 ] ||
+    { [ "$smoke_major" -eq 28 ] && [ "$smoke_minor" -gt 3 ]; } ||
+    { [ "$smoke_major" -eq 28 ] && [ "$smoke_minor" -eq 3 ] && [ "$smoke_patch" -ge 3 ]; }; then
+    echo "default install skipped the web UI although engine $smoke_engine supports it" >&2
+    exit 1
+  fi
+fi
 "$installed" doctor > "$temporary/doctor.json"
 grep -q '"schemaVersion":1,"ok":true,"host":' "$temporary/doctor.json"
 grep -q '"container":{"schemaVersion":1,"ok":true' "$temporary/doctor.json"
