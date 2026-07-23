@@ -211,7 +211,7 @@ jobs:
             # This mutable resume handle is reusable only when a prior invocation of this exact
             # tagged workflow signed its digest. Registry labels/tag ownership are not trust, and
             # the immutable public SemVer remains absent until every qualification gate passes.
-            cosign verify "$IMAGE@$digest" \
+            cosign verify --registry-referrers-mode=legacy "$IMAGE@$digest" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME"
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -319,9 +319,15 @@ jobs:
           COSIGN_YES: "true"
         run: |
           if [ "${{ steps.checkpoint.outputs.exists }}" != true ]; then
-            cosign sign "$IMAGE@${{ steps.identity.outputs.digest }}"
+            # WHY --registry-referrers-mode=legacy: cosign v3 defaults to the OCI 1.1 referrers
+            # API, which Docker Hub does not serve compatibly — sign exits 0 but writes no
+            # discoverable signature, and the verify below fails "no signatures found" (the exact
+            # failure the first real v0.1.0 build hit). Legacy mode stores the signature as the
+            # tag-based sha256-<digest>.sig artifact Docker Hub fully supports. Sign and verify
+            # must use the same mode; the published RELEASE_NOTES verify example matches.
+            cosign sign --registry-referrers-mode=legacy "$IMAGE@${{ steps.identity.outputs.digest }}"
           fi
-          cosign verify "$IMAGE@${{ steps.identity.outputs.digest }}" \
+          cosign verify --registry-referrers-mode=legacy "$IMAGE@${{ steps.identity.outputs.digest }}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME"
       - name: Publish the signed mutable candidate resume handle
@@ -526,8 +532,8 @@ jobs:
           Backup/restore: offline, exact-instance/project identity, credentials excluded.
           Image: $IMAGE@$digest
 
-          Verify the image signature:
-          cosign verify $IMAGE@$digest --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME
+          Verify the image signature (legacy tag-based signatures; required on Docker Hub):
+          cosign verify --registry-referrers-mode=legacy $IMAGE@$digest --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME
 
           BuildKit attached SPDX SBOM and SLSA provenance attestations to both native manifest members.
           Inspect them with: docker buildx imagetools inspect --raw $IMAGE@$digest
@@ -810,7 +816,7 @@ jobs:
           (cd bundle && sha256sum --check SHA256SUMS)
           bundle/workflow-mcp-docker help >/dev/null
           image="docker.io/juliusolsson/workflow-mcp@${{ needs.publish.outputs.digest }}"
-          cosign verify "$image" \
+          cosign verify --registry-referrers-mode=legacy "$image" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GH_REPO/.github/workflows/container-release.yml@refs/tags/$tag"
           docker pull "$image"
