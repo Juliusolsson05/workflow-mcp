@@ -7,7 +7,7 @@ import type {
   AgentProviderEvent,
   AgentRequest,
 } from '../src/agentProvider.js'
-import { CodexAgentProvider } from '../src/codexProvider.js'
+import { buildCodexRecoveryFingerprint, CodexAgentProvider } from '../src/codexProvider.js'
 import type { CodexClientLike } from '../src/codexProvider.js'
 
 function eventStream(events: readonly ThreadEvent[]): AsyncGenerator<ThreadEvent> {
@@ -62,6 +62,40 @@ function mockClient(events: readonly ThreadEvent[]) {
 }
 
 describe('CodexAgentProvider', () => {
+  it('builds a canonical recovery fingerprint only from complete capability evidence', () => {
+    const common = {
+      executableEvidence: { path: '/opt/codex', sha256: 'a'.repeat(64), version: '1.2.3' },
+      configurationIsolation: {
+        codexHome: '/data/codex-home',
+        effectiveConfigurationFingerprint: 'effective-config-v1',
+      },
+      capabilities: {
+        inheritedMcpServers: 'disabled' as const,
+        mcpServers: [
+          { name: 'zeta', effect: 'read-only' as const },
+          { name: 'alpha', effect: 'idempotent' as const },
+        ],
+      },
+      modelAliases: { sonnet: 'gpt-5', haiku: null },
+    }
+    const fingerprint = buildCodexRecoveryFingerprint(common)
+    expect(fingerprint).toMatch(/^codex:v1:[a-f0-9]{64}$/)
+    expect(buildCodexRecoveryFingerprint({
+      ...common,
+      capabilities: {
+        ...common.capabilities,
+        mcpServers: [...common.capabilities.mcpServers].reverse(),
+      },
+      modelAliases: { haiku: null, sonnet: 'gpt-5' },
+    })).toBe(fingerprint)
+    expect(buildCodexRecoveryFingerprint({
+      ...common,
+      executableEvidence: { ...common.executableEvidence, sha256: 'b'.repeat(64) },
+    })).not.toBe(fingerprint)
+    const { executableEvidence: _omitted, ...withoutExecutable } = common
+    expect(buildCodexRecoveryFingerprint(withoutExecutable)).toBeUndefined()
+  })
+
   it('does not advertise process-tree ownership for hosted Codex attempts', () => {
     const provider = new CodexAgentProvider({
       codexPathOverride: '/tmp/codex',
@@ -191,7 +225,7 @@ describe('CodexAgentProvider', () => {
       providerSession: { provider: 'codex', id: 'thread-1' },
       diagnostics: {
         sdk: '@openai/codex-sdk',
-        sdkVersion: '0.144.4',
+        sdkVersion: '0.144.6',
       },
     })
   })

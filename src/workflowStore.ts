@@ -6,6 +6,7 @@ import type {
   WorkflowResultMaterialization,
 } from './workflowEvents.js'
 import type { JournalSnapshot } from './workflowJournal.js'
+import type { WorkflowJournalWriteCoordinator } from './workflowWriteCoordinator.js'
 import type {
   StoredWorkflowEvent,
   WorkflowAgentResultPage,
@@ -60,10 +61,54 @@ export type WorkflowStoreLease = {
   release(): Promise<void>
 }
 
+export type WorkflowStoreLeaseBackendLease = {
+  generation: number
+  /** Synchronous because persistent journals mutate through a synchronous execution contract. */
+  assertOwned(): void
+  release(): Promise<void>
+}
+
+/** Injected ownership authority for environments where PID liveness is not globally meaningful. */
+export interface WorkflowStoreLeaseBackend {
+  acquire(input: {
+    rootDirectory: string
+    ownerId: string
+  }): Promise<WorkflowStoreLeaseBackendLease>
+}
+
 export type WorkflowResultReadInput = {
   artifactId: string
   cursor?: string
   maxBytes: number
+}
+
+export type WorkflowRunSummary = {
+  schemaVersion: 1
+  runId: string
+  status: WorkflowRunManifest['status']
+  cursor: number
+  createdAt: string
+  updatedAt: string
+  workflow: {
+    name: string
+    title?: string
+    description: string
+  }
+  lineageId: string
+  resumedFromRunId?: string
+  recoveryMode?: 'manual' | 'automatic'
+}
+
+export type WorkflowRunListInput = {
+  cursor?: string
+  limit?: number
+  statuses?: readonly WorkflowRunManifest['status'][]
+}
+
+export type WorkflowRunListPage = {
+  items: WorkflowRunSummary[]
+  hasMore: boolean
+  nextCursor?: string
 }
 
 export type WorkflowAgentResultReadInput = {
@@ -89,9 +134,22 @@ export interface WorkflowStore {
   listQuarantinedRuns?(): readonly { runId: string; code: string; message: string }[]
   /** Optional cross-process single-writer fence. It may be acquired before initialize(). */
   acquireLease?(ownerId: string): Promise<WorkflowStoreLease>
+  /**
+   * Coordinator for synchronous journal checkpoints which happen outside ordinary store methods.
+   * A journal holding this reference cannot mint authority: runSync fails after lease quiesce.
+   */
+  journalWriteCoordinator?(): WorkflowJournalWriteCoordinator
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>
   getManifest(runId: string): Promise<WorkflowRunManifest | undefined>
   listManifests(): Promise<WorkflowRunManifest[]>
+  /** Bounded, path-redacted keyset inventory for standalone clients. */
+  listRuns?(input: WorkflowRunListInput): Promise<WorkflowRunListPage>
+  /** Indexed successor query keeps health and recovery off the unbounded manifest scan path. */
+  findActiveLineageSuccessor?(
+    lineageId: string,
+    predecessorRunId: string,
+  ): Promise<WorkflowRunManifest | undefined>
+  findLatestSuccessor?(runId: string): Promise<WorkflowRunManifest | undefined>
   findByIdempotencyKey(cwd: string, key: string): Promise<WorkflowRunManifest | undefined>
   appendEvent(runId: string, event: WorkflowEvent): Promise<StoredWorkflowEvent>
   readEvents(runId: string, after: number, limit: number): Promise<WorkflowEventPage>
