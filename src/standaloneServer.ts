@@ -12,10 +12,16 @@ import { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowM
 import { WORKFLOW_MCP_VERSION } from './generatedBuildMetadata.js'
 
 export type WorkflowMcpHttpServer = {
-  host: '127.0.0.1'
+  host: '127.0.0.1' | '0.0.0.0'
   port: number
   url: string
   token: string
+  close(): Promise<void>
+}
+
+export type WorkflowMcpHttpHandler = {
+  /** Returns false without writing when another router owns this path. */
+  handle(request: IncomingMessage, response: ServerResponse): Promise<boolean>
   close(): Promise<void>
 }
 
@@ -46,29 +52,56 @@ export async function serveWorkflowMcpStdio(
 export async function serveWorkflowMcpHttp(
   service: WorkflowService,
   scope: WorkflowServiceScope,
-  options: { port?: number; token?: string } = {},
+  options: { port?: number; token?: string; host?: '127.0.0.1' | '0.0.0.0' } = {},
 ): Promise<WorkflowMcpHttpServer> {
   const token = options.token ?? randomBytes(32).toString('base64url')
-  if (token.length < 24) throw new TypeError('HTTP bearer token must contain at least 24 characters')
-  const transports = new Set<StreamableHTTPServerTransport>()
-  const servers = new Set<McpServer>()
+  const host = options.host ?? '127.0.0.1'
+  const handler = createWorkflowMcpHttpHandler(service, scope, token)
 
   const http = createServer((request, response) => {
-    void handleHttpRequest(request, response, token, service, scope, transports, servers)
+    void handler.handle(request, response).then(handled => {
+      if (!handled) json(response, 404, { error: 'not-found' })
+    })
   })
-  await listen(http, options.port ?? 0)
+  await listen(http, options.port ?? 0, host)
   const address = http.address()
   if (!address || typeof address === 'string') throw new Error('Workflow MCP HTTP server has no TCP address')
   const port = address.port
   return {
-    host: '127.0.0.1',
+    host,
     port,
     url: `http://127.0.0.1:${port}/mcp`,
     token,
     async close(): Promise<void> {
-      await Promise.allSettled([...transports].map((transport) => transport.close()))
-      await Promise.allSettled([...servers].map((server) => server.close()))
+      await handler.close()
       await closeHttp(http)
+    },
+  }
+}
+
+export function createWorkflowMcpHttpHandler(
+  service: WorkflowService,
+  scope: WorkflowServiceScope,
+  token: string,
+): WorkflowMcpHttpHandler {
+  if (token.length < 24) throw new TypeError('HTTP bearer token must contain at least 24 characters')
+  const transports = new Set<StreamableHTTPServerTransport>()
+  const servers = new Set<McpServer>()
+  return {
+    handle: (request, response) => handleHttpRequest(
+      request,
+      response,
+      token,
+      service,
+      scope,
+      transports,
+      servers,
+    ),
+    async close(): Promise<void> {
+      await Promise.allSettled([...transports].map(transport => transport.close()))
+      await Promise.allSettled([...servers].map(server => server.close()))
+      transports.clear()
+      servers.clear()
     },
   }
 }
@@ -81,17 +114,22 @@ async function handleHttpRequest(
   scope: WorkflowServiceScope,
   transports: Set<StreamableHTTPServerTransport>,
   servers: Set<McpServer>,
-): Promise<void> {
+): Promise<boolean> {
   try {
-    if (request.url?.split('?', 1)[0] !== '/mcp') return json(response, 404, { error: 'not-found' })
-    if (!validOrigin(request.headers.origin)) return json(response, 403, { error: 'invalid-origin' })
+    if (request.url?.split('?', 1)[0] !== '/mcp') return false
+    if (!validOrigin(request.headers.origin)) {
+      json(response, 403, { error: 'invalid-origin' })
+      return true
+    }
     if (!validBearer(request.headers.authorization, token)) {
       response.setHeader('WWW-Authenticate', 'Bearer')
-      return json(response, 401, { error: 'unauthorized' })
+      json(response, 401, { error: 'unauthorized' })
+      return true
     }
     if (request.method !== 'POST' && request.method !== 'GET' && request.method !== 'DELETE') {
       response.setHeader('Allow', 'POST, GET, DELETE')
-      return json(response, 405, { error: 'method-not-allowed' })
+      json(response, 405, { error: 'method-not-allowed' })
+      return true
     }
 
     // Stateless transports are intentional. Durable cursor tools own reconnect semantics, so MCP
@@ -113,12 +151,14 @@ async function handleHttpRequest(
     // runtime object implements Transport; this cast only bridges that declaration mismatch.
     await mcp.connect(transport as unknown as Transport)
     await transport.handleRequest(request, response)
+    return true
   } catch (error) {
     if (!response.headersSent) {
       json(response, 500, { error: error instanceof Error ? error.message : String(error) })
     } else if (!response.writableEnded) {
       response.end()
     }
+    return true
   }
 }
 
@@ -145,11 +185,15 @@ function json(response: ServerResponse, status: number, body: object): void {
   response.end(JSON.stringify(body))
 }
 
-function listen(server: HttpServer, port: number): Promise<void> {
+function listen(
+  server: HttpServer,
+  port: number,
+  host: '127.0.0.1' | '0.0.0.0',
+): Promise<void> {
   return new Promise((resolveListen, reject) => {
     const onError = (error: Error): void => reject(error)
     server.once('error', onError)
-    server.listen(port, '127.0.0.1', () => {
+    server.listen(port, host, () => {
       server.removeListener('error', onError)
       resolveListen()
     })
