@@ -46,6 +46,21 @@ cat > "$temporary/output/openai_api_key" <<'EOF'
 workflow-mcp-nonsecret-container-probe
 EOF
 
+# WHY: bind mounts retain the host fixture's mode bits. Hosted runners are free to choose a
+# defensive umask, while the final image intentionally runs as unrelated uid 10001. If these
+# inputs inherit 0700/0600, the policy wrapper cannot stat `.codex` and the refusal probe appears
+# to accept the workspace merely because it was unreadable. Fix the public fixture modes so this
+# gate measures the image's isolation decision, not the runner account's ambient umask.
+chmod 0755 \
+  "$temporary/workspace" \
+  "$temporary/workspace/.claude" \
+  "$temporary/workspace/.claude/workflows" \
+  "$temporary/catalog-workspace" \
+  "$temporary/catalog-workspace/.codex"
+chmod 0644 \
+  "$temporary/workspace/.claude/workflows/smoke.js" \
+  "$temporary/catalog-workspace/.codex/config.toml"
+
 # WHY: the documented extension image is an operator-facing compatibility contract, not illustrative
 # prose. Building it from the exact candidate catches base-distribution/package-manager drift, and
 # executing the installed tool as the final non-root user proves the example did not merely parse.

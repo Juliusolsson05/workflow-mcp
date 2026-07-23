@@ -44,10 +44,17 @@ describe('standalone application', () => {
       fileURLToPath(new URL('../dist/cli/main.js', import.meta.url)),
       'serve', '--stdio', workspace, `--data-dir=${join(root, 'data')}`,
     ], {
-      // The standalone default is the image-internal isolation wrapper. This parser/lifecycle test
-      // runs on the host and never starts a provider, so give configuration an existing executable
-      // without weakening the production default or making the test depend on a Codex install.
-      env: { ...process.env, WORKFLOW_MCP_CODEX_PATH: process.execPath },
+      // The standalone defaults are image-internal: Linux selects inherited-flock because the
+      // image entrypoint has already acquired and handed off a native kernel lock. This host-side
+      // parser/lifecycle test deliberately bypasses that entrypoint, so asking it to consume an
+      // inherited descriptor would test an impossible process shape and fail before STDIO starts.
+      // The final-image smoke owns the real entrypoint/flock contract; embedded ownership keeps
+      // this test focused on the documented option-first command without weakening production.
+      env: {
+        ...process.env,
+        WORKFLOW_MCP_CODEX_PATH: process.execPath,
+        WORKFLOW_MCP_LEASE_MODE: 'embedded',
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     child.stdin.end()
