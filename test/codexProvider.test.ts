@@ -127,6 +127,25 @@ describe('CodexAgentProvider', () => {
     }))).toMatchObject({ automatic: true, risk: 'read_only' })
   })
 
+  it('advertises process-tree ownership only with an evidence-backed PID namespace', () => {
+    const provider = new CodexAgentProvider({
+      codexPathOverride: '/tmp/codex',
+      providerHostFilePath: fileURLToPath(new URL('../dist/providerHost.js', import.meta.url)),
+      executableEvidence: { path: '/tmp/codex', sha256: 'a'.repeat(64) },
+      configurationIsolation: {
+        codexHome: '/tmp/private-codex-home',
+        effectiveConfigurationFingerprint: 'verified-container-policy',
+      },
+      capabilities: {
+        inheritedMcpServers: 'disabled',
+        attemptContainment: 'codex-bwrap-pid-v1',
+        mcpServers: [],
+      },
+    })
+
+    expect(provider.terminationBoundary).toBe('process-tree')
+  })
+
   it('maps thread policy, streamed activities, final text, session, and raw usage', async () => {
     const { client, calls } = mockClient([
       { type: 'thread.started', thread_id: 'thread-1' },

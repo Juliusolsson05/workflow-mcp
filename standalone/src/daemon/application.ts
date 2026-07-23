@@ -57,7 +57,7 @@ export async function createStandaloneApplication(
       approvedSources.has(`${resolve(request.canonicalIdentity)}\0${request.sourceHash}`)
     ),
     sandbox: {
-      mode: 'read-only',
+      mode: config.sourceMode === 'authoring' ? 'workspace-write' : 'read-only',
       approvalPolicy: 'never',
       network: false,
     },
@@ -89,8 +89,7 @@ async function createCodexProvider(
   environment: NodeJS.ProcessEnv,
 ): Promise<CodexAgentProvider> {
   const executableBytes = await readFile(config.codexExecutable)
-  const effectiveConfigurationFingerprint =
-    environment.WORKFLOW_MCP_CODEX_CONFIG_FINGERPRINT
+  const effectiveConfigurationFingerprint = await codexPolicyFingerprint(config, environment)
   const isolation = {
     codexHome: join(config.dataDirectory, 'codex-home'),
     ...(effectiveConfigurationFingerprint === undefined
@@ -99,13 +98,42 @@ async function createCodexProvider(
   }
   return new CodexAgentProvider({
     codexPathOverride: config.codexExecutable,
+    // The outer service selects the source capability; the policy launcher
+    // independently checks that the SDK's requested sandbox cannot exceed it.
+    env: { WORKFLOW_MCP_ATTEMPT_PROFILE: config.sourceMode },
     configurationIsolation: isolation,
     capabilities: effectiveConfigurationFingerprint === undefined
       ? { inheritedMcpServers: 'unknown' }
-      : { inheritedMcpServers: 'disabled', mcpServers: [] },
+      : {
+          inheritedMcpServers: 'disabled',
+          attemptContainment: 'codex-bwrap-pid-v1',
+          mcpServers: [],
+        },
     executableEvidence: {
       path: config.codexExecutable,
       sha256: createHash('sha256').update(executableBytes).digest('hex'),
     },
   })
+}
+
+async function codexPolicyFingerprint(
+  config: StandaloneConfig,
+  environment: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
+  const policyFiles = [
+    '/etc/codex/requirements.toml',
+    '/opt/workflow-mcp/bin/codex-policy-launcher.mjs',
+  ]
+  const contents = await Promise.all(policyFiles.map(path => readFile(path).catch(() => undefined)))
+  if (contents.some(value => value === undefined)) return undefined
+  const evidence = {
+    schemaVersion: 1,
+    sourceMode: config.sourceMode,
+    projectCodexMasked: environment.WORKFLOW_MCP_PROJECT_CODEX_MASKED === 'true',
+    policyFiles: policyFiles.map((path, index) => ({
+      path,
+      sha256: createHash('sha256').update(contents[index]!).digest('hex'),
+    })),
+  }
+  return createHash('sha256').update(JSON.stringify(evidence)).digest('hex')
 }
