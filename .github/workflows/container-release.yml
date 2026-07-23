@@ -198,7 +198,7 @@ jobs:
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v3.0.6
+          cosign-release: v2.4.3
       - name: Discover a previously signed candidate checkpoint
         id: checkpoint
         shell: bash
@@ -211,7 +211,7 @@ jobs:
             # This mutable resume handle is reusable only when a prior invocation of this exact
             # tagged workflow signed its digest. Registry labels/tag ownership are not trust, and
             # the immutable public SemVer remains absent until every qualification gate passes.
-            cosign verify --registry-referrers-mode=legacy "$IMAGE@$digest" \
+            cosign verify "$IMAGE@$digest" \
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME"
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -319,15 +319,17 @@ jobs:
           COSIGN_YES: "true"
         run: |
           if [ "${{ steps.checkpoint.outputs.exists }}" != true ]; then
-            # WHY --registry-referrers-mode=legacy: cosign v3 defaults to the OCI 1.1 referrers
-            # API, which Docker Hub does not serve compatibly — sign exits 0 but writes no
-            # discoverable signature, and the verify below fails "no signatures found" (the exact
-            # failure the first real v0.1.0 build hit). Legacy mode stores the signature as the
-            # tag-based sha256-<digest>.sig artifact Docker Hub fully supports. Sign and verify
-            # must use the same mode; the published RELEASE_NOTES verify example matches.
-            cosign sign --registry-referrers-mode=legacy "$IMAGE@${{ steps.identity.outputs.digest }}"
+            # WHY cosign is pinned to v2.4.3 (see cosign-installer above): cosign v3 defaults to
+            # --new-bundle-format=true / the OCI 1.1 referrers API, which Docker Hub does not serve
+            # compatibly — sign exits 0 but writes no discoverable signature and the verify below
+            # fails "no signatures found" (the exact failure the first real v0.1.0 builds hit, and
+            # --registry-referrers-mode is not even a valid sign flag to override it). cosign v2
+            # writes the tag-based sha256-<digest>.sig artifact Docker Hub fully supports, with no
+            # flags, and its verify discovers the same tag. The RELEASE_NOTES verify example needs
+            # no special flags for the same reason.
+            cosign sign "$IMAGE@${{ steps.identity.outputs.digest }}"
           fi
-          cosign verify --registry-referrers-mode=legacy "$IMAGE@${{ steps.identity.outputs.digest }}" \
+          cosign verify "$IMAGE@${{ steps.identity.outputs.digest }}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME"
       - name: Publish the signed mutable candidate resume handle
@@ -533,7 +535,7 @@ jobs:
           Image: $IMAGE@$digest
 
           Verify the image signature (legacy tag-based signatures; required on Docker Hub):
-          cosign verify --registry-referrers-mode=legacy $IMAGE@$digest --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME
+          cosign verify $IMAGE@$digest --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME
 
           BuildKit attached SPDX SBOM and SLSA provenance attestations to both native manifest members.
           Inspect them with: docker buildx imagetools inspect --raw $IMAGE@$digest
@@ -778,7 +780,7 @@ jobs:
           # WHY: pinning only the installer action still follows that action's changing default
           # Cosign release. Post-publication verification must use the same reviewed binary as the
           # pre-publication signature gate, or a default bump can make recovery nondeterministic.
-          cosign-release: v3.0.6
+          cosign-release: v2.4.3
       - name: Enable nested Codex sandbox namespaces on the disposable runner
         shell: bash
         run: |
@@ -816,7 +818,7 @@ jobs:
           (cd bundle && sha256sum --check SHA256SUMS)
           bundle/workflow-mcp-docker help >/dev/null
           image="docker.io/juliusolsson/workflow-mcp@${{ needs.publish.outputs.digest }}"
-          cosign verify --registry-referrers-mode=legacy "$image" \
+          cosign verify "$image" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GH_REPO/.github/workflows/container-release.yml@refs/tags/$tag"
           docker pull "$image"
