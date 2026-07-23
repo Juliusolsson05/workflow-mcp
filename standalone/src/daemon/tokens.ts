@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 
 import type { WorkflowJournalWriteCoordinator } from 'workflow-mcp'
 
-export type TokenPurpose = 'mcp' | 'web'
+export type TokenPurpose = 'mcp' | 'web' | 'admin'
 export type StandaloneTokens = Readonly<Record<TokenPurpose, string>>
 
 export function loadOrCreateTokens(
@@ -28,6 +28,9 @@ export function loadOrCreateTokens(
     return Object.freeze({
       mcp: loadOrCreate(join(directory, 'mcp.token')),
       web: loadOrCreate(join(directory, 'web.token')),
+      // This token is never exposed by `token show`. It authenticates only the rootless local
+      // operator socket, whose path is additionally hidden from Codex attempts by managed policy.
+      admin: loadOrCreate(join(directory, 'admin.token')),
     })
   })
 }

@@ -234,6 +234,10 @@ export class FileWorkflowStore implements WorkflowStore {
     return this.#writers
   }
 
+  runOwnedMutation<T>(operation: () => Promise<T>): Promise<T> {
+    return this.#writers.run(operation)
+  }
+
   async acquireLease(ownerId: string): Promise<WorkflowStoreLease> {
     if (ownerId.length === 0) throw new TypeError('Workflow store ownerId must not be empty')
     if (this.#leaseActive) {

@@ -11,6 +11,23 @@ case "${1:-help}" in
     # executing the same installation concurrently.
     exec /opt/workflow-mcp/native/workflow-mcp-lock "$lock_path" node "$cli" "$@"
     ;;
+  maintenance)
+    case "${2:-}" in
+      backup-verify)
+        # Verification is read-only and often runs without a data volume. Identity and archive
+        # checks are still enforced by the CLI, but minting an irrelevant /data lock would make
+        # `--read-only` verification fail before opening its input bind.
+        exec node "$cli" "$@"
+        ;;
+      backup-create|restore)
+        exec /opt/workflow-mcp/native/workflow-mcp-lock "$lock_path" node "$cli" "$@"
+        ;;
+      *)
+        echo "workflow-mcp: unknown maintenance action: ${2:-}" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   *)
     # Proxy, UI, doctor, and health commands are clients. Giving them the owner FD would make an
     # innocent `docker compose exec` extend ownership beyond daemon shutdown.

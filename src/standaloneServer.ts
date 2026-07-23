@@ -8,7 +8,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 
 import type { WorkflowService, WorkflowServiceScope } from './workflowService.js'
-import { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
+import { registerWorkflowMcpTools, workflowMcpInstructions } from './workflowMcp.js'
 import { WORKFLOW_MCP_VERSION } from './generatedBuildMetadata.js'
 
 export type WorkflowMcpHttpServer = {
@@ -25,25 +25,34 @@ export type WorkflowMcpHttpHandler = {
   close(): Promise<void>
 }
 
-function createServerWithTools(service: WorkflowService, scope: WorkflowServiceScope): McpServer {
+export type WorkflowMcpServerOptions = { inlineAuthoring?: boolean }
+
+function createServerWithTools(
+  service: WorkflowService,
+  scope: WorkflowServiceScope,
+  options: WorkflowMcpServerOptions = {},
+): McpServer {
   const server = new McpServer(
     { name: 'workflow-mcp', version: WORKFLOW_MCP_VERSION },
     {
       // MCP initialization instructions are the only guidance guaranteed to reach a client before
       // it chooses a tool. Keeping the authoring loop here prevents success from depending on a
       // model having read this repository or previously seen Claude's private Workflow prompt.
-      instructions: WORKFLOW_MCP_INSTRUCTIONS,
+      instructions: workflowMcpInstructions(options.inlineAuthoring !== false),
     },
   )
-  registerWorkflowMcpTools(server, service, scope)
+  registerWorkflowMcpTools(server, service, scope, options.inlineAuthoring === undefined
+    ? {}
+    : { inlineAuthoring: options.inlineAuthoring })
   return server
 }
 
 export async function serveWorkflowMcpStdio(
   service: WorkflowService,
   scope: WorkflowServiceScope,
+  options: WorkflowMcpServerOptions = {},
 ): Promise<{ close(): Promise<void> }> {
-  const server = createServerWithTools(service, scope)
+  const server = createServerWithTools(service, scope, options)
   const transport = new StdioServerTransport()
   await server.connect(transport)
   return { close: () => server.close() }
@@ -52,11 +61,21 @@ export async function serveWorkflowMcpStdio(
 export async function serveWorkflowMcpHttp(
   service: WorkflowService,
   scope: WorkflowServiceScope,
-  options: { port?: number; token?: string; host?: '127.0.0.1' | '0.0.0.0' } = {},
+  options: {
+    port?: number
+    token?: string
+    host?: '127.0.0.1' | '0.0.0.0'
+    inlineAuthoring?: boolean
+  } = {},
 ): Promise<WorkflowMcpHttpServer> {
   const token = options.token ?? randomBytes(32).toString('base64url')
   const host = options.host ?? '127.0.0.1'
-  const handler = createWorkflowMcpHttpHandler(service, scope, token)
+  const handler = createWorkflowMcpHttpHandler(
+    service,
+    scope,
+    token,
+    options.inlineAuthoring === undefined ? {} : { inlineAuthoring: options.inlineAuthoring },
+  )
 
   const http = createServer((request, response) => {
     void handler.handle(request, response).then(handled => {
@@ -83,6 +102,7 @@ export function createWorkflowMcpHttpHandler(
   service: WorkflowService,
   scope: WorkflowServiceScope,
   token: string,
+  options: WorkflowMcpServerOptions = {},
 ): WorkflowMcpHttpHandler {
   if (token.length < 24) throw new TypeError('HTTP bearer token must contain at least 24 characters')
   const transports = new Set<StreamableHTTPServerTransport>()
@@ -96,6 +116,7 @@ export function createWorkflowMcpHttpHandler(
       scope,
       transports,
       servers,
+      options,
     ),
     async close(): Promise<void> {
       await Promise.allSettled([...transports].map(transport => transport.close()))
@@ -114,6 +135,7 @@ async function handleHttpRequest(
   scope: WorkflowServiceScope,
   transports: Set<StreamableHTTPServerTransport>,
   servers: Set<McpServer>,
+  options: WorkflowMcpServerOptions,
 ): Promise<boolean> {
   try {
     if (request.url?.split('?', 1)[0] !== '/mcp') return false
@@ -135,7 +157,7 @@ async function handleHttpRequest(
     // Stateless transports are intentional. Durable cursor tools own reconnect semantics, so MCP
     // transport sessions add no useful state and would make one dropped HTTP connection capable of
     // orphaning a run the service is explicitly designed to preserve.
-    const mcp = createServerWithTools(service, scope)
+    const mcp = createServerWithTools(service, scope, options)
     const transport = new StreamableHTTPServerTransport({
       enableJsonResponse: true,
     })

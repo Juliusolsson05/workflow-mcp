@@ -13,12 +13,14 @@ import {
 
 import type { StandaloneConfig } from '../config/schema.js'
 import { prepareWorkflowDataLayout, type WorkflowDataLayout } from './dataLayout.js'
+import { SourceApprovalStore } from './sourceApprovals.js'
 
 export type StandaloneApplication = {
   config: StandaloneConfig
   layout: WorkflowDataLayout
   store: FileWorkflowStore
   service: WorkflowService
+  sourceApprovals: SourceApprovalStore
   quiesce(reason?: string): Promise<void>
 }
 
@@ -46,6 +48,8 @@ export async function createStandaloneApplication(
     ...(leaseBackend === undefined ? {} : { leaseBackend }),
   })
   const approvedSources = await startupSourceApprovals(config.workspace)
+  const sourceApprovals = new SourceApprovalStore(config.dataDirectory, config.projectHash)
+  sourceApprovals.initialize()
   const provider = options.provider ?? await createCodexProvider(config, environment)
   const service = new WorkflowService({
     store,
@@ -54,8 +58,10 @@ export async function createStandaloneApplication(
     // read-only profile's review boundary; an inline file or one edited after startup cannot grant
     // itself execution authority merely by becoming visible in the project.
     authorizeWorkflowSource: request => (
-      approvedSources.has(`${resolve(request.canonicalIdentity)}\0${request.sourceHash}`)
+      approvedSources.has(`${resolve(request.canonicalIdentity)}\0${request.sourceHash}`) ||
+      sourceApprovals.isApproved(request.canonicalIdentity, request.sourceHash)
     ),
+    allowInlineWorkflowAuthoring: config.sourceMode === 'authoring',
     sandbox: {
       mode: config.sourceMode === 'authoring' ? 'workspace-write' : 'read-only',
       approvalPolicy: 'never',
@@ -72,6 +78,7 @@ export async function createStandaloneApplication(
     layout,
     store,
     service,
+    sourceApprovals,
     quiesce: reason => service.quiesce(reason),
   }
 }

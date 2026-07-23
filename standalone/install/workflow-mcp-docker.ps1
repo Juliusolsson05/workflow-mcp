@@ -56,6 +56,10 @@ if ($Command -ne "install") {
   } elseif ($Project -eq ".") {
     $Project = $DefaultProject
   }
+  if ($Command -eq "backup" -and ($Project -eq "create" -or $Project -eq "verify")) {
+    $Rest = @($Project) + @($Rest)
+    $Project = $DefaultProject
+  }
 }
 
 function Host-Doctor([bool] $NeedWeb) {
@@ -135,7 +139,37 @@ function Install-Command() {
   Host-Doctor ($null -ne $WebPort)
   docker image inspect $Image 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { docker pull $Image | Out-Null }
-  if ($Authoring) { New-Item -ItemType Directory -Force -Path (Join-Path $script:ProjectDirectory ".claude/workflows") | Out-Null }
+  if ($Authoring) {
+    $ClaudeDirectory = Join-Path $script:ProjectDirectory ".claude"
+    $WorkflowDirectory = Join-Path $ClaudeDirectory "workflows"
+    foreach ($Candidate in @($ClaudeDirectory, $WorkflowDirectory)) {
+      if ((Test-Path -LiteralPath $Candidate) -and ((Get-Item -Force -LiteralPath $Candidate).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        Fail "refusing redirected authoring path: $Candidate"
+      }
+    }
+    New-Item -ItemType Directory -Force -Path $WorkflowDirectory | Out-Null
+    $ExpectedWorkflowDirectory = [IO.Path]::GetFullPath($WorkflowDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $ActualWorkflowDirectory = (Get-Item -Force -LiteralPath $WorkflowDirectory).FullName.TrimEnd([IO.Path]::DirectorySeparatorChar)
+    if ($ActualWorkflowDirectory -ne $ExpectedWorkflowDirectory) { Fail "workflow authoring path redirects outside the canonical project" }
+    $Probe = @'
+const fs = require("node:fs");
+const first = `/probe/.workflow-mcp-write-probe-${process.pid}`;
+const second = `${first}.renamed`;
+let fd;
+try {
+  fd = fs.openSync(first, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  fs.writeSync(fd, "probe\n"); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+  fs.renameSync(first, second);
+  const directory = fs.openSync("/probe", fs.constants.O_RDONLY); fs.fsyncSync(directory); fs.closeSync(directory);
+  fs.unlinkSync(second);
+} finally {
+  if (fd !== undefined) fs.closeSync(fd);
+  for (const path of [first, second]) { try { fs.unlinkSync(path); } catch {} }
+}
+'@
+    & docker run --rm --network none --read-only --user 10001:10001 --entrypoint /usr/local/bin/node --mount "type=bind,src=$WorkflowDirectory,dst=/probe" $Image -e $Probe
+    if ($LASTEXITCODE -ne 0) { Fail "UID 10001 cannot durably author $WorkflowDirectory; grant a narrow ACL/ownership or use read-only mode" }
+  }
   New-Item -ItemType Directory -Force -Path $script:Installation | Out-Null
   foreach ($Name in @("compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.project-codex-mask.yaml")) {
     Copy-Item -LiteralPath (Join-Path $BundleRoot $Name) -Destination (Join-Path $script:Installation $Name)
@@ -225,6 +259,81 @@ function Uninstall-Command() {
   Write-Host "Remove $($MyInvocation.MyCommand.Path) after this command returns."
 }
 
+function Resolve-MaintenancePath([string] $Requested, [string] $Kind) {
+  if (-not [IO.Path]::IsPathRooted($Requested)) { Fail "$Kind path must be absolute" }
+  $script:MaintenanceName = [IO.Path]::GetFileName($Requested)
+  if ([string]::IsNullOrWhiteSpace($script:MaintenanceName)) { Fail "invalid $Kind filename" }
+  $script:MaintenanceDirectory = Canonical-Directory ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Requested)))
+  $script:MaintenanceHostPath = Join-Path $script:MaintenanceDirectory $script:MaintenanceName
+}
+
+function Invoke-ArchiveVerification([string] $InputPath) {
+  Resolve-MaintenancePath $InputPath "input"
+  if (-not (Test-Path -LiteralPath $script:MaintenanceHostPath -PathType Leaf) -or -not (Test-Path -LiteralPath "$($script:MaintenanceHostPath).sha256" -PathType Leaf)) {
+    Fail "backup archive or checksum sidecar is missing"
+  }
+  & docker run --rm --network none --read-only --user 10001:10001 `
+    -e "WORKFLOW_MCP_INSTANCE_ID=$($script:Instance.instanceId)" -e "WORKFLOW_MCP_PROJECT_HASH=$($script:Instance.projectHash)" `
+    --mount "type=bind,src=$script:MaintenanceDirectory,dst=/backup-input,readonly" `
+    $Image maintenance backup-verify "--input=/backup-input/$script:MaintenanceName"
+  if ($LASTEXITCODE -ne 0) { Fail "backup verification failed" }
+}
+
+function Backup-Command() {
+  Load-Instance $Project
+  if ($Rest.Count -lt 1) { Fail "backup requires create or verify" }
+  $Action = $Rest[0]
+  $Options = @($Rest | Select-Object -Skip 1)
+  if ($Action -eq "create") {
+    $Output = $null
+    foreach ($Argument in $Options) {
+      if ($Argument -match '^--output=(.+)$') { $Output = $Matches[1] } else { Fail "unknown backup create option: $Argument" }
+    }
+    if ([string]::IsNullOrWhiteSpace($Output)) { Fail "backup create requires --output=C:\absolute\file" }
+    Resolve-MaintenancePath $Output "output"
+    if ((Test-Path -LiteralPath $script:MaintenanceHostPath) -or (Test-Path -LiteralPath "$($script:MaintenanceHostPath).sha256")) { Fail "backup output already exists" }
+    Invoke-Compose @("down", "--remove-orphans")
+    Attest-Volume
+    $Volume = "$($script:Instance.composeProjectName)_workflow-mcp-data"
+    & docker run --rm --network none --read-only --user 10001:10001 `
+      -e "WORKFLOW_MCP_INSTANCE_ID=$($script:Instance.instanceId)" -e "WORKFLOW_MCP_PROJECT_HASH=$($script:Instance.projectHash)" `
+      --mount "type=volume,src=$Volume,dst=/data,volume-nocopy" `
+      --mount "type=bind,src=$script:MaintenanceDirectory,dst=/backup-output" `
+      $Image maintenance backup-create "--output=/backup-output/$script:MaintenanceName"
+    if ($LASTEXITCODE -ne 0) { Fail "offline backup failed; the daemon remains stopped" }
+    Write-Host "Backup committed at $script:MaintenanceHostPath (checksum: $($script:MaintenanceHostPath).sha256)."
+  } elseif ($Action -eq "verify") {
+    $Input = $null
+    foreach ($Argument in $Options) {
+      if ($Argument -match '^--input=(.+)$') { $Input = $Matches[1] } else { Fail "unknown backup verify option: $Argument" }
+    }
+    if ([string]::IsNullOrWhiteSpace($Input)) { Fail "backup verify requires --input=C:\absolute\file" }
+    Invoke-ArchiveVerification $Input
+  } else { Fail "backup requires create or verify" }
+}
+
+function Restore-Command() {
+  Load-Instance $Project
+  $Input = $null
+  foreach ($Argument in $Rest) {
+    if ($Argument -match '^--input=(.+)$') { $Input = $Matches[1] } else { Fail "unknown restore option: $Argument" }
+  }
+  if ([string]::IsNullOrWhiteSpace($Input)) { Fail "restore requires --input=C:\absolute\file" }
+  Invoke-ArchiveVerification $Input
+  Invoke-Compose @("down", "--remove-orphans")
+  Invoke-Compose @("create")
+  Attest-Volume
+  Invoke-Compose @("down", "--remove-orphans")
+  $Volume = "$($script:Instance.composeProjectName)_workflow-mcp-data"
+  & docker run --rm --network none --read-only --user 10001:10001 `
+    -e "WORKFLOW_MCP_INSTANCE_ID=$($script:Instance.instanceId)" -e "WORKFLOW_MCP_PROJECT_HASH=$($script:Instance.projectHash)" `
+    --mount "type=volume,src=$Volume,dst=/data,volume-nocopy" `
+    --mount "type=bind,src=$script:MaintenanceDirectory,dst=/backup-input,readonly" `
+    $Image maintenance restore "--input=/backup-input/$script:MaintenanceName"
+  if ($LASTEXITCODE -ne 0) { Fail "offline restore failed; the target volume was not overwritten if it was non-empty" }
+  Write-Host "Restore committed offline. Run the up command when ready; Codex login and local tokens must be recreated."
+}
+
 switch ($Command) {
   "install" { Install-Command }
   "up" { Load-Instance $Project; Invoke-Compose @("create"); Attest-Volume; Invoke-Compose @("up", "--detach", "--wait") }
@@ -235,7 +344,11 @@ switch ($Command) {
   "ui" { Load-Instance $Project; Invoke-Compose @("exec", "workflow-mcp", "workflow-mcp", "ui") }
   "mcp-proxy" { Load-Instance $Project; Invoke-Compose @("exec", "-T", "workflow-mcp", "workflow-mcp", "mcp-proxy") }
   "token" { Load-Instance $Project; Invoke-Compose (@("exec", "workflow-mcp", "workflow-mcp", "token", "show") + $Rest) }
+  "source" { Load-Instance $Project; Invoke-Compose (@("exec", "-T", "workflow-mcp", "workflow-mcp", "source") + $Rest) }
+  "auth" { Load-Instance $Project; Invoke-Compose (@("exec", "workflow-mcp", "workflow-mcp", "auth") + $Rest) }
+  "backup" { Backup-Command }
+  "restore" { Restore-Command }
   "uninstall" { Uninstall-Command }
-  "help" { Write-Host "workflow-mcp-docker install|up|down|status|logs|doctor|ui|mcp-proxy|token PROJECT" }
+  "help" { Write-Host "workflow-mcp-docker install|up|down|status|logs|doctor|ui|mcp-proxy|token|source|auth|backup|restore PROJECT" }
   default { Fail "unknown command: $Command" }
 }

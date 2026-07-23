@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import { FakeAgentProvider } from 'workflow-mcp'
 
 import type { StandaloneConfig } from '../src/config/schema.js'
+import { hashProjectIdentity } from '../src/instance/record.js'
 import { startStandaloneDaemon } from '../src/daemon/lifecycle.js'
 
 describe('stdio MCP proxy', () => {
@@ -23,11 +24,13 @@ describe('stdio MCP proxy', () => {
     return 'proxy result'`)
     const config: StandaloneConfig = Object.freeze({
       workspace,
+      projectHash: hashProjectIdentity(workspace),
       dataDirectory: join(root, 'data'),
       host: '127.0.0.1',
       port: 0,
       sourceMode: 'read-only',
       leaseMode: 'embedded',
+      adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',
       webEnabled: false,
     })

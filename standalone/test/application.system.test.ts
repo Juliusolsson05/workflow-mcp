@@ -8,6 +8,7 @@ import { FakeAgentProvider } from 'workflow-mcp'
 
 import type { StandaloneConfig } from '../src/config/schema.js'
 import { createStandaloneApplication } from '../src/daemon/application.js'
+import { hashProjectIdentity } from '../src/instance/record.js'
 
 describe('standalone application', () => {
   it('runs through the public core API and quiesces without a second owner', async () => {
@@ -21,11 +22,13 @@ describe('standalone application', () => {
     return 'complete'`)
     const config: StandaloneConfig = Object.freeze({
       workspace,
+      projectHash: hashProjectIdentity(workspace),
       dataDirectory: join(root, 'data'),
       host: '127.0.0.1',
       port: 7331,
       sourceMode: 'read-only',
       leaseMode: 'embedded',
+      adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',
       webEnabled: false,
     })

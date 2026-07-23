@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, symlink, unlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -188,6 +188,37 @@ describe('WorkflowService', () => {
     })).rejects.toMatchObject({ code: 'invalid-request' } satisfies Partial<WorkflowServiceError>)
     await terminal(service, cwd, run.runId)
     await service.stop()
+  })
+
+  it('rejects inline source before touching a read-only profile project', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-inline-disabled-'))
+    await mkdir(join(cwd, '.git'))
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(cwd, 'state')),
+      provider: new FakeAgentProvider([]),
+      allowInlineWorkflowAuthoring: false,
+    })
+    await service.initialize()
+
+    await expect(service.start({ cwd }, {
+      script: `export const meta = { name: 'blocked', description: 'Must remain absent' }\nreturn null`,
+    })).rejects.toMatchObject({ code: 'authoring-disabled' })
+    await expect(access(join(cwd, '.claude'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await service.stop()
+  })
+
+  it('fences app-owned administrative state with service mutation admission', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-administrative-mutation-'))
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(cwd, 'state')),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+    await expect(service.runAdministrativeMutation(async () => 'committed')).resolves.toBe('committed')
+    await service.stop()
+    await expect(service.runAdministrativeMutation(async () => 'too-late')).rejects.toMatchObject({
+      code: 'service-stopped',
+    })
   })
 
   it('returns immediately, persists events, closes phases honestly, and enforces cwd scope', async () => {

@@ -139,6 +139,11 @@ export interface WorkflowStore {
    * A journal holding this reference cannot mint authority: runSync fails after lease quiesce.
    */
   journalWriteCoordinator?(): WorkflowJournalWriteCoordinator
+  /**
+   * App-owned durable state (approvals, auth metadata, backup manifests) must share the same lease
+   * generation as run state. This callback grants no reusable permit and drains before release.
+   */
+  runOwnedMutation?<T>(operation: () => Promise<T>): Promise<T>
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>
   getManifest(runId: string): Promise<WorkflowRunManifest | undefined>
   listManifests(): Promise<WorkflowRunManifest[]>

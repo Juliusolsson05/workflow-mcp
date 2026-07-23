@@ -14,11 +14,13 @@ describe('standalone configuration', () => {
     }, { WORKFLOW_MCP_CODEX_PATH: '/opt/codex' })
     expect(config).toMatchObject({
       workspace: '/workspace/project',
+      projectHash: expect.stringMatching(/^[a-f0-9]{64}$/),
       dataDirectory: '/data/instance',
       host: '0.0.0.0',
       port: 7444,
       webEnabled: true,
       leaseMode: 'embedded',
+      adminSocketPath: '/data/instance/.coordination/admin.sock',
     })
     expect(Object.isFrozen(config)).toBe(true)
   })

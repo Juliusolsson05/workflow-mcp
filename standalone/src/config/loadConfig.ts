@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 
 import {
   StandaloneConfigurationError,
@@ -6,6 +6,7 @@ import {
   type StandaloneLeaseMode,
   type StandaloneSourceMode,
 } from './schema.js'
+import { hashProjectIdentity } from '../instance/record.js'
 
 export function loadStandaloneConfig(
   flags: Readonly<Record<string, string | boolean>>,
@@ -19,6 +20,10 @@ export function loadStandaloneConfig(
     stringFlag(flags, 'data-dir') ?? environment.WORKFLOW_MCP_DATA_DIR ?? '/data',
     'data-dir',
   )
+  const projectHash = environment.WORKFLOW_MCP_PROJECT_HASH ?? hashProjectIdentity(workspace)
+  if (!/^[a-f0-9]{64}$/.test(projectHash)) {
+    throw new StandaloneConfigurationError('WORKFLOW_MCP_PROJECT_HASH must be a lowercase SHA-256 value')
+  }
   const hostValue = stringFlag(flags, 'host') ?? environment.WORKFLOW_MCP_HOST ?? '127.0.0.1'
   if (hostValue !== '127.0.0.1' && hostValue !== '0.0.0.0') {
     throw new StandaloneConfigurationError('host must be 127.0.0.1 or 0.0.0.0')
@@ -52,6 +57,17 @@ export function loadStandaloneConfig(
         'WORKFLOW_MCP_LOCK_PATH',
       )
     : undefined
+  // The operator channel lives in tmpfs in the image so a workflow attempt cannot recover its
+  // address from durable state. Embedded mode deliberately keeps the socket under its disposable
+  // test/development data root because ordinary hosts do not provision the container's /run path.
+  const adminSocketPath = absolutePath(
+    environment.WORKFLOW_MCP_ADMIN_SOCKET ?? (
+      leaseMode === 'inherited-flock'
+        ? '/run/workflow-mcp/admin.sock'
+        : join(dataDirectory, '.coordination', 'admin.sock')
+    ),
+    'WORKFLOW_MCP_ADMIN_SOCKET',
+  )
   const codexExecutable = absolutePath(
     environment.WORKFLOW_MCP_CODEX_PATH ?? '/opt/workflow-mcp/bin/codex-isolated',
     'WORKFLOW_MCP_CODEX_PATH',
@@ -63,6 +79,7 @@ export function loadStandaloneConfig(
 
   const config: StandaloneConfig = {
     workspace,
+    projectHash,
     dataDirectory,
     host: hostValue,
     port,
@@ -70,6 +87,7 @@ export function loadStandaloneConfig(
     leaseMode,
     ...(lockFileDescriptor === undefined ? {} : { lockFileDescriptor }),
     ...(lockPath === undefined ? {} : { lockPath }),
+    adminSocketPath,
     codexExecutable,
     webEnabled,
   }
