@@ -7,6 +7,17 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# WHY: PowerShell 7.3+ can opt native commands into `$ErrorActionPreference`, but this launcher
+# intentionally interprets Docker exit codes at command-specific boundaries: an absent image means
+# pull, an invalid record means reject, doctor exit 3 means degraded, and cleanup failures are
+# handled separately from the primary operation. Letting the shell throw first bypasses those
+# distinctions and makes behavior depend on the operator's ambient preference. Older Windows
+# PowerShell has no such variable, so retain its native semantics and normalize newer hosts to it.
+$NativeErrorPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+if ($null -ne $NativeErrorPreference) {
+  Set-Variable -Name PSNativeCommandUseErrorActionPreference -Value $false
+}
+
 function Fail([string] $Message) { throw "workflow-mcp-docker: $Message" }
 function Assert-TerminalSafePath([string] $Path) {
   # WHY: these host paths later appear in errors and success messages. Quoting a path is not a
@@ -209,10 +220,9 @@ function Load-Instance([string] $ProjectPath) {
   # WHY: ConvertFrom-Json proves syntax only. Compose project name is command authority, so the
   # PowerShell launcher must not consume any member until the same pinned image parser used by the
   # POSIX launcher has checked size, schema, UUID-derived name, canonical path/hash, and field types.
-  # WHY: PowerShell 7 can promote a native child's stderr into a terminating ErrorRecord under
-  # `$ErrorActionPreference = "Stop"`. Invalid untrusted JSON is an expected parser outcome here,
-  # not a PowerShell transport failure; discard the image parser's detail so the exit code below
-  # always becomes the launcher's stable public error and never skips the command-authority fence.
+  # Invalid untrusted JSON is an expected parser outcome here, not a PowerShell transport failure;
+  # discard the image parser's detail so the exit code below becomes the launcher's stable public
+  # error without leaking implementation diagnostics past the command-authority fence.
   $ValidatedRecord = & docker run --rm --network none --read-only --user 0:0 `
     -v "${script:Installation}:/bundle:ro" $Image instance inspect --file=/bundle/instance.json 2>$null
   if ($LASTEXITCODE -ne 0) { Fail "instance.json is invalid or unsupported" }

@@ -115,7 +115,14 @@ COPY --chmod=0644 standalone/docker/codex-requirements.toml /etc/codex/requireme
 
 # Fresh named volumes use Docker copy-up from this tree. Normal startup never runs as root and must
 # therefore begin with every durable domain privately owned by the fixed runtime identity.
-RUN install -d -o 10001 -g 10001 -m 0700 \
+# WHY: COPY fixes the requirements file mode but does not state the mode of an auto-created parent.
+# Builder implementations and umasks must not decide whether runtime uid 10001 can traverse the
+# administrator policy directory. Reassert the complete root-owned path contract in a RUN layer;
+# otherwise Codex can report the world-readable file itself as EACCES on one builder only.
+RUN chown 0:0 /etc/codex /etc/codex/requirements.toml \
+    && chmod 0755 /etc/codex \
+    && chmod 0644 /etc/codex/requirements.toml \
+    && install -d -o 10001 -g 10001 -m 0700 \
       /data /data/.coordination /data/store /data/codex-home /data/config /data/secrets \
       /data/approvals /data/backups /data/workspaces /backup-output /bundle-output /run/workflow-mcp \
     && install -o 10001 -g 10001 -m 0600 /dev/null /data/.coordination/owner.lock \

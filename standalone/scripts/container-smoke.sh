@@ -147,6 +147,12 @@ docker run --rm --network "$network" --read-only=true --user=10001:10001 \
 
 user=$(docker image inspect "$image" --format '{{.Config.User}}')
 [ "$user" = 10001:10001 ] || { echo "unexpected image user: $user" >&2; exit 1; }
+# WHY: the managed requirements file is only useful if the actual non-root runtime can traverse
+# its root-owned parent and read it. File metadata alone missed a builder-dependent parent-mode
+# regression, while the later Codex sandbox error misleadingly named only the leaf file.
+docker run --rm --network none --read-only --user 10001:10001 \
+  --entrypoint /usr/local/bin/node "$image" \
+  -e 'require("node:fs").accessSync("/etc/codex/requirements.toml",require("node:fs").constants.R_OK)'
 healthcheck=$(docker image inspect "$image" --format '{{json .Config.Healthcheck}}')
 [ "$healthcheck" = null ] || { echo "image embeds a transport-specific healthcheck: $healthcheck" >&2; exit 1; }
 label=$(docker image inspect "$image" --format '{{index .Config.Labels "io.modelcontextprotocol.server.name"}}')
