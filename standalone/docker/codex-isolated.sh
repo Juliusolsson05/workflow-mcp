@@ -23,12 +23,32 @@ if [ -e /workspace/.codex ] || [ -L /workspace/.codex ]; then
     echo "codex-isolated: project Codex mask is not an ordinary directory" >&2
     exit 77
   fi
-  [ -z "$(find /workspace/.codex -mindepth 1 -maxdepth 1 -print -quit)" ] || {
+  # Emptiness must be PROVEN, not merely unreported. A mount whose directory mode denies read (for
+  # example 0111) makes `find` fail with "Permission denied" while printing nothing, which a bare
+  # output test reads as empty — yet Codex, which only needs traverse+read on the file itself, can
+  # still read config.toml inside it. Treat any find failure as a refusal.
+  mask_entries=$(find /workspace/.codex -mindepth 1 -maxdepth 1 -print 2>/dev/null) || {
     echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
     exit 77
   }
-  if ! awk '$5 == "/workspace/.codex" { found=1 } END { if (!found) exit 3 }' /proc/self/mountinfo \
-    || [ -w /workspace/.codex ]; then
+  [ -z "$mask_entries" ] || {
+    echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
+    exit 77
+  }
+  # Read-only must come from the MOUNT, not from the current UID's permissions. `[ -w ]` only
+  # describes what uid 10001 may do right now, so a read-write mount whose directory mode merely
+  # excludes that uid would pass while another writer (a sibling container sharing the volume, or
+  # the host) populates it after this check — a TOCTOU straight into project-controlled Codex
+  # configuration. mountinfo field 5 is the mount point and field 6 its per-mount options; requiring
+  # `ro` there proves the kernel itself refuses writes through this mount regardless of who asks.
+  if ! awk '
+      $5 == "/workspace/.codex" {
+        found = 1
+        count = split($6, options, ",")
+        for (index_ = 1; index_ <= count; index_++) if (options[index_] == "ro") readonly = 1
+      }
+      END { if (!found || !readonly) exit 3 }
+    ' /proc/self/mountinfo || [ -w /workspace/.codex ]; then
     echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
     exit 77
   fi

@@ -287,27 +287,19 @@ load_instance() {
     # $PWD and so broke in one terminal while working in another.
     #
     # Identity still may not cross directories: only a path that IS the recorded directory is
-    # accepted, proven by comparing device+inode rather than by comparing strings. A moved, copied,
-    # or unrelated project still has a different inode and is still refused. On success adopt the
-    # recorded spelling so the hash, bind source, and Compose project name remain byte-identical to
-    # installation.
+    # accepted. `-ef` compares device AND inode, which is what "same directory" actually means —
+    # an inode number alone is unique only within one filesystem, so two directories on separate
+    # volumes routinely share one (two tmpfs mounts both report inode 1) and comparing inodes
+    # alone would let a copied bundle adopt an unrelated project on another volume. A moved,
+    # copied, or unrelated directory therefore still fails here. On success adopt the recorded
+    # spelling so the hash, bind source, and Compose project name remain byte-identical to
+    # installation. `-ef` is not in POSIX test, but every shell this launcher runs under supports
+    # it (verified: macOS /bin/sh, dash, and the image's BusyBox ash).
     # shellcheck disable=SC2154
-    same_directory=false
-    if [ -n "${recorded_project_directory:-}" ] && [ -d "$recorded_project_directory" ]; then
-      # `ls -di DIR/.` prints only "<inode> <path>" for the directory itself, and just the leading
-      # inode field is read — no filename is parsed, so SC2012's filename-safety concern does not
-      # apply. `find -printf` would be the suggested alternative but is GNU-only and this launcher
-      # must run against BSD find on macOS.
-      # shellcheck disable=SC2012
-      current_identity=$(ls -di "$project_directory/." 2>/dev/null | awk '{ print $1 }')
-      # shellcheck disable=SC2012
-      recorded_identity=$(ls -di "$recorded_project_directory/." 2>/dev/null | awk '{ print $1 }')
-      if [ -n "$current_identity" ] && [ "$current_identity" = "$recorded_identity" ]; then
-        same_directory=true
-      fi
-    fi
-    [ "$same_directory" = true ] ||
+    if [ -z "${recorded_project_directory:-}" ] || [ ! -d "$recorded_project_directory" ] ||
+      [ ! "$project_directory" -ef "$recorded_project_directory" ]; then
       fail "instance.json belongs to a different canonical project path"
+    fi
     project_directory=$recorded_project_directory
     actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
     [ "$actual_hash" = "$project_hash" ] ||

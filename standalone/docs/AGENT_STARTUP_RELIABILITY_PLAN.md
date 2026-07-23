@@ -75,16 +75,28 @@ install is only usable from the exact casing used at install time.
 Worse, it is silent and intermittent: the PATH shim resolves from `$PWD` (whatever the user typed),
 so the same install works in one terminal and refuses in another.
 
-### Fix
+### Fix (as implemented)
 
-Normalize the recorded project directory to the filesystem's own spelling at record time. The
-identity hash then describes the directory that actually exists, not a spelling of it, and every
-later resolution — typed in any case on a case-insensitive volume — agrees. Case-sensitive
-filesystems are unaffected because there the typed spelling *is* the on-disk spelling.
+Record-time normalization was considered and **not** taken: the record is produced by `instance
+create` running *inside the container*, where the host path does not exist, so it cannot read the
+real directory entries to recover the on-disk spelling. Doing it host-side in POSIX `sh` would mean
+walking every component with `ls` and case-insensitive matching — new, fragile, security-sensitive
+path code in the one function that already carries the terminal-safety guarantees.
 
-Implementation note: resolution must not invent a path. It reads the real directory entries to
-recover the true spelling component-by-component, and falls back to the given path unchanged when
-a component cannot be read, so a permission-restricted parent can never turn into a wrong identity.
+What ships instead is a launcher-side identity fallback. When the recomputed hash does not match,
+the launcher compares the invocation path against the newly rendered `recorded_project_directory`
+with `test -ef` — device **and** inode, which is what "the same directory" actually means — and on
+a match adopts the recorded spelling so the hash, bind source, and Compose project name stay
+byte-identical to installation. A moved, copied, or unrelated directory still fails, including one
+that merely shares an inode number on another volume (two tmpfs mounts both report inode 1, which
+is exactly why an inode-only comparison would have been wrong).
+
+Known limitation, deliberately not fixed here: `install --adopt-instance` compares against the
+preserved volume's `io.workflow-mcp.project-hash` label, and by then `instance.json` is gone, so
+no recorded spelling exists to fall back to. Reattaching from a differently-cased path is still
+refused. The uninstall output already prints the exact reattach command containing the recorded
+spelling; using that command is the supported path. Carrying the spelling in the volume label would
+fix it and is left as follow-up rather than widening this change.
 
 ## 4. Defect C — the daemon reports healthy while agents cannot start
 
