@@ -132,7 +132,7 @@ multi-platform verifier image instead of installing another host binary:
 ```sh
 docker run --rm \
   ghcr.io/sigstore/cosign/cosign@sha256:de9c65609e6bde17e6b48de485ee788407c9502fa08b8f4459f595b21f56cd00 \
-  verify "$SUBJECT" \
+  verify --registry-referrers-mode=legacy "$SUBJECT" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity "https://github.com/Juliusolsson05/workflow-mcp/.github/workflows/container-release.yml@refs/tags/v$VERSION"
 ```
