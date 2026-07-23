@@ -24,15 +24,46 @@ Docker-first Codex MCP product with three interfaces over one durable service:
 2. an interactive terminal UI launched with a Docker command; and
 3. an optional local browser UI served by the same container.
 
-The plan is intentionally larger than a normal feature note. A future implementation agent should
-not have to rediscover why Compose owns the durable service, why the TUI must be a client, how a
+The plan is intentionally larger than a normal feature note. A future maintainer should not have
+to rediscover why Compose owns the durable service, why the TUI must be a client, how a
 Docker MCP Catalog launch differs from the full product, or what security properties are lost by
 mounting a host Codex home. It records product decisions, current-code evidence, proposed file
-layout, commands, protocols, rollout slices, tests, release mechanics, and unresolved decisions.
+layout, commands, protocols, rollout slices, tests, release mechanics, and the decisions resolved
+during implementation.
 
 This document does not authorize a big-bang rewrite. The existing durable runtime is the asset.
 The implementation should add a separately shaped product around it and move code only when a
 specific boundary has tests and a compatibility path.
+
+### 1.1 Implementation ledger
+
+The implementation now exists on `feat/docker-first-standalone`; the plan remains normative for
+release qualification and future migrations. Compact accepted decisions live in
+[`standalone/docs/adr`](../standalone/docs/adr/README.md), while implementation WHYs remain beside
+the enforcing code. This ledger distinguishes code-complete work from evidence that can exist only
+on protected release infrastructure.
+
+| Slice | Implementation status | Primary evidence |
+| --- | --- | --- |
+| 0–1 contracts/core durability | Implemented | ADRs; kernel owner/CLOEXEC helpers; lifecycle, cursor, index, migration, and writer-permit suites |
+| 2–4 package/daemon/MCP | Implemented | isolated package boundary; daemon/admin/API servers; SDK-backed HTTP/STDIO conformance suites |
+| 5 container/install | Implemented | fixed-UID hardened image; Compose overlays; POSIX/PowerShell launchers; reproducible bundle; final-image smoke |
+| 6–8 API/TUI/web | Implemented; real-browser qualification pending | bounded read model; dependency-free ANSI TUI; hashed static browser app; auth/header/API/asset and DOM lifecycle tests |
+| 9 auth/authoring | Implemented | API-key and broker paths; managed Codex isolation; hostile policy probe; two-step byte-exact approval |
+| 10 release | Implemented, infrastructure qualification pending | build-once multi-arch workflow; native architecture smoke/scan; SBOM/provenance/signature; immutable bundle workflow |
+| 11 registries | Implemented, publication pending | current MCP Registry schema validator; OCI ownership label; Docker Catalog template/tool inventory/limitations |
+| 12 broad mutation | Deliberately deferred | outside the first read-only/narrow-authoring release contract |
+
+Repository settings, Docker Hub namespace/tag immutability, protected environments, publication
+accounts, real Docker Desktop runners, and a real-browser container run are external qualification
+prerequisites: code can enforce and record their protocols but cannot truthfully claim evidence
+that has not run in those environments. The
+platform evidence protocol is [`standalone/docs/PLATFORM_VALIDATION.md`](../standalone/docs/PLATFORM_VALIDATION.md).
+The 2026-07-23 owner audit found immutable GitHub releases disabled, no protected preflight or
+publication environments, no tag ruleset, and no public Docker Hub repository, so release is
+currently blocked. The exact
+remediation and workflow attestation gate are recorded in
+[`standalone/docs/RELEASE_PREREQUISITES.md`](../standalone/docs/RELEASE_PREREQUISITES.md).
 
 ## 2. Reading conventions
 
@@ -75,7 +106,7 @@ The user-facing lifecycle is:
 ```bash
 # Start or recover the project service through the versioned launcher. It supplies an absolute
 # Compose file, a stable per-project name, and an absolute project bind.
-./workflow-mcp-docker up -d
+./workflow-mcp-docker up
 
 # Paint an interactive terminal UI without creating another workflow owner.
 ./workflow-mcp-docker ui
@@ -429,6 +460,14 @@ or other kernel boundary. That service may execute attempts but may not become a
 `WorkflowService` or direct store owner. The executive diagram is logical; the security-topology ADR
 owns the final container/process placement before Compose freezes.
 
+**RESOLUTION:** the final image passed the one-container gate with Codex's managed Bubblewrap PID
+namespace plus the generated deny policy, the Compose-only project `.codex` mask (and fail-closed
+absence requirement in Catalog mode), private Codex home, disabled
+network, and a release-blocking hostile probe that attempts token access and a detached `setsid`
+escape. The daemon/admin capability is outside that managed mount namespace. The shared Unix UID is
+therefore not presented as the boundary; if the pinned Codex mechanism stops enforcing the probe,
+the image fails release and the separate-provider-service branch above becomes mandatory.
+
 ### 8.2 Why an init process is required
 
 The daemon supervises native child processes. Generic MCP launchers may not add Docker's `--init`
@@ -684,7 +723,7 @@ Use a multi-stage Dockerfile:
 2. core build stage;
 3. standalone web build stage;
 4. standalone server/TUI build stage;
-5. minimal Debian-slim-style runtime stage.
+5. minimal Alpine/musl runtime stage using Codex's native musl artifacts.
 
 The repository root is the sole build context and
 `standalone/docker/Dockerfile.dockerignore` is the ignore contract. Base images are pinned by
@@ -713,7 +752,7 @@ provider and project-toolchain tests show it is viable.
 Proposed image metadata:
 
 ```dockerfile
-ENTRYPOINT ["/usr/bin/tini", "--", "workflow-mcp"]
+ENTRYPOINT ["/sbin/tini", "--", "workflow-mcp"]
 CMD ["serve", "--stdio", "/workspace"]
 ```
 
@@ -840,18 +879,22 @@ The generated Codex MCP entry contains that project name and the absolute Compos
 cannot attach to whichever similarly named project happens to be in the launch directory.
 
 The instance schema is versioned and records the instance ID, canonical project identity, and
-Docker context/daemon identity. The named volume carries the instance ID plus a non-sensitive
-project-identity hash in reverse-DNS labels. Every launcher command resolves and compares the
-instance file, volume labels, project path, and active Docker context before acting. A missing or
-copied file beside labeled state fails closed; explicit `instance move/adopt` and `instance new`
-commands cover intentional relocation and new ownership. The launcher never silently regenerates
-identity around an existing labeled volume.
+Docker context/daemon identity. The daemon identity is a domain-separated digest of Docker
+`/info.ID`, because a context name and endpoint can survive an Engine reset. The named volume
+carries the instance ID plus non-sensitive project-identity and daemon-identity hashes in
+reverse-DNS labels. Every launcher command resolves and compares the instance file, volume labels,
+project path, active Docker context, and current daemon fingerprint before acting. A missing or
+copied file beside labeled state fails closed. Version one implements random identity creation plus
+same-canonical-project `--adopt-instance`; cross-path/context moves are explicitly unsupported
+because changing the project-hash label would otherwise turn relocation into an ownership bypass.
+The launcher never silently regenerates identity around an existing labeled volume.
 
-The published `pids_limit` is a provisional safety ceiling and must be replaced by a measured
-value before RC1. CPU and memory defaults likewise come from the resource characterization in
-Section 24; until measured, the plan may not claim that nine concurrent Codex attempts fit a
-default Docker Desktop allocation. Bounded local-driver logs and state-retention/disk-full behavior
-are release requirements, not optional operational tuning.
+The published constrained profile is one concurrent attempt, 1 CPU, 2 GiB, 512 PIDs, 64 MiB shared
+memory, and 256 MiB tmpfs. Readiness reads cgroup v1/v2 CPU and memory limits and refuses a profile
+smaller than one CPU plus `(concurrency + 1)` GiB. Higher concurrency remains unsupported unless
+all three operator-set values are raised together and qualified; the runtime never claims that the
+core library's historical capacity of nine fits a default Docker Desktop allocation. Bounded
+local-driver logs and state-retention/disk-full behavior remain release requirements.
 
 ### 11.1 Port behavior
 
@@ -860,10 +903,10 @@ reachable through Docker port publication. When the web/direct-HTTP override is 
 publishes it only on host `127.0.0.1`; an unqualified `7331:7331` mapping would expose the service
 on every host interface by default.
 
-Users running several project daemons may choose distinct host ports through `WORKFLOW_MCP_PORT`.
-If no port is configured, the launcher reserves an available loopback port, persists it in the
-instance file, and rechecks the reservation immediately before Compose startup. An explicit port
-collision fails before the daemon starts and names the owner where available; it is never allowed
+Users running several project daemons choose distinct explicit ports with `--web-port`. Version one
+does not publish a port at all when that option is absent, avoiding a racy reserve-then-bind protocol
+and keeping terminal/MCP operation private to the container. An explicit port collision fails
+before the daemon becomes ready; it is never allowed
 to leave the daemon owning `/data` but unreachable. The raw Compose path requires an explicit port.
 Generated Compose project names keep containers and volumes separate; the documentation must not
 prescribe a fixed top-level `name` or `container_name`, because either would undermine parallel
@@ -961,20 +1004,23 @@ The launcher may:
 
 - canonicalize one local project directory and reject remote Docker contexts;
 - generate/read the stable instance ID and Compose project name;
-- resolve, label, inspect, and attest the exact named volume and Docker context;
-- select and persist an available loopback port or fail an explicit collision before startup;
+- resolve, label, inspect, and attest the exact named volume, Docker context, and Docker daemon;
+- persist only an explicitly selected loopback web port and otherwise publish none;
 - supply absolute `-f`, `-p`, and `--project-directory` arguments;
 - select reviewed Compose overrides;
-- write/update a generated Codex MCP stanza after showing the target file; and
+- write/update one marker-fenced generated Codex MCP stanza without reparsing Compose policy; and
 - invoke container CLI commands through `docker compose exec`.
 
 It may not inspect or mutate the run store, copy credentials, implement MCP, or become another
 workflow owner. POSIX and PowerShell behavior share golden contract fixtures. Raw `docker compose`
 equivalents remain documented for recovery, always with explicit paths and project identity.
 
-The host launcher exposes `install`, `instance new`, `instance move/adopt`, `doctor`, `uninstall`,
-and a separately confirmed `uninstall --delete-data`. `uninstall` first removes only the generated
-Codex stanza it owns, stops/removes the Compose application, then removes the local public bundle
+The host launcher exposes `install` (new random identity or same-project `--adopt-instance`),
+`doctor`, lifecycle/interface/auth/source/maintenance commands, `uninstall`, and a separately
+confirmed `uninstall --delete-data`. Cross-project/context/daemon move is not a v1 operation.
+`uninstall` first validates the generated Codex path and exact labeled volume without mutation,
+stops/removes the Compose application, removes only the marker-fenced Codex stanza it owns, then
+removes the local public bundle
 and instance metadata; it preserves the named volume by default. Data deletion resolves and checks
 the labeled volume again and requires an explicit destructive confirmation. Stopping or upgrading
 the daemon must never make Codex startup itself fail, and uninstall must leave no stale generated
@@ -989,19 +1035,8 @@ service:
 
 ```toml
 [mcp_servers.workflow_mcp]
-command = "docker"
-args = [
-  "compose",
-  "-f",
-  "/absolute/project/.workflow-mcp/compose.yaml",
-  "-p",
-  "workflow-mcp-project-instance",
-  "exec",
-  "-T",
-  "workflow-mcp",
-  "workflow-mcp",
-  "mcp-proxy"
-]
+command = "/absolute/project/.workflow-mcp/workflow-mcp-docker"
+args = ["mcp-proxy"]
 cwd = "/absolute/project"
 # `required` is omitted by default. Operators may opt into `required = true` only after accepting
 # that a stopped, owner-conflicted, or upgrading project daemon will then block Codex startup.
@@ -1013,7 +1048,8 @@ Why this is preferred:
 - The host does not need the Node package.
 - The durable daemon remains alive when Codex exits.
 - The host Codex config does not contain a bearer token.
-- Compose scopes the connection to the current project service.
+- The launcher revalidates project/context/image identity and reconstructs every recorded Compose
+  overlay before scoping the connection to the current project service.
 
 The proxy reads a container-local MCP token, connects to the daemon as an MCP client, and exposes a
 separate SDK-backed STDIO MCP server to Codex. It does not read the workflow store and does not
@@ -1082,6 +1118,10 @@ resources are explicitly raised; current documented defaults are one CPU and 2 G
 `--block-network` cannot be enabled for this in-container remote Codex provider, so agent command
 network denial must be demonstrated by the Codex sandbox rather than overstated as a Gateway
 network guarantee.
+
+Catalog cannot safely share one mutable mask volume across unrelated launches. Its project bind is
+therefore accepted only when `.codex` is absent, and the image rechecks that invariant at every
+provider attempt. The project-scoped Compose launcher alone may add its private empty tmpfs mask.
 
 ## 14. Authentication and configuration isolation
 
@@ -1302,11 +1342,14 @@ in the acceptance matrix.
 ### 16.2 Version-one screens
 
 1. Instance header: version, workspace, mount mode, auth status, daemon uptime, provider capacity.
-2. Run list: status, workflow name, age, cursor, agent counts, error/coverage-gap indicator.
+2. Run list: status, workflow name, age, cursor, and error indicator; the selected-run projection
+   shows agent counts, while its bounded agent evidence marks coverage gaps.
 3. Run detail: phases, logical agents, attempt history, current activity, warnings, scheduler health.
 4. Result reader: complete paginated run or agent output, never only bounded previews.
 5. Transcript reader: paginated provider transcript through the service API.
-6. Diagnostics view: quarantined histories, provider circuit state, store and recovery warnings.
+6. Diagnostics view: projected recovery/store/provider warnings plus bounded logical-agent attempt
+   and coverage-gap histories. Private quarantine payloads and provider-circuit internals remain in
+   authenticated MCP evidence/container logs until a separately reviewed redacted DTO exists.
 
 ### 16.3 Rendering architecture
 
@@ -1322,9 +1365,11 @@ Both UIs should consume a small shared client package that handles:
 The terminal and web renderers remain separate. Sharing API/state logic is useful; forcing DOM and
 ANSI rendering through one component abstraction is not.
 
-**OPEN:** select the TUI rendering library in a time-boxed spike. Criteria are maintained Node
-support, deterministic testing, correct resize/alternate-screen cleanup, accessible non-color
-fallback, dependency size, and license. The product contract must not depend on the choice.
+**DECISION:** use a dependency-free ANSI renderer over the shared bounded client. The implemented
+surface uses an alternate screen by default, restores it and cursor/terminal state through `finally`
+and signal paths, redraws on resize, and has explicit plain/no-color/non-interactive fallbacks. This
+avoids adding a UI framework to the security-critical runtime image while keeping the product
+contract independent of the rendering implementation; ADR 0003 records the client/transport boundary.
 
 ## 17. Browser UI
 
@@ -1456,7 +1501,7 @@ store directory                /data/store in every image mode
 instance/project identity      generated stable installation ID, never `/workspace` alone
 listen host                    0.0.0.0 in container daemon mode
 listen port                    7331
-provider concurrency           9 in full Compose mode
+provider concurrency           1 in the qualified default Compose profile
 agent sandbox mode             read-only
 agent approval policy          never
 agent tool network             false
@@ -1488,35 +1533,36 @@ configuration object and pass that through composition.
 ### 21.2 `doctor`
 
 Diagnostics have two explicit phases. `./workflow-mcp-docker doctor` runs on the host and checks the
-Docker context/daemon, Engine/Desktop/Compose versions, canonical project/installation paths,
-version-matched bundle and Git ignore, rendered Compose model, instance/volume labels, driver
-options, port availability, Codex configuration target, and host authoring permissions. It then
+Docker context/daemon, Engine/Compose versions, canonical project/installation identity, verified
+version-matched bundle, rendered Compose model, and instance/volume labels and driver options. It then
 invokes `workflow-mcp doctor --container`, which checks the effective UID/user namespace, mounts,
 filesystem/lock/fsync behavior, layout/ownership, daemon endpoint, Codex SDK/config/auth/sandbox,
 and tmpfs. Raw Compose users can run the container phase, but receive an unsupported warning unless
 they supply the verified host attestation.
 
-Together the phases check:
+Together the implemented v1 phases check:
 
 - CPU architecture and image version;
-- workspace existence, canonical path, Git root, and read/write mode;
-- `/data` ownership, free space, layout version, and lease state;
-- the resolved local volume's empty allowlisted driver options, labels, mount/filesystem evidence,
-  and a real two-process kernel-lock probe;
-- ability to create and fsync a private probe in allowed state directories;
+- workspace existence, canonical project identity, and read/write mode;
+- `/data` access, fsync/rename primitives, free space, and layout version;
+- the resolved local volume's empty allowlisted driver options and instance/project labels;
 - isolated Codex home, project `.codex` masking, and absence of inherited MCP/hooks/rules;
 - provider authentication status without making a billable model call;
-- daemon endpoint and version compatibility;
-- TTY/color capabilities for the TUI;
+- daemon readiness after the owner acquired its inherited lease and bound the API, plus the
+  container image/core/SDK version report;
 - configured concurrency versus detected CPU/memory guidance;
-- published-port and origin configuration;
 - whether a newer state layout would make downgrade unsafe;
 - Docker context plus minimum Engine/Desktop/Compose versions, including Engine 28.3.3 for the
   localhost publication claim;
 - `bubblewrap` availability and a non-billable sandbox probe under the final hardening settings;
 - absolute project bind, stable Compose project identity, and explicit MCP `cwd`/Compose path; and
-- writable/bounded tmpfs ownership for `/tmp`, `/run/workflow-mcp`, and `/dev/shm`, plus negative
-  checks for undeclared root-filesystem fallback writes or authoritative tmpfs state.
+- managed-command inability to read credential/state/process paths, connect to admin, escape the
+  PID namespace, inherit credential keys, or reach the release-gate network sentinel.
+
+The doctor CLI is a separate process and therefore reports its own missing owner descriptor as a
+warning; it does not claim to inspect the daemon's private inherited FD. Real two-process lock
+exclusion, signal containment, and hostile network sentinels remain mandatory final-image release
+smokes and are not relabeled as interactive diagnostics.
 
 The JSON form is one versioned envelope with separate `host` and `container` result objects plus a
 cross-phase identity verdict. It is suitable for support bundles and must redact credentials,
@@ -1558,9 +1604,12 @@ Documentation and generated Compose files pin an exact semantic version or diges
 
 Docker tags are mutable unless the repository's immutable-tag rules enforce otherwise. Release
 setup enables and CI/API-verifies immutability for semantic-version tags before the first publish.
-The pipeline builds each release once, records the multi-platform digest, and promotes that same
-digest to compatible-minor and `latest` tags; it never rebuilds a release tag. The checksummed
-Compose bundle pins the immutable digest while retaining the human-readable version in metadata.
+The API gate compares the complete normalized rule list with the single reviewed full-SemVer regex;
+merely finding that regex among broader rules could freeze the candidate, compatible-minor, or
+`latest` reconciliation paths. The pipeline builds each release once, records the multi-platform
+digest, and promotes that same digest to compatible-minor and `latest` tags; it never rebuilds a
+release tag. The checksummed Compose bundle pins the immutable digest while retaining the
+human-readable version in metadata.
 
 ### 22.2 Architectures
 
@@ -1574,10 +1623,11 @@ architecture supported.
 
 The host support matrix is Linux Engine, Intel/Apple-Silicon macOS Docker Desktop, and x86-64
 Windows Docker Desktop/WSL2 because the product publishes first-class POSIX and PowerShell
-launchers. Windows coverage includes drive/UNC and space-containing paths, canonicalization,
-current-user ACLs, CRLF-safe assets, Git-ignore editing, Compose argument quoting, TTY behavior, and
-Codex stanza removal. A platform remains preview—not stable—until its real runner passes the full
-launcher/Compose matrix.
+launchers. Windows v1 is preview-only, accepts local absolute drive paths (including spaces), and
+explicitly rejects UNC/device paths; its installation directory inherits the current user's
+project ACL rather than claiming to author a new ACL policy. CRLF-safe assets, Git-ignore editing,
+Compose argument quoting, TTY behavior, and Codex stanza removal still require a real runner. A
+platform remains preview—not stable—until its full launcher/Compose matrix passes.
 
 Docker Desktop validation runs on explicitly managed self-hosted or contracted external runners:
 Intel macOS, Apple Silicon macOS, and x86-64 Windows labels, Docker Desktop version, owner, reset
@@ -1606,10 +1656,11 @@ threshold, architecture smoke failure, or mismatch among image/package/MCP/metad
 Rebuild regularly under a new patch release for base-image security updates; immutable release
 tags are never overwritten.
 
-Runtime Debian packages are installed from a recorded distribution snapshot or equivalent
-reproducible package set when practicable, their resolved versions are part of the SBOM, and the
-release records how security rebuilds advance them. Every downloaded build/release tool is pinned
-and verified before execution.
+Runtime OS packages use an equivalent reproducible package set: the Alpine base is digest-pinned,
+each added APK is revision-pinned, and every resolved version is part of the SBOM. Repository
+movement can therefore fail a rebuild closed but cannot silently select a newer package version.
+The release records how security rebuilds advance those pins. Every downloaded build/release tool
+is pinned and verified before execution.
 
 Each GitHub release is created as a draft, receives the POSIX/PowerShell Compose bundle,
 `SHA256SUMS`, image digest, signature verification command/policy, SBOM/provenance references,
@@ -1618,6 +1669,11 @@ attached. Repository immutable releases then lock the tag/assets and generate a 
 attestation. A checksum alone detects corruption but not whole-release substitution, so the
 no-clone installer and release smoke verify both `gh release verify` and `gh release verify-asset`
 (or an equivalent documented release-attestation verifier) plus the checksum before execution.
+A separate protected preflight environment supplies only a repository-scoped Administration(read)
+fine-grained PAT, because the ordinary `GITHUB_TOKEN` has no `administration` permission. Its
+authenticated repository API check must prove immutable releases are still enabled before the
+Docker/publication environment becomes available: discovering drift after publishing the draft
+cannot retroactively lock that public release.
 
 Every action is full-SHA-pinned with least-privilege job permissions. Protected tags/environment,
 trusted-ref checks, release concurrency, fork/PR secret isolation, scoped short-lived Docker Hub
@@ -1641,7 +1697,10 @@ SBOM, provenance, and exact digest are verified, and use a new
 prerelease/version for metadata corrections. Installation does not depend on a registry lookup.
 
 Registry acceptance is not an `initialize`/`tools/list` handshake alone. A clean OCI launch must
-execute one fake-provider tool call and, in a credentialed scheduled gate, one real Codex workflow
+execute one deterministic workflow to terminal completion within the same STDIO container/session;
+removing that container must discard its anonymous state exactly as the metadata promises. A
+separate named-volume reconnect test remains a stronger image capability check, not a claim about
+the published Registry profile. A credentialed scheduled gate must additionally run one real Codex workflow
 with the declared workspace, state, authentication, command arguments, and architecture. If target
 clients cannot honor required OCI runtime arguments/mounts/secrets, metadata must label the package
 ephemeral/compatibility-only rather than promising the Compose product.
@@ -1652,7 +1711,7 @@ Submit only after the image command, secrets, volumes, supported architectures, 
 are stable. The catalog contribution should declare:
 
 - the project workspace mount;
-- persistent state volume;
+- no shared state volume (Catalog v1 is explicitly ephemeral and project-isolated);
 - provider credential secret(s);
 - the STDIO command;
 - resource guidance; and
@@ -1663,10 +1722,13 @@ provenance, and SBOM, or reference a maintainer image. Decide which identity is 
 submission so users do not face two undocumented images with different update policies.
 
 Catalog validation uses a concrete `server.yaml`, declared command, required environment/secrets,
-workspace/state volumes, supported architecture behavior, and concurrency one. Test through the
-current Docker task/wizard/catalog tooling, then run an actual Gateway tool call and a
-`--long-lived` stop/restart with persistent state. Gateway signature verification is tested against
-the selected canonical image identity.
+read-only workspace that must contain no `.codex`, supported architecture behavior, and concurrency
+one. The image proves both halves: a clean project is accepted and an unmasked project-controlled
+`.codex` is refused. A credential-free scheduled job compiles current Gateway and validates against
+current Catalog source. Actual Docker Desktop Gateway tool-list/call and separate maintainer-image
+Cosign verification remain publication gates, not claims made by metadata-only CI. Stop/restart
+durability is qualified only for the Compose daemon product because Catalog v1 deliberately
+discards session state.
 
 ### 22.6 npm
 
@@ -1761,12 +1823,12 @@ Build and run the actual image to prove:
   for explicitly documented coordination diagnostics;
 - project bind is read-only by default;
 - two generated project installations remain isolated even with identical directory basenames;
-- web mode automatically selects distinct persisted loopback ports for two projects and rejects a
-  configured collision before durable startup;
+- two web-enabled projects accept distinct explicitly selected persisted loopback ports and reject
+  a configured collision before durable startup;
 - `/run/workflow-mcp` and `/tmp` have the intended UID/GID/mode and pass create/fsync/unlink probes;
 - no write falls back to the read-only application filesystem;
 - project `.codex` config/hooks/rules and image system/managed config cannot reach provider attempts;
-- hostile workflows cannot read credential/token paths or process environments and cannot reach
+- hostile model-generated commands cannot read credential/token paths or process environments and cannot reach
   the daemon over loopback/service DNS;
 - Codex `bubblewrap` starts under the exact published capability/seccomp/read-only settings;
 - amd64 and arm64 entrypoints select functioning Codex binaries;
@@ -1796,6 +1858,11 @@ Use a real browser against a containerized fake-provider daemon:
 - narrow and wide layouts; and
 - no mutation controls in observational mode.
 
+The API, headers, immutable assets, and read-only route surface have automated coverage on this
+branch. The real-browser run remains a required pre-release qualification gate because this
+environment did not expose a browser runtime; do not infer DOM, focus, suspension, or layout
+behavior from HTTP/asset tests alone.
+
 ### 23.5 TUI tests
 
 - deterministic rendering from recorded state snapshots;
@@ -1824,7 +1891,8 @@ Keep live tests opt-in and credential-aware:
   network, and daemon loopback;
 - exact `@openai/codex-sdk` fresh-home trusted/untrusted config-layer characterization with sentinel
   MCP, hook, rule, plugin, and app capability;
-- one real tool call plus persistent-state restart through Docker MCP Gateway `--long-lived`.
+- a current Docker Desktop/Gateway Catalog launch that lists all thirteen tools and makes one real
+  credential-free call, plus explicit proof that removing the ephemeral server discards its state.
 
 ## 24. Resource model
 
@@ -2000,9 +2068,10 @@ Deliverables:
 - baked init, `bubblewrap`, non-root runtime, healthcheck;
 - base, web, authoring, and opt-in API-key-secret Compose files with correct tmpfs ownership;
 - POSIX/PowerShell launchers and reproducible checksummed installation bundle;
-- project `.codex` masking and effective-configuration evidence;
-- host/container `doctor`, instance/context/volume labels and attestation, automatic web-port
-  allocation, explicit identity move/new flows, and reversible uninstall;
+- project-scoped Compose `.codex` masking, Catalog `.codex` refusal, and effective-configuration
+  evidence;
+- host/container `doctor`, instance/context/volume labels and attestation, explicit web-port
+  selection/collision checks, explicit identity move/new flows, and reversible uninstall;
 - generated Codex stanza plus current Codex CLI smoke through the built Compose application;
 - Docker contract test harness;
 - documented derived image; and
@@ -2045,7 +2114,7 @@ Deliverables:
 - TUI library spike and ADR;
 - instance/run/detail/result/transcript/diagnostics views;
 - resize, no-color, and disconnect behavior; and
-- launcher plus explicit raw-Compose recovery documentation.
+- verified-bundle launcher recovery plus explicit raw-Compose refusal/diagnostic documentation.
 
 Exit criteria:
 
@@ -2130,7 +2199,9 @@ Exit criteria:
 
 - Registry installation completes a real fake-provider tool call with declared runtime inputs;
 - Catalog launch exposes the same thirteen tools;
-- Gateway `--long-lived` restart preserves state under the declared volume and signature policy; and
+- current Docker Desktop/Gateway launches the rendered ephemeral Catalog entry, exposes thirteen
+  tools, completes a credential-free call, and the maintainer digest passes explicit Cosign
+  verification; and
 - neither integration is described as the full durable UI product unless it actually preserves
   daemon lifecycle, storage, and port access.
 
@@ -2228,11 +2299,11 @@ artifacts, tokens, configuration, and container-owned Codex login.
 | MCP client requests arbitrary files | fixed project scope, canonical path confinement, opaque artifacts |
 | Workflow source changes after approval | approval keyed by canonical identity and source hash |
 | Container compromise controls Docker host | no Docker socket, non-root, capabilities dropped |
-| Host/project Codex configuration creates recursive MCP | isolated `CODEX_HOME`, masked project `.codex`, audited system/managed layers, no whole-home mount |
+| Host/project Codex configuration creates recursive MCP | isolated `CODEX_HOME`, private Compose mask, Catalog refusal, audited system/managed layers, no whole-home mount |
 | Two owners execute same lineage | immutable-inode installation lock, writer permits, verified local volume, fail-closed readiness |
 | Escaped provider descendant survives attempt | kernel lifetime containment; capacity and lock handoff wait for all descendants |
 | Restart duplicates unsafe side effects | existing replay evidence and explicit recovery-required state |
-| Same-UID workflow reads tokens/credentials | exact-sandbox negative tests; separate principal or verified deny layer if any probe succeeds |
+| Approved workflow source reads tokens/credentials | explicit operator code-trust grant; never advertise `node:vm` as a hostile-code boundary |
 | Token leaks through ordinary tooling | stable private files, redaction, no URL/query/log placement; file mode alone is not claimed as agent isolation |
 | Writable bind corrupts host project | read-only default and separately named opt-in profiles |
 | Release bundle substitution | immutable GitHub release attestation plus checksum/asset verification |
@@ -2242,9 +2313,11 @@ artifacts, tokens, configuration, and container-owned Codex login.
 | Migration mutates unknown layout | installation lock, inspect-before-repair, one-selector generation transaction, fail-closed readiness |
 | Agent invokes administrative control | isolated principal/namespace, non-published transport, out-of-band one-time capability |
 
-The restricted JavaScript workflow runtime and Codex sandbox reduce risk but are not treated as a
-perfect hostile-code boundary. The container itself is a defense-in-depth boundary around the
-service; a full writable project mount still grants meaningful access to host-owned source.
+The restricted JavaScript workflow runtime is a compatibility/accident boundary, not a hostile-code
+boundary. Selecting a repository or approving authored workflow bytes explicitly trusts that code.
+The Codex command sandbox remains the boundary for untrusted model-generated commands. The
+container itself is defense in depth around the service; a writable project mount still grants
+meaningful access to host-owned source.
 
 ## 29. Risks and mitigations
 
@@ -2344,35 +2417,25 @@ Mitigation: freeze administrative routes only after the Slice 0 principal/namesp
 the real Codex process cannot reach its socket or one-time capability; otherwise omit stable admin
 commands instead of relying on another bearer file under the same UID.
 
-## 30. Open decisions requiring explicit ADRs
+## 30. Resolved decisions and release watch items
 
-1. Final Docker Hub organization and canonical image name.
-2. Final official MCP reverse-DNS server name and case normalization.
-3. Exact native `flock` integration, immutable coordination inode, writer-permit API, and narrowly
-   supported local volume/filesystem matrix.
-4. Exact per-attempt cgroup/PID-namespace lifetime containment under rootful, rootless, and Docker
-   Desktop hardening.
-5. Exact restart-safe `WorkflowService` lifecycle API, additive `quiesce()`, admission transaction,
-   writer drain, and event semantics.
-6. Exact provider credential/control/admin principal, mount, PID, and network topology.
-7. Primary SDK-proven Codex untrusted/config-suppression mechanism and whether nested
-   `/workspace/.codex` masking remains defense in depth.
-8. TUI rendering library.
-9. Stable token UX for direct HTTP Codex clients.
-10. Interactive Codex login/broker flow supported on each platform.
-11. Minimum Engine 28.3.3/Desktop/Compose versions and measured CPU/memory/PID/disk/concurrency
-    profiles.
-12. Linux authoring UID/GID/ACL/broker strategy and stable Windows Docker Desktop support gate.
-13. Whether standalone becomes an npm workspace/package or is built as a private subproject without
-    changing the root package manager shape.
-14. State generation/selector format, offline archive schema, and retention policy.
-15. Release vulnerability threshold, signature identity/issuer policy, immutable-tag/release rules,
-    and native Docker Desktop runner ownership.
-16. Canonical Docker MCP Catalog image ownership: maintainer image versus Docker-built `mcp/*`.
-17. When, if ever, mutation controls enter the TUI or web UI.
+The implementation does not leave an architectural OPEN item implicit. ADRs 0001–0008 resolve the
+runtime, ownership, transport, platform, credential/source, maintenance, distribution, and evidence
+questions. The selected public identities are `docker.io/juliusolsson05/workflow-mcp` and
+`io.github.juliusolsson05/workflow-mcp`; the standalone remains a private subproject; the TUI is a
+dependency-free ANSI client; Docker Catalog points at the maintainer image and explicitly describes
+its session-bound limits; and broad mutation/browser mutation remain deferred.
 
-An open item may not be answered implicitly by the first implementation patch. Record the decision
-and why the rejected alternative fails a requirement.
+The following are release watch items rather than undecided code architecture:
+
+1. protected GitHub/Docker Hub controls and publisher accounts must be configured and attested;
+2. each claimed Desktop/rootless row needs clean-runner evidence under the platform protocol;
+3. measured resource profiles may lower concurrency or narrow a release's support matrix;
+4. a future layout change must add a transactional migration and release-specific rollback rule;
+5. a Codex/SDK/MCP/Docker Catalog revision requires re-running the pinned hostile/conformance probes;
+6. Docker Catalog publication may eventually prefer a Docker-built `mcp/*` mirror, but it must
+   retain digest correspondence and may not replace the full Compose lifecycle claim; and
+7. broad project mutation or UI mutation requires its own threat model and acceptance plan.
 
 ## 31. Definition of done for the first stable Docker release
 
@@ -2398,11 +2461,13 @@ All items below are required:
 - credentials use isolated Codex state or explicit secrets, never the whole host Codex home;
 - project/system/managed Codex configuration cannot add unclassified MCP, hooks, rules, plugins, or
   apps to provider attempts;
-- hostile workflow probes cannot read credentials/tokens/process environments or call the daemon;
-- hostile workflows cannot reach the administrative transport/capability;
+- hostile model-command probes cannot read credentials/tokens/process environments or call the daemon;
+- hostile model commands cannot reach the administrative transport/capability;
 - automatic recovery fingerprints the exact executable, SDK, effective configuration, and policy;
 - TUI and browser inspect the same cursor-derived durable state;
 - browser/API security controls pass system tests;
+- a real browser passes the containerized token, CSP/origin, reconnect, cursor-continuation,
+  pagination, responsive-layout, accessibility, and no-mutation-control qualification matrix;
 - amd64 and arm64 images are exercised, not merely built;
 - Docker Hub publishes versioned multi-architecture artifacts with supply-chain metadata;
 - release tags are repository-enforced immutable and image signatures, max provenance, SBOM, scan,
@@ -2508,7 +2573,8 @@ Access, or Preview.
 
 ## 33. Repository evidence map
 
-Future implementation should start from these current files:
+Maintenance and release review should start from these core files; standalone-owned evidence is
+indexed by the implementation ledger and ADRs above:
 
 | Concern | Current source of truth |
 | --- | --- |
@@ -2659,7 +2725,7 @@ between every durable boundary that materially changes the next owner's decision
 | Codex compatibility | STDIO proxy + HTTP endpoint | current Codex CLI/IDE/Desktop matrix where available |
 | TUI does not own work | API client-only architecture | repeated attach/detach during live run |
 | Optional local web UI | static assets + authenticated read API | real-browser container test |
-| No Codex recursion | isolated home + masked project layer + audited effective config | config/hook/rule/plugin negative inheritance tests |
+| No Codex recursion | isolated home + private Compose mask or Catalog refusal + audited effective config | config/hook/rule/plugin negative inheritance tests |
 | Credential/control isolation | exact sandbox or separate principal | hostile `/data`/secrets/`/proc`/loopback probes |
 | Admin isolation | non-published transport + out-of-band capability + separate principal | hostile reachability and quiesce-race suite |
 | Stable MCP surface | canonical registrar | existing MCP suite through every transport |
@@ -2671,17 +2737,17 @@ between every durable boundary that materially changes the next owner's decision
 | Supportable operation | health, doctor, structured logs | failure-injection diagnostics assertions |
 | Reversible installation | generated-stanza ownership + non-destructive uninstall | stopped-daemon startup and uninstall/data-preservation tests |
 
-## 37. Planning handoff checklist
+## 37. Maintenance and release handoff checklist
 
-Before implementation starts, the next agent should:
+Before changing or qualifying the implementation, the next agent should:
 
 1. read this plan, `README.md`, `docs/ARCHITECTURE.md`, and the status header of
    `docs/RELIABILITY_IMPLEMENTATION_PLAN.md`;
 2. inspect the current code named in the repository evidence map rather than trusting line numbers;
 3. recheck the official Codex, Docker MCP, and MCP Registry sources because their statuses are
    time-sensitive;
-4. confirm the selected work begins at Slice 0 and that no standalone daemon/UI work bypasses the
-   Slice 1 correctness gates;
+4. confirm the selected work preserves the Slice 0/1 gates and that no standalone daemon/UI change
+   bypasses their ownership, isolation, or durability contracts;
 5. add or update the relevant ADR before resolving an open decision in code;
 6. preserve thick WHY comments for lifecycle, security, durability, and packaging decisions;
 7. keep changes inside the standalone repository and product boundary; and
@@ -2715,7 +2781,7 @@ reviews from the preceding full round remain the source of the storage/container
 | Docker Hub image alone does not supply Compose | Accepted; image plus reproducible checksummed release bundle is the installation unit |
 | UID 10001 cannot write the proposed root-owned 0700 tmpfs | Accepted; explicit tmpfs UID/GID and real write probes |
 | Fixed UID, Git trust, fresh/restored/rootless volume behavior undefined | Accepted; explicit support matrix, exact `safe.directory`, no root fallback, repair command and tests |
-| Private `CODEX_HOME` still permits project `.codex` capability | Accepted; mask/suppress project layer, audit all effective layers, canonical recovery fingerprint |
+| Private `CODEX_HOME` still permits project `.codex` capability | Accepted; private Compose mask, fail-closed Catalog absence, audit all effective layers, canonical recovery fingerprint |
 | Compose secrets and 0600 files do not isolate same-UID agent commands | Accepted; hostile sandbox probes are release-blocking and require a separate principal/deny layer on failure |
 | Concurrent OAuth refresh/account mutation lacks one owner | Accepted; stable API-key path first, daemon-owned broker required for supported concurrent OAuth |
 | State migration was required but unowned and ordered after repair | Accepted; inspect-before-repair transactional migration moved into core Slice 1 |
@@ -2737,7 +2803,7 @@ reviews from the preceding full round remain the source of the storage/container
 | Credential and admin isolation was deferred too late | Accepted as Slice 0 topology **GATE** with real pinned-Codex sentinel secret and non-agent-reachable admin transport/capability |
 | Fixed UID cannot promise host authoring writes | Accepted; effective-user mutation/fsync probe plus ACL/dynamic-UID/broker ADR; defer rather than root/chown fallback |
 | Host launcher and container diagnostics were conflated | Accepted; versioned two-phase doctor envelope with cross-phase instance/volume verdict |
-| Project identity did not bind Docker context/volume | Accepted; schema-versioned instance, daemon/context identity, labeled volume, command-time comparison, explicit new/move/adopt |
+| Project identity did not bind Docker context/volume | Accepted; schema-versioned instance, daemon/context identity, labeled volume, command-time comparison, and same-project preserved-volume adoption; cross-context identity import is explicitly unsupported in v1 |
 | Checksums do not authenticate a substituted bundle | Accepted; immutable draft-then-publish GitHub release and release/asset attestation verification in no-clone smoke |
 | Registry metadata could resolve a mutable tag | Accepted; `server.json` uses verified multi-platform manifest-index digest |
 | Generated `required = true` makes a stopped optional server block Codex | Accepted; omit by default, opt in explicitly, and test stopped-daemon startup |

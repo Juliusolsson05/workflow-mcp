@@ -14,6 +14,7 @@ export type StandaloneConfig = Readonly<{
   adminSocketPath: string
   codexExecutable: string
   webEnabled: boolean
+  concurrency: number
 }>
 
 export class StandaloneConfigurationError extends Error {

@@ -19,6 +19,7 @@ describe('standalone configuration', () => {
       host: '0.0.0.0',
       port: 7444,
       webEnabled: true,
+      concurrency: 1,
       leaseMode: 'embedded',
       adminSocketPath: '/data/instance/.coordination/admin.sock',
     })

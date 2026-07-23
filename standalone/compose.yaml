@@ -13,6 +13,9 @@ services:
       WORKFLOW_MCP_PROJECT_HASH: ${WORKFLOW_MCP_PROJECT_HASH:?canonical project hash required}
       WORKFLOW_MCP_SOURCE_MODE: read-only
       WORKFLOW_MCP_WEB_ENABLED: "false"
+      # The published constrained profile fits Docker Gateway/Desktop's common one-CPU/two-GiB
+      # allocation. Raise concurrency only together with the CPU and memory limits below.
+      WORKFLOW_MCP_CONCURRENCY: ${WORKFLOW_MCP_CONCURRENCY:-1}
     restart: unless-stopped
     stop_grace_period: 120s
     expose:
@@ -41,6 +44,8 @@ services:
       retries: 6
       start_period: 20s
     pids_limit: ${WORKFLOW_MCP_PIDS_LIMIT:-512}
+    cpus: ${WORKFLOW_MCP_CPUS:-1.0}
+    mem_limit: ${WORKFLOW_MCP_MEMORY_LIMIT:-2g}
     logging:
       driver: local
       options:
@@ -52,4 +57,7 @@ volumes:
     labels:
       io.workflow-mcp.instance-id: ${WORKFLOW_MCP_INSTANCE_ID:?stable instance ID required}
       io.workflow-mcp.project-hash: ${WORKFLOW_MCP_PROJECT_HASH:?canonical project hash required}
+      # Context names/endpoints can be recreated. This digest binds preserved-volume adoption to
+      # the Docker Engine /info.ID that actually created it without publishing the raw daemon ID.
+      io.workflow-mcp.docker-daemon-fingerprint: ${WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT:?Docker daemon identity required}
       io.workflow-mcp.layout: "1"

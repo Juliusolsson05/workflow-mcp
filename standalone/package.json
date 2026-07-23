@@ -1,6 +1,6 @@
 {
   "name": "@workflow-mcp/standalone",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "description": "Docker-first daemon, MCP proxy, and local interfaces for Workflow MCP.",
   "type": "module",
@@ -14,7 +14,9 @@
     "test": "npm run build && vitest run",
     "bundle": "npm run build && node ./scripts/build-install-bundle.mjs",
     "check:imports": "node ./scripts/check-imports.mjs",
-    "check": "npm run typecheck && npm run test && npm run check:imports"
+    "check:distribution": "node ./scripts/validate-distribution.mjs",
+    "check:host-launcher": "sh ./scripts/host-launcher-path-smoke.sh",
+    "check": "npm run typecheck && npm run test && npm run check:imports && npm run check:distribution && npm run check:host-launcher"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
@@ -28,6 +30,7 @@
   "devDependencies": {
     "@types/node": "^22.20.0",
     "esbuild": "0.28.1",
+    "happy-dom": "20.11.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { chmod, mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, stat, utimes, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -11,9 +11,10 @@ const revision = arguments_.revision ?? 'development'
 const image = arguments_.image ?? 'workflow-mcp:development'
 const release = arguments_.release === true
 
-// This script removes its output before recreating it. Confinement to a named
-// leaf keeps an accidental empty argument or path typo from turning a release
-// convenience into a repository deletion primitive.
+// WHY: an explicit output is caller-owned and may be a durable mount such as `/data`, not a
+// disposable build leaf. Path-shape validation cannot tell those meanings apart, so recursively
+// replacing an existing target would turn a harmless typo into data loss. An atomic, non-recursive
+// mkdir below claims only a previously nonexistent leaf and also closes the check/create race.
 if (!isAbsolute(output) || basename(output) === '' || output === dirname(output)) {
   throw new Error(`Unsafe bundle output path: ${output}`)
 }
@@ -30,6 +31,7 @@ if (release) {
 }
 
 const inputs = Object.freeze([
+  ['../LICENSE', 'LICENSE'],
   ['compose.yaml', 'compose.yaml'],
   ['compose.web.yaml', 'compose.web.yaml'],
   ['compose.authoring.yaml', 'compose.authoring.yaml'],
@@ -37,14 +39,24 @@ const inputs = Object.freeze([
   ['compose.project-codex-mask.yaml', 'compose.project-codex-mask.yaml'],
   ['install/workflow-mcp-docker', 'workflow-mcp-docker'],
   ['install/workflow-mcp-docker.ps1', 'workflow-mcp-docker.ps1'],
+  ['scripts/launcher-smoke.sh', 'launcher-smoke.sh'],
   ['install/bundle.gitignore', '.gitignore'],
 ])
 
-await rm(output, { recursive: true, force: true })
-await mkdir(output, { recursive: true, mode: 0o700 })
+await mkdir(dirname(output), { recursive: true, mode: 0o700 })
+try {
+  await mkdir(output, { recursive: false, mode: 0o700 })
+} catch (error) {
+  if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+    throw new Error(`Bundle output already exists: ${output}`)
+  }
+  throw error
+}
 for (const [sourceName, targetName] of inputs) {
   const bytes = await readFile(join(standaloneRoot, sourceName))
-  await writeFile(join(output, targetName), bytes, { mode: targetName === 'workflow-mcp-docker' ? 0o755 : 0o600 })
+  await writeFile(join(output, targetName), bytes, {
+    mode: ['workflow-mcp-docker', 'launcher-smoke.sh'].includes(targetName) ? 0o755 : 0o600,
+  })
 }
 await writeFile(join(output, 'version.env'), [
   '# Generated release metadata. This file is covered by SHA256SUMS.',
@@ -70,6 +82,7 @@ const timestamp = new Date(epochSeconds * 1_000)
 for (const file of [...files, 'SHA256SUMS']) await utimes(join(output, file), timestamp, timestamp)
 await utimes(output, timestamp, timestamp)
 await chmod(join(output, 'workflow-mcp-docker'), 0o755)
+await chmod(join(output, 'launcher-smoke.sh'), 0o755)
 
 const outputStat = await stat(output)
 if (!outputStat.isDirectory()) throw new Error('Bundle output is not a directory')

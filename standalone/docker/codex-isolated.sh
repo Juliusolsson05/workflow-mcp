@@ -7,8 +7,24 @@ policy_launcher=/opt/workflow-mcp/bin/codex-policy-launcher.mjs
 # Docker cannot create a nested tmpfs mountpoint under a read-only bind when `.codex` does not
 # already exist. The launcher therefore selects the mask overlay only for an existing directory;
 # this attempt-time refusal closes the race where the host creates a project config afterwards.
-if { [ -e /workspace/.codex ] || [ -L /workspace/.codex ]; } \
-  && [ "${WORKFLOW_MCP_PROJECT_CODEX_MASKED:-false}" != true ]; then
+if [ "${WORKFLOW_MCP_PROJECT_CODEX_MASKED:-false}" = true ]; then
+  # The environment bit is only an attestation request; the mount is the security boundary. Check
+  # it again at every attempt so a contaminated reusable Catalog volume or broken Compose overlay
+  # cannot turn a trusted boolean into project-controlled Codex configuration authority.
+  if [ ! -d /workspace/.codex ] || [ -L /workspace/.codex ]; then
+    echo "codex-isolated: project Codex mask is not an ordinary directory" >&2
+    exit 77
+  fi
+  [ -z "$(find /workspace/.codex -mindepth 1 -maxdepth 1 -print -quit)" ] || {
+    echo "codex-isolated: project Codex mask is not empty" >&2
+    exit 77
+  }
+  if ! awk '$5 == "/workspace/.codex" { found=1 } END { if (!found) exit 3 }' /proc/self/mountinfo \
+    || [ -w /workspace/.codex ]; then
+    echo "codex-isolated: project Codex mask is absent or effectively writable" >&2
+    exit 77
+  fi
+elif [ -e /workspace/.codex ] || [ -L /workspace/.codex ]; then
   echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
   exit 77
 fi
@@ -36,6 +52,10 @@ fi
 
 if [ "${1:-}" = policy-probe ]; then
   exec node "$policy_launcher" --self-test
+fi
+
+if [ "${1:-}" = policy-probe-authoring ]; then
+  exec node "$policy_launcher" --self-test-authoring
 fi
 
 exec node "$codex" "$@"

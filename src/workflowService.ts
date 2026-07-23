@@ -335,6 +335,7 @@ export class WorkflowService {
   readonly #runVersions = new Map<string, number>()
   readonly #idempotentStarts = new Map<string, Promise<WorkflowRunStartResult>>()
   #storeLease: WorkflowStoreLease | undefined
+  #storeLeaseLossUnsubscribe: (() => void) | undefined
   #storeLeaseRelease: Promise<void> | undefined
   #initializePromise: Promise<void> | undefined
   #stopPromise: Promise<void> | undefined
@@ -342,6 +343,8 @@ export class WorkflowService {
   #lifecycle: WorkflowServiceLifecycleState = 'NEW'
   #admittedMutations = 0
   readonly #admissionDrainWaiters = new Set<() => void>()
+  #exclusiveAdministrativeMutation = false
+  readonly #exclusiveAdmissionWaiters = new Set<() => void>()
 
   constructor(options: WorkflowServiceOptions) {
     this.#options = options
@@ -388,6 +391,7 @@ export class WorkflowService {
         `workflow-service:${randomUUID()}`,
       )
       this.#storeLease = acquiredLease
+      this.#watchStoreLease(acquiredLease)
       if (this.#isClosing()) {
         await this.#releaseStoreLease()
         throw this.#initializationClosingError()
@@ -498,6 +502,8 @@ export class WorkflowService {
       if (this.#storeLease === acquiredLease) {
         try {
           await acquiredLease?.release()
+          this.#storeLeaseLossUnsubscribe?.()
+          this.#storeLeaseLossUnsubscribe = undefined
           this.#storeLease = undefined
         } catch (releaseError) {
           // Preserve the lease object so stop() or a later initialize() can retry its token-owned
@@ -531,14 +537,24 @@ export class WorkflowService {
     return this.#lifecycle
   }
 
-  #beginStop(reason: string, mode: 'cancellation' | 'interruption'): Promise<void> {
+  #beginStop(
+    reason: string,
+    mode: 'cancellation' | 'interruption',
+    terminalFailure = false,
+  ): Promise<void> {
+    if (terminalFailure) {
+      // A lost kernel fence is not an ordinary shutdown phase. Mark FAILED before consulting the
+      // existing stop promise so a concurrent operator close cannot keep readiness at QUIESCING or
+      // later overwrite this safety verdict with STOPPED.
+      this.#lifecycle = 'FAILED'
+    }
     if (this.#stopPromise) return this.#stopPromise
     if (this.#lifecycle === 'STOPPED') return Promise.resolve()
 
     // This assignment and mutation admission happen synchronously on one JavaScript turn. Closing
     // the gate before the first await is what prevents an async source lookup from registering a
     // provider after shutdown has already taken its active-run snapshot.
-    this.#lifecycle = 'QUIESCING'
+    if (!terminalFailure) this.#lifecycle = 'QUIESCING'
     this.#closingMode = mode
     for (const waiters of this.#waiters.values()) for (const wake of waiters) wake()
     this.#waiters.clear()
@@ -546,7 +562,7 @@ export class WorkflowService {
     const stopping = this.#stopOnce(reason, mode)
     this.#stopPromise = stopping
     void stopping.then(
-      () => { this.#lifecycle = 'STOPPED' },
+      () => { this.#lifecycle = terminalFailure ? 'FAILED' : 'STOPPED' },
       () => { this.#lifecycle = 'FAILED' },
     ).finally(() => {
       // FileWorkflowStore.release() deliberately remains retryable after transient I/O failure.
@@ -642,6 +658,38 @@ export class WorkflowService {
       }
       return this.#options.store.runOwnedMutation(mutation)
     })
+  }
+
+  /**
+   * Run an app-owned mutation while excluding workflow starts/cancels and other exclusive work.
+   *
+   * Credential rotation is qualitatively different from an approval-file write: Codex may read
+   * auth.json for an entire provider process, so merely sharing the durable store lock does not
+   * stop a workflow start from racing the credential CLI. Closing admission synchronously before
+   * the first await gives hosts one linearization point; already-admitted operations drain before
+   * the callback and service quiesce still waits because this operation counts as admitted work.
+   */
+  async runExclusiveAdministrativeMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    this.#assertAvailable()
+    if (this.#exclusiveAdministrativeMutation) {
+      throw new WorkflowServiceError('invalid-request', 'An exclusive administrative mutation is already in progress')
+    }
+    this.#exclusiveAdministrativeMutation = true
+    this.#admittedMutations += 1
+    try {
+      await this.#waitForOtherAdmissionDrain()
+      if (this.#options.store.runOwnedMutation === undefined) {
+        throw new WorkflowServiceError(
+          'invalid-request',
+          'This workflow store does not support fenced administrative mutations',
+        )
+      }
+      return await this.#options.store.runOwnedMutation(mutation)
+    } finally {
+      this.#exclusiveAdministrativeMutation = false
+      this.#admittedMutations -= 1
+      this.#notifyAdmissionChange()
+    }
   }
 
   async describe(scope: WorkflowServiceScope, input: { name: string }): Promise<FoundWorkflow> {
@@ -1756,7 +1804,7 @@ export class WorkflowService {
   #isClosing(): boolean {
     // Kept as a method because lifecycle may change while an awaited store operation is in flight;
     // TypeScript's local control-flow narrowing cannot observe that asynchronous transition.
-    return this.#lifecycle === 'QUIESCING' || this.#lifecycle === 'STOPPED'
+    return this.#lifecycle === 'QUIESCING' || this.#lifecycle === 'STOPPED' || this.#lifecycle === 'FAILED'
   }
 
   #initializationClosingError(): WorkflowServiceError {
@@ -1769,18 +1817,37 @@ export class WorkflowService {
 
   #withMutationAdmission<T>(mutation: () => Promise<T>): Promise<T> {
     this.#assertAvailable()
+    if (this.#exclusiveAdministrativeMutation) {
+      throw new WorkflowServiceError(
+        'invalid-request',
+        'Workflow mutation admission is closed for an exclusive administrative operation',
+      )
+    }
     this.#admittedMutations += 1
     return (async () => {
       try {
         return await mutation()
       } finally {
         this.#admittedMutations -= 1
-        if (this.#admittedMutations === 0) {
-          for (const wake of this.#admissionDrainWaiters) wake()
-          this.#admissionDrainWaiters.clear()
-        }
+        this.#notifyAdmissionChange()
       }
     })()
+  }
+
+  #notifyAdmissionChange(): void {
+    if (this.#exclusiveAdministrativeMutation && this.#admittedMutations === 1) {
+      for (const wake of this.#exclusiveAdmissionWaiters) wake()
+      this.#exclusiveAdmissionWaiters.clear()
+    }
+    if (this.#admittedMutations === 0) {
+      for (const wake of this.#admissionDrainWaiters) wake()
+      this.#admissionDrainWaiters.clear()
+    }
+  }
+
+  #waitForOtherAdmissionDrain(): Promise<void> {
+    if (this.#admittedMutations === 1) return Promise.resolve()
+    return new Promise(resolveDrain => this.#exclusiveAdmissionWaiters.add(resolveDrain))
   }
 
   #waitForAdmissionDrain(): Promise<void> {
@@ -1856,10 +1923,32 @@ export class WorkflowService {
     this.#storeLeaseRelease = release
     try {
       await release
-      if (this.#storeLease === lease) this.#storeLease = undefined
+      if (this.#storeLease === lease) {
+        this.#storeLeaseLossUnsubscribe?.()
+        this.#storeLeaseLossUnsubscribe = undefined
+        this.#storeLease = undefined
+      }
     } finally {
       if (this.#storeLeaseRelease === release) this.#storeLeaseRelease = undefined
     }
+  }
+
+  #watchStoreLease(lease: WorkflowStoreLease | undefined): void {
+    this.#storeLeaseLossUnsubscribe?.()
+    this.#storeLeaseLossUnsubscribe = lease?.onOwnershipLost?.((error) => {
+      if (this.#storeLease !== lease || this.#lifecycle === 'STOPPED') return
+      // The backend has already closed writer admission before delivering this callback. Starting
+      // interruption cleanup synchronously closes service admission and wakes long-polls; retaining
+      // the old FD until that cleanup drains prevents descendants from extending split ownership.
+      console.error('[workflow-mcp] Durable ownership was lost:', error)
+      void this.#beginStop(
+        'Workflow service lost its durable ownership fence',
+        'interruption',
+        true,
+      ).catch(cleanupError => {
+        console.error('[workflow-mcp] Durable ownership failure cleanup failed:', cleanupError)
+      })
+    })
   }
 
   async #serializeIdempotentStart(

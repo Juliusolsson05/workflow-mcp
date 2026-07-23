@@ -16,6 +16,10 @@ import { dirname, join, resolve } from 'node:path'
 
 const LAYOUT_FILE = 'layout.json'
 const FORMAT = 'workflow-mcp-installation'
+export const RESTORE_IN_PROGRESS_FILE = '.restore-in-progress.json'
+export const RESTORE_PREPARING_FILE = '.restore-in-progress.preparing'
+export const RESTORE_RESET_CLAIM_FILE = '.restore-reset-claimed.json'
+export const RESTORE_RESET_PREPARING_FILE = '.restore-reset-claimed.preparing'
 export const CURRENT_LAYOUT_VERSION = 1
 const MAX_LAYOUT_BYTES = 64 * 1024
 const DURABLE_DIRECTORIES = [
@@ -68,6 +72,23 @@ export function inspectWorkflowDataLayout(dataDirectory: string): WorkflowDataLa
   const info = lstatSync(root)
   if (!info.isDirectory() || info.isSymbolicLink()) {
     throw new WorkflowDataLayoutError('layout-invalid', `Workflow data root is not a directory: ${root}`)
+  }
+  const restoreMarkers = [
+    RESTORE_IN_PROGRESS_FILE,
+    RESTORE_PREPARING_FILE,
+    RESTORE_RESET_CLAIM_FILE,
+    RESTORE_RESET_PREPARING_FILE,
+  ]
+  const restoreMarkerName = restoreMarkers.find(name => existsSync(join(root, name)))
+  if (restoreMarkerName !== undefined) {
+    // WHY: restore extracts into a new live volume because Docker named volumes cannot be renamed
+    // atomically. The durable poison marker is therefore the commit selector: even a partial tree
+    // containing a valid layout.json (or only legacy-looking directories) must never be repaired or
+    // opened until restore removes and fsyncs this marker after every archive byte is durable.
+    const restoreMarker = join(root, restoreMarkerName)
+    const markerInfo = lstatSync(restoreMarker)
+    const detail = markerInfo.isFile() && !markerInfo.isSymbolicLink() ? 'is incomplete' : 'has an invalid marker'
+    throw new WorkflowDataLayoutError('layout-invalid', `Workflow data restore ${detail}: ${restoreMarker}`)
   }
   const selector = join(root, LAYOUT_FILE)
   if (!existsSync(selector)) {

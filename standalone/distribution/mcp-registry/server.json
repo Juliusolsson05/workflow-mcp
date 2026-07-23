@@ -1,0 +1,103 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.juliusolsson05/workflow-mcp",
+  "title": "Workflow MCP",
+  "description": "Session-bound Docker workflow server through Codex. State is discarded with the container.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/Juliusolsson05/workflow-mcp/tree/main/standalone",
+  "repository": {
+    "url": "https://github.com/Juliusolsson05/workflow-mcp",
+    "source": "github",
+    "id": "1300795532",
+    "subfolder": "standalone"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "docker.io/juliusolsson05/workflow-mcp:0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OPENAI_API_KEY",
+          "description": "OpenAI API key used only by the contained Codex provider.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "WORKFLOW_MCP_CONCURRENCY",
+          "description": "Constrained session profile; the Docker-first daemon bundle provides the larger durable profile.",
+          "value": "1",
+          "format": "number"
+        }
+      ],
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--read-only",
+          "value": "true"
+        },
+        {
+          "type": "named",
+          "name": "--user",
+          "value": "10001:10001"
+        },
+        {
+          "type": "named",
+          "name": "--cap-drop",
+          "value": "ALL"
+        },
+        {
+          "type": "named",
+          "name": "--security-opt",
+          "value": "no-new-privileges:true"
+        },
+        {
+          "type": "named",
+          "name": "--pids-limit",
+          "value": "256"
+        },
+        {
+          "type": "named",
+          "name": "--memory",
+          "value": "2g"
+        },
+        {
+          "type": "named",
+          "name": "--cpus",
+          "value": "1"
+        },
+        {
+          "type": "named",
+          "name": "--tmpfs",
+          "value": "/tmp:size=256m,mode=1777,uid=10001,gid=10001"
+        },
+        {
+          "type": "named",
+          "name": "--tmpfs",
+          "value": "/run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001"
+        },
+        {
+          "type": "named",
+          "name": "--mount",
+          "value": "type=volume,target=/data"
+        },
+        {
+          "type": "named",
+          "name": "--mount",
+          "value": "type=bind,source={project},target=/workspace,readonly",
+          "variables": {
+            "project": {
+              "description": "Absolute project directory containing .claude/workflows and no .codex configuration.",
+              "format": "filepath",
+              "isRequired": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

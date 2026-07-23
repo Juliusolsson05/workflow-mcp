@@ -366,15 +366,39 @@ export class FileWorkflowStore implements WorkflowStore {
     })
     this.#leaseActive = true
     this.#writers.activate(() => backendLease.assertOwned())
+    let ownershipLoss: Error | undefined
+    const lossListeners = new Set<(error: Error) => void>()
+    const unsubscribeBackendLoss = backendLease.onOwnershipLost?.((error) => {
+      if (ownershipLoss !== undefined) return
+      ownershipLoss = error
+      // closeAndDrain closes #open synchronously before returning its promise. Do not await it here:
+      // notification must reach the service on this turn, while the eventual lease release remains
+      // responsible for awaiting every permit before closing the kernel descriptor.
+      void this.#writers.closeAndDrain()
+      for (const listener of lossListeners) listener(error)
+      lossListeners.clear()
+    })
     let released = false
     return {
       ownerId,
       generation: backendLease.generation,
+      ...(backendLease.onOwnershipLost === undefined ? {} : {
+        onOwnershipLost: (listener: (error: Error) => void) => {
+          if (ownershipLoss !== undefined) {
+            listener(ownershipLoss)
+            return () => undefined
+          }
+          lossListeners.add(listener)
+          return () => { lossListeners.delete(listener) }
+        },
+      }),
       release: async () => {
         if (released) return
         await this.#writers.closeAndDrain()
         await backendLease.release()
         released = true
+        unsubscribeBackendLoss?.()
+        lossListeners.clear()
         this.#leaseActive = false
         this.#writers.deactivate()
       },

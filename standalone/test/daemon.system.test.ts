@@ -34,14 +34,36 @@ describe('standalone daemon', () => {
       adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',
       webEnabled: true,
+      concurrency: 1,
     })
+    const privateProviderMessage = 'hostile stderr OPENAI_API_KEY=leaked /data/workspaces/private'
+    const privateProviderCode = 'hostile-/data/private-code'
     const daemon = await startStandaloneDaemon(config, {
-      provider: new FakeAgentProvider([{ outcome: { type: 'wait-for-abort' } }]),
+      provider: new FakeAgentProvider([{
+        events: [{ event: { type: 'warning', message: privateProviderMessage, code: privateProviderCode } }],
+        outcome: { type: 'wait-for-abort' },
+      }]),
     })
     const base = `http://127.0.0.1:${daemon.port}`
     expect(await (await fetch(`${base}/healthz`)).json()).toEqual({ status: 'live' })
     expect((await fetch(`${base}/readyz`)).status).toBe(200)
     expect((await fetch(`${base}/api/v1/instance`)).status).toBe(401)
+    const instanceResponse = await fetch(`${base}/api/v1/instance`, {
+      headers: { authorization: `Bearer ${daemon.tokens.web}` },
+    })
+    expect(instanceResponse.status).toBe(200)
+    const instanceBody = await instanceResponse.json() as Record<string, unknown>
+    expect(instanceBody).toMatchObject({
+      runtime: {
+        workspace: '/workspace',
+        mountMode: 'project-read-only',
+        authentication: { mode: 'interactive', status: 'operator-check-required' },
+        providerCapacity: 1,
+        uptimeSeconds: expect.any(Number),
+      },
+    })
+    // The UI needs the logical mount identity, never the embedded host fixture's private path.
+    expect(JSON.stringify(instanceBody)).not.toContain(workspace)
     expect((await stat(config.adminSocketPath)).mode & 0o777).toBe(0o600)
     const admin = new StandaloneAdminClient({
       socketPath: config.adminSocketPath,
@@ -79,6 +101,72 @@ describe('standalone daemon', () => {
     const body = await inventory.json() as { items: Array<Record<string, unknown>> }
     expect(body.items).toEqual([expect.objectContaining({ runId })])
     expect(JSON.stringify(body)).not.toContain(workspace)
+
+    let detailBody: {
+      state: { phases: Array<{ agentCount: number }>; agents: unknown[]; warnings: Array<{ code: string }> }
+    } | undefined
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const detail = await fetch(`${base}/api/v1/runs/${encodeURIComponent(runId)}`, {
+        headers: { authorization: `Bearer ${daemon.tokens.web}` },
+      })
+      expect(detail.status).toBe(200)
+      detailBody = await detail.json() as typeof detailBody
+      if (detailBody?.state.warnings.length) break
+      await new Promise(resolveWait => setTimeout(resolveWait, 5))
+    }
+    expect(detailBody).toBeDefined()
+    expect(detailBody.state.phases.every(phase => Number.isSafeInteger(phase.agentCount))).toBe(true)
+    expect(Array.isArray(detailBody.state.agents)).toBe(true)
+    expect(JSON.stringify(detailBody)).not.toContain(workspace)
+    expect(JSON.stringify(detailBody)).not.toContain(privateProviderMessage)
+    expect(JSON.stringify(detailBody)).not.toContain(privateProviderCode)
+    expect(detailBody!.state.warnings).toContainEqual(expect.objectContaining({ code: 'provider-warning' }))
+
+    const transcript = await fetch(`${base}/api/v1/runs/${encodeURIComponent(runId)}/agents/agent_1/transcript`, {
+      headers: { authorization: `Bearer ${daemon.tokens.web}` },
+    })
+    expect(transcript.status).toBe(200)
+    const transcriptText = await transcript.text()
+    expect(transcriptText).toContain('provider-warning')
+    expect(transcriptText).not.toContain(privateProviderMessage)
+    expect(transcriptText).not.toContain(privateProviderCode)
+    expect(transcriptText).not.toContain('fake-session-1')
+    expect(JSON.stringify(detailBody)).not.toContain('agentIds')
+
+    const originalSnapshot = daemon.application.service.snapshot.bind(daemon.application.service)
+    const privateErrorMessage = 'OPENAI_API_KEY=browser-leak /data/workspaces/hidden'
+    Object.defineProperty(daemon.application.service, 'snapshot', {
+      configurable: true,
+      value: async () => {
+        throw Object.assign(new Error(privateErrorMessage), { code: 'hostile-/data-error-code' })
+      },
+    })
+    const failedDetail = await fetch(`${base}/api/v1/runs/${encodeURIComponent(runId)}`, {
+      headers: { authorization: `Bearer ${daemon.tokens.web}` },
+    })
+    expect(failedDetail.status).toBe(500)
+    const failedBody = await failedDetail.text()
+    expect(failedBody).toContain('internal-error')
+    expect(failedBody).not.toContain(privateErrorMessage)
+    expect(failedBody).not.toContain('/data')
+    Object.defineProperty(daemon.application.service, 'snapshot', {
+      configurable: true,
+      value: originalSnapshot,
+    })
+
+    const originalLifecycleState = daemon.application.service.lifecycleState.bind(daemon.application.service)
+    Object.defineProperty(daemon.application.service, 'lifecycleState', {
+      configurable: true,
+      value: () => 'FAILED',
+    })
+    // Readiness is derived from the service lifecycle, not merely the startup-complete boolean. The
+    // inherited-flock monitor changes the former asynchronously when its pathname is replaced.
+    expect(daemon.ready()).toBe(false)
+    expect((await fetch(`${base}/readyz`)).status).toBe(503)
+    Object.defineProperty(daemon.application.service, 'lifecycleState', {
+      configurable: true,
+      value: originalLifecycleState,
+    })
 
     await daemon.close('test container replacement')
     expect((await daemon.application.store.getManifest(runId))?.status).toBe('interrupted')

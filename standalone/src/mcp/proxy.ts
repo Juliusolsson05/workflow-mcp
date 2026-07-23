@@ -57,36 +57,63 @@ export async function startWorkflowMcpProxy(options: {
       ...(instructions === undefined ? {} : { instructions }),
     },
   )
-  localServer.setRequestHandler(ListToolsRequestSchema, request => (
+  let activeRequests = 0
+  const drainWaiters = new Set<() => void>()
+  const withActiveRequest = async <T>(operation: () => Promise<T>): Promise<T> => {
+    activeRequests += 1
+    try {
+      return await operation()
+    } finally {
+      activeRequests -= 1
+      if (activeRequests === 0) {
+        for (const resolve of drainWaiters) resolve()
+        drainWaiters.clear()
+      }
+    }
+  }
+  localServer.setRequestHandler(ListToolsRequestSchema, request => withActiveRequest(() => (
     remote.listTools(request.params, { timeout: 30_000 })
-  ))
-  let inFlight = 0
+  )))
+  let inFlightToolCalls = 0
   localServer.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    if (inFlight >= MAX_IN_FLIGHT_TOOL_CALLS) {
+    if (inFlightToolCalls >= MAX_IN_FLIGHT_TOOL_CALLS) {
       throw new Error(`Workflow MCP proxy has ${MAX_IN_FLIGHT_TOOL_CALLS} tool calls in flight`)
     }
-    inFlight += 1
-    try {
+    inFlightToolCalls += 1
+    return withActiveRequest(async () => {
       return await remote.callTool(request.params, undefined, {
         signal: extra.signal,
         timeout: 60_000,
         maxTotalTimeout: 24 * 60 * 60 * 1_000,
       })
-    } finally {
-      inFlight -= 1
-    }
+    }).finally(() => { inFlightToolCalls -= 1 })
   })
 
   const stdio = new StdioServerTransport()
   await localServer.connect(stdio)
   let closePromise: Promise<void> | undefined
-  return {
-    close(): Promise<void> {
-      if (closePromise !== undefined) return closePromise
-      closePromise = (async () => {
-        await Promise.allSettled([localServer!.close(), remote.close()])
-      })()
-      return closePromise
-    },
+  const closeProxy = (drainInput: boolean): Promise<void> => {
+    if (closePromise !== undefined) return closePromise
+    closePromise = (async () => {
+      process.stdin.off('end', closeAfterInput)
+      process.stdin.off('close', closeAfterInput)
+      if (drainInput && activeRequests > 0) {
+        await new Promise<void>(resolve => { drainWaiters.add(resolve) })
+      }
+      // Request handlers settle before the SDK serializes their JSON-RPC responses. One event-loop
+      // turn lets that continuation flush stdout before transport.close clears the stdio buffer.
+      if (drainInput) await new Promise<void>(resolve => { setImmediate(resolve) })
+      await Promise.allSettled([localServer!.close(), remote.close()])
+    })()
+    return closePromise
   }
+  const close = (): Promise<void> => closeProxy(false)
+  const closeAfterInput = (): void => { void closeProxy(true) }
+  // SDK 1.29's StdioServerTransport listens for data/error but not EOF. In a Docker `compose exec
+  // -T` proxy that leaves the process (and release/host client) alive forever after the MCP client
+  // closes stdin. Treating both end and close as an idempotent transport disconnect preserves the
+  // daemon's independent lifetime while allowing the tiny per-client adapter to terminate.
+  process.stdin.once('end', closeAfterInput)
+  process.stdin.once('close', closeAfterInput)
+  return { close }
 }

@@ -125,8 +125,14 @@ provider-neutral AgentProvider
 
 ## Getting started
 
-Requires Node ≥ 20.14. Codex execution reuses your existing Codex CLI login or
-the SDK's API-key mode.
+The Docker-first standalone product needs no host Node or Codex installation. It ships one
+project-scoped daemon, a Codex MCP proxy, terminal UI, optional local web UI, isolated credentials,
+and durable named-volume state. Start with the verified release and operator guide in
+[`standalone/README.md`](standalone/README.md); the full decisions and support boundaries are in
+[`standalone/docs/adr`](standalone/docs/adr/README.md).
+
+For core-library development, Node ≥ 20.19 is required. A source checkout can build and test both
+the provider-neutral runtime and isolated standalone package:
 
 ```bash
 npm install --include=dev
@@ -278,29 +284,28 @@ registerWorkflowMcpTools(mcpServer, service, { cwd: projectDirectory, clientId: 
 - **[docs/RELIABILITY_IMPLEMENTATION_PLAN.md](docs/RELIABILITY_IMPLEMENTATION_PLAN.md)** —
   the unattended-execution and failure-domain plan.
 
-## Built for Agent Code
+## Agent Code and standalone use
 
-`workflow-mcp` was built as a feature of
+`workflow-mcp` began as a feature of
 [**Agent Code**](https://github.com/Juliusolsson05/agent-code) — an open-source
 Electron IDE for driving the real Claude Code and Codex CLIs across a
 multi-agent workspace. Agent Code embeds this runtime through its existing MCP
 host and renders each run as a live, first-class feed card: phases and agents as
 vertical lists, with prompt, activity, and outcome expandable inline.
 
-That embedded path is the most polished way to use `workflow-mcp` today. The
-runtime was designed from the start to stand on its own — the CLI and the
-standalone stdio / loopback-HTTP MCP server already run workflows outside Agent
-Code — but **better support for standalone execution is on its way**: a
-supervised host so runs keep progressing across restarts without a desktop app
-present, smoother first-run setup, and more provider adapters beyond Codex.
+That embedded path remains supported, but it is no longer required. The Docker-first product above
+adds the supervised owner, project-scoped Codex MCP proxy, terminal and optional browser clients,
+credential and authoring controls, offline maintenance, and verified release machinery needed to
+run without the desktop application. Generic OCI/MCP-registry mode is intentionally session-bound;
+use the checksummed Compose bundle when runs must outlive an MCP client connection.
 
 ## Status
 
-Early. The loader, execution runtime, durable service, MCP facade, standalone
-server, deterministic fake provider, and pinned Codex adapter are in place;
-Agent Code embeds the same service. Compatibility is pinned to an **observed**
-Claude Code profile — a snapshot of a fast-moving upstream, not a promise about
-future versions.
+The loader, execution runtime, durable service, MCP facade, Agent Code embedding, and Docker-first
+standalone implementation are in place. The first stable container release still requires the
+external platform qualification, protected release controls, and registry publication documented
+in the standalone implementation ledger. Compatibility is pinned to an **observed** Claude Code
+profile — a snapshot of a fast-moving upstream, not a promise about future versions.
 
 ## License
 

@@ -1,0 +1,88 @@
+name: Container CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-launcher-contract:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+      - name: Exercise the default PowerShell installation path
+        shell: pwsh
+        run: |
+          node standalone/scripts/build-install-bundle.mjs `
+            --output="$env:RUNNER_TEMP/workflow-mcp-windows-install" `
+            --image=workflow-mcp:windows-smoke
+          & ./standalone/scripts/windows-launcher-smoke.ps1 `
+            -Bundle "$env:RUNNER_TEMP/workflow-mcp-windows-install"
+
+  image-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Every third-party action is pinned to a reviewed full commit. The trailing version comment
+      # is for Dependabot/human upgrade context; mutable major tags are never execution authority.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+      - name: Build one native test image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: standalone/docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: workflow-mcp:ci
+          build-args: |
+            VERSION=0.1.0-ci
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=workflow-mcp-amd64
+          cache-to: type=gha,scope=workflow-mcp-amd64,mode=max
+      - name: Exercise final-image contracts
+        run: standalone/scripts/container-smoke.sh workflow-mcp:ci
+      - name: Exercise a clean documented launcher installation
+        run: |
+          node standalone/scripts/build-install-bundle.mjs \
+            --output=${{ runner.temp }}/workflow-mcp-install --image=workflow-mcp:ci
+          ${{ runner.temp }}/workflow-mcp-install/launcher-smoke.sh \
+            ${{ runner.temp }}/workflow-mcp-install
+      - name: Validate Compose profiles
+        env:
+          WORKFLOW_MCP_IMAGE: workflow-mcp:ci
+          WORKFLOW_MCP_INSTANCE_ID: 11111111-2222-4333-8444-555555555555
+          WORKFLOW_MCP_PROJECT_HASH: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          WORKFLOW_MCP_PROJECT_DIR: ${{ github.workspace }}
+          WORKFLOW_MCP_WORKFLOW_DIR: ${{ github.workspace }}/.claude/workflows
+          WORKFLOW_MCP_PORT: "7331"
+          WORKFLOW_MCP_OPENAI_API_KEY_FILE: ${{ runner.temp }}/unused-api-key
+        run: |
+          touch "$WORKFLOW_MCP_OPENAI_API_KEY_FILE"
+          docker compose -f standalone/compose.yaml config --quiet
+          docker compose -f standalone/compose.yaml -f standalone/compose.web.yaml config --quiet
+          docker compose -f standalone/compose.yaml -f standalone/compose.authoring.yaml config --quiet
+          docker compose -f standalone/compose.yaml -f standalone/compose.auth-api-key.yaml config --quiet

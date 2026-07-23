@@ -5,6 +5,6 @@ services:
     ports:
       - name: local-api
         target: 7331
-        published: "${WORKFLOW_MCP_PORT:?explicit or launcher-allocated loopback port required}"
+        published: "${WORKFLOW_MCP_PORT:?explicit launcher-selected loopback port required}"
         host_ip: 127.0.0.1
         protocol: tcp

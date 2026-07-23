@@ -6,4 +6,4 @@ services:
     environment:
       WORKFLOW_MCP_PROJECT_CODEX_MASKED: "true"
     tmpfs:
-      - /workspace/.codex:size=1m,mode=0555,uid=10001,gid=10001
+      - /workspace/.codex:ro,size=1m,mode=0555,uid=10001,gid=10001
