@@ -128,6 +128,26 @@ docker run --rm --network none --read-only --user 10001:10001 \
   --tmpfs /workspace/.codex:ro,size=1m,mode=0555,uid=10001,gid=10001 \
   --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null
 
+# REGRESSION: a genuinely mounted mask must be accepted even when the caller rebuilt a minimal
+# environment and dropped the attestation variable. The credential broker does exactly that so a
+# login child cannot inherit credentials, and because installation always writes the project Codex
+# stanza into <project>/.codex, dropping the flag made `auth status`/`auth login` refuse on 100% of
+# default installations — surfacing to operators as an unreadable EPIPE. The mount, not the
+# variable, is the security boundary; proving it here keeps that fix from silently regressing.
+docker run --rm --network none --read-only --user 10001:10001 \
+  --mount "type=bind,src=$temporary/catalog-workspace,dst=/workspace,readonly" \
+  --tmpfs /workspace/.codex:ro,size=1m,mode=0555,uid=10001,gid=10001 \
+  --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null
+
+# The converse must still hold with the flag absent: an unmasked project `.codex` is refused, so
+# trusting the mount never became "trust anything".
+if docker run --rm --network none --read-only --user 10001:10001 \
+  --mount "type=bind,src=$temporary/catalog-workspace,dst=/workspace,readonly" \
+  --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null 2>&1; then
+  echo 'unmasked project Codex configuration was accepted without the attestation flag' >&2
+  exit 1
+fi
+
 # Authoring uses the same immutable policy but a real nested writable mount. Prove that exact
 # allowlist can perform durable file primitives while sibling project paths, state, credentials,
 # process metadata, admin/daemon endpoints, external network, and detached descendants stay denied.

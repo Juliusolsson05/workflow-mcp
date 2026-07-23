@@ -7,26 +7,31 @@ policy_launcher=/opt/workflow-mcp/bin/codex-policy-launcher.mjs
 # Docker cannot create a nested tmpfs mountpoint under a read-only bind when `.codex` does not
 # already exist. The launcher therefore selects the mask overlay only for an existing directory;
 # this attempt-time refusal closes the race where the host creates a project config afterwards.
-if [ "${WORKFLOW_MCP_PROJECT_CODEX_MASKED:-false}" = true ]; then
-  # The environment bit is only an attestation request; the mount is the security boundary. Check
-  # it again at every attempt so a contaminated reusable Catalog volume or broken Compose overlay
-  # cannot turn a trusted boolean into project-controlled Codex configuration authority.
+#
+# WHY the mount is the source of truth rather than WORKFLOW_MCP_PROJECT_CODEX_MASKED: that variable
+# was only ever an attestation REQUEST, while the mount is the actual security boundary — which is
+# why it was always re-proven below. Gating on the variable first meant any caller that rebuilt a
+# minimal environment silently lost the attestation and hit the unmasked refusal even though a
+# correct mask was mounted. The credential broker does exactly that (it strips the environment down
+# to PATH/LANG/TERM/HOME/CODEX_HOME so a login child cannot inherit credentials), and because a
+# default install always writes the project Codex stanza into <project>/.codex, `auth status` and
+# `auth login` failed on 100% of default installations with an opaque exit 77 that surfaced to
+# operators as EPIPE. Proving the mask directly fixes that whole class — every caller, not just the
+# broker — without loosening anything: an unproven `.codex` is still refused exactly as before.
+if [ -e /workspace/.codex ] || [ -L /workspace/.codex ]; then
   if [ ! -d /workspace/.codex ] || [ -L /workspace/.codex ]; then
     echo "codex-isolated: project Codex mask is not an ordinary directory" >&2
     exit 77
   fi
   [ -z "$(find /workspace/.codex -mindepth 1 -maxdepth 1 -print -quit)" ] || {
-    echo "codex-isolated: project Codex mask is not empty" >&2
+    echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
     exit 77
   }
   if ! awk '$5 == "/workspace/.codex" { found=1 } END { if (!found) exit 3 }' /proc/self/mountinfo \
     || [ -w /workspace/.codex ]; then
-    echo "codex-isolated: project Codex mask is absent or effectively writable" >&2
+    echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
     exit 77
   fi
-elif [ -e /workspace/.codex ] || [ -L /workspace/.codex ]; then
-  echo "codex-isolated: refusing unmasked project /workspace/.codex configuration" >&2
-  exit 77
 fi
 
 if [ -n "${WORKFLOW_MCP_OPENAI_API_KEY_FILE:-}" ]; then

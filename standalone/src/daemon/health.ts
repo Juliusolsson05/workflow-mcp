@@ -64,6 +64,31 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
       message: error instanceof Error ? error.message : String(error),
     })
   }
+  // WHY agent-startup is its own check: readiness proves the HTTP surface and store ownership, and
+  // says nothing about whether the provider can execute. A daemon whose every agent will fail still
+  // reports READY, the dashboard looks healthy, and the operator only learns otherwise hours later
+  // from an EPIPE buried in a workflow result — because the isolation wrapper exits before the SDK
+  // can write the prompt. Run the exact wrapper the provider runs and surface its own refusal text
+  // (unmasked project .codex, missing login) in `doctor`, which is the command operators are told
+  // to run. Cheap: the wrapper's gates and `--version` only, no model call.
+  if (process.platform === 'linux' && basename(config.codexExecutable) === 'codex-isolated') {
+    try {
+      await executeAgentStartupProbe(config.codexExecutable)
+      checks.push({
+        id: 'agent-startup',
+        status: 'pass',
+        message: 'the provider isolation wrapper starts, so workflow agents can be launched',
+      })
+    } catch (error) {
+      checks.push({
+        id: 'agent-startup',
+        status: 'fail',
+        message: `workflow agents cannot start: ${
+          error instanceof Error ? error.message.slice(0, 400) : String(error).slice(0, 400)
+        }`,
+      })
+    }
+  }
   await pathCheck(checks, 'workspace-readable', config.workspace, constants.R_OK | constants.X_OK)
   await pathCheck(checks, 'data-writable', config.dataDirectory, constants.R_OK | constants.W_OK | constants.X_OK)
   await pathCheck(checks, 'codex-executable', config.codexExecutable, constants.R_OK | constants.X_OK)
@@ -167,6 +192,34 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
     dependencies: { codexSdk: CODEX_SDK_VERSION, mcpSdk: MCP_SDK_VERSION },
     checks,
   }
+}
+
+async function executeAgentStartupProbe(executable: string): Promise<void> {
+  // Deliberately the plain wrapper entry with `--version`: it passes exactly the gates a real
+  // attempt passes (project `.codex` masking, credential-secret readability) and then exits without
+  // contacting a model or mutating durable state. Its stderr is the operator-facing sentence we
+  // want in doctor, so surface that rather than a generic exit-code message. Isolate HOME/CODEX_HOME
+  // to a one-shot /tmp tree for the same reason the policy probe does: an observational command must
+  // not create Codex lock or cache entries in the durable volume without the daemon's flock.
+  const probeRoot = await mkdtemp('/tmp/workflow-mcp-doctor-startup-')
+  const probeHome = join(probeRoot, 'home')
+  try {
+    await mkdir(probeHome, { mode: 0o700 })
+    await execute(executable, ['--version'], {
+      timeout: 15_000,
+      maxBuffer: 64 * 1_024,
+      env: { ...process.env, HOME: probeHome, CODEX_HOME: probeHome, TMPDIR: probeRoot },
+    })
+  } catch (error) {
+    const stderr = isRecord(error) && typeof error.stderr === 'string' ? error.stderr.trim() : ''
+    throw new Error(stderr.length > 0 ? stderr : (error instanceof Error ? error.message : String(error)))
+  } finally {
+    await rm(probeRoot, { recursive: true, force: true })
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }
 
 async function executeCodexPolicyProbe(executable: string): Promise<string> {

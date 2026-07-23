@@ -278,7 +278,41 @@ load_instance() {
   [ "$docker_daemon_fingerprint" = "$recorded_daemon_fingerprint" ] ||
     fail "Docker daemon changed since install; cross-daemon identity import is not supported in v1"
   actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
-  [ "$actual_hash" = "$project_hash" ] || fail "instance.json belongs to a different canonical project path"
+  if [ "$actual_hash" != "$project_hash" ]; then
+    # WHY a same-directory fallback instead of a flat refusal: this launcher is `#!/bin/sh`, and a
+    # POSIX shell's `pwd -P` returns the spelling the caller typed, not the one stored on disk. On
+    # macOS's case-insensitive volumes `cd ~/desktop` and `cd ~/Desktop` therefore canonicalize to
+    # different strings for one directory, so an install recorded through one spelling refused every
+    # command issued through the other — including the PATH shim, which resolves from the user's own
+    # $PWD and so broke in one terminal while working in another.
+    #
+    # Identity still may not cross directories: only a path that IS the recorded directory is
+    # accepted, proven by comparing device+inode rather than by comparing strings. A moved, copied,
+    # or unrelated project still has a different inode and is still refused. On success adopt the
+    # recorded spelling so the hash, bind source, and Compose project name remain byte-identical to
+    # installation.
+    # shellcheck disable=SC2154
+    same_directory=false
+    if [ -n "${recorded_project_directory:-}" ] && [ -d "$recorded_project_directory" ]; then
+      # `ls -di DIR/.` prints only "<inode> <path>" for the directory itself, and just the leading
+      # inode field is read — no filename is parsed, so SC2012's filename-safety concern does not
+      # apply. `find -printf` would be the suggested alternative but is GNU-only and this launcher
+      # must run against BSD find on macOS.
+      # shellcheck disable=SC2012
+      current_identity=$(ls -di "$project_directory/." 2>/dev/null | awk '{ print $1 }')
+      # shellcheck disable=SC2012
+      recorded_identity=$(ls -di "$recorded_project_directory/." 2>/dev/null | awk '{ print $1 }')
+      if [ -n "$current_identity" ] && [ "$current_identity" = "$recorded_identity" ]; then
+        same_directory=true
+      fi
+    fi
+    [ "$same_directory" = true ] ||
+      fail "instance.json belongs to a different canonical project path"
+    project_directory=$recorded_project_directory
+    actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
+    [ "$actual_hash" = "$project_hash" ] ||
+      fail "instance.json belongs to a different canonical project path"
+  fi
   export WORKFLOW_MCP_IMAGE WORKFLOW_MCP_INSTANCE_ID="$instance_id"
   export WORKFLOW_MCP_PROJECT_HASH="$project_hash" WORKFLOW_MCP_PROJECT_DIR="$project_directory"
   export WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT="$docker_daemon_fingerprint"
