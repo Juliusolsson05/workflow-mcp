@@ -30,6 +30,11 @@ export async function createStandaloneApplication(
   // The native image launcher already holds flock before Node starts. Only this global layout
   // decision is allowed before WorkflowService adopts the descriptor; FileWorkflowStore repair is
   // still deferred until after the injected backend has validated and activated writer permits.
+  if (config.leaseMode === 'inherited-flock' && config.lockFileDescriptor === undefined) {
+    throw new Error(
+      'Durable owner startup requires WORKFLOW_MCP_LOCK_FD from the native image launcher',
+    )
+  }
   const layout = prepareWorkflowDataLayout(config.dataDirectory)
   const leaseBackend = config.leaseMode === 'inherited-flock'
     ? new InheritedFlockLeaseBackend({

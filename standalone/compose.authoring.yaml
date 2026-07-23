@@ -1,0 +1,11 @@
+services:
+  workflow-mcp:
+    environment:
+      WORKFLOW_MCP_SOURCE_MODE: authoring
+    volumes:
+      - type: bind
+        source: ${WORKFLOW_MCP_WORKFLOW_DIR:?absolute .claude/workflows path required}
+        target: /workspace/.claude/workflows
+        read_only: false
+        bind:
+          create_host_path: false

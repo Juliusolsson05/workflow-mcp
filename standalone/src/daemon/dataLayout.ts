@@ -26,6 +26,7 @@ const DURABLE_DIRECTORIES = [
   'secrets',
   'approvals',
   'backups',
+  'workspaces',
 ] as const
 
 export type WorkflowDataLayout = Readonly<{
@@ -35,10 +36,13 @@ export type WorkflowDataLayout = Readonly<{
   formats: Readonly<{
     store: 1
     journal: 2
+    indexes: 1
     approvals: 1
     tokens: 1
     configuration: 1
     credentials: 1
+    workspaces: 1
+    backups: 1
   }>
 }>
 
@@ -129,10 +133,13 @@ export function prepareWorkflowDataLayout(dataDirectory: string): WorkflowDataLa
     formats: Object.freeze({
       store: 1,
       journal: 2,
+      indexes: 1,
       approvals: 1,
       tokens: 1,
       configuration: 1,
       credentials: 1,
+      workspaces: 1,
+      backups: 1,
     }),
   })
   writeSelectorAtomically(join(root, LAYOUT_FILE), layout)
@@ -178,10 +185,13 @@ function parseLayout(value: unknown, path: string): WorkflowDataLayout {
     !isObject(value.formats) ||
     value.formats.store !== 1 ||
     value.formats.journal !== 2 ||
+    value.formats.indexes !== 1 ||
     value.formats.approvals !== 1 ||
     value.formats.tokens !== 1 ||
     value.formats.configuration !== 1 ||
-    value.formats.credentials !== 1
+    value.formats.credentials !== 1 ||
+    value.formats.workspaces !== 1 ||
+    value.formats.backups !== 1
   ) {
     throw new WorkflowDataLayoutError('layout-invalid', `Workflow layout is unsupported: ${path}`)
   }
@@ -192,10 +202,13 @@ function parseLayout(value: unknown, path: string): WorkflowDataLayout {
     formats: Object.freeze({
       store: 1,
       journal: 2,
+      indexes: 1,
       approvals: 1,
       tokens: 1,
       configuration: 1,
       credentials: 1,
+      workspaces: 1,
+      backups: 1,
     }),
   })
 }

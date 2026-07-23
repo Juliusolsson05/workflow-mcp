@@ -17,7 +17,17 @@ describe('workflow data layout', () => {
     expect(layout).toMatchObject({
       format: 'workflow-mcp-installation',
       version: 1,
-      formats: { store: 1, journal: 2, approvals: 1, tokens: 1 },
+      formats: {
+        store: 1,
+        journal: 2,
+        indexes: 1,
+        approvals: 1,
+        tokens: 1,
+        configuration: 1,
+        credentials: 1,
+        workspaces: 1,
+        backups: 1,
+      },
     })
     expect(inspectWorkflowDataLayout(root)).toMatchObject({ state: 'ready', layout })
   })
