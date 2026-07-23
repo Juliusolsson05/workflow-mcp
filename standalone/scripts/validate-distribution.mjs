@@ -21,7 +21,7 @@ const releaseWorkflow = await readFile(join(root, '../.github/workflows/containe
 if (server.$schema !== 'https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json') {
   throw new Error('MCP Registry metadata must pin the reviewed 2025-12-11 schema')
 }
-if (server.name !== 'io.github.juliusolsson05/workflow-mcp') throw new Error('MCP server name drifted')
+if (server.name !== 'io.github.Juliusolsson05/workflow-mcp') throw new Error('MCP server name drifted')
 if (server.version !== packageDocument.version) throw new Error('Standalone and MCP Registry versions differ')
 if (server.packages?.length !== 1 || server.packages[0]?.registryType !== 'oci') {
   throw new Error('MCP Registry metadata must contain one OCI package')
@@ -52,10 +52,10 @@ for (const [name, value] of [
 if (!server.description.includes('Session-bound') || !server.description.includes('State is discarded')) {
   throw new Error('MCP Registry metadata must disclose its ephemeral compatibility lifecycle')
 }
-if (server.packages[0].identifier !== `docker.io/juliusolsson05/workflow-mcp:${packageDocument.version}`) {
+if (server.packages[0].identifier !== `docker.io/juliusolsson/workflow-mcp:${packageDocument.version}`) {
   throw new Error('MCP Registry image/version differs from the standalone release')
 }
-if (!/io\.modelcontextprotocol\.server\.name="io\.github\.juliusolsson05\/workflow-mcp"/.test(dockerfile)) {
+if (!/io\.modelcontextprotocol\.server\.name="io\.github\.Juliusolsson05\/workflow-mcp"/.test(dockerfile)) {
   throw new Error('OCI image lacks the exact MCP ownership label')
 }
 if (!dockerfile.includes('https://github.com/Juliusolsson05/workflow-mcp')) {
@@ -156,7 +156,7 @@ if (activeGrypeConfiguration !== [
 ].join('\n')) {
   throw new Error('Grype suppression must remain the one exact Linux-inapplicable Git for Windows advisory')
 }
-if (!catalog.includes('image: docker.io/juliusolsson05/workflow-mcp:${VERSION}') || !catalog.includes('commit: ${REVISION}')) {
+if (!catalog.includes('image: docker.io/juliusolsson/workflow-mcp:${VERSION}') || !catalog.includes('commit: ${REVISION}')) {
   throw new Error('Docker Catalog metadata must retain explicit release substitution tokens')
 }
 const renderedCatalog = catalog

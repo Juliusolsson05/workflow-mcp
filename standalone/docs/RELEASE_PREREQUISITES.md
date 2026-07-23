@@ -6,10 +6,10 @@ not repository files and cannot be created safely by a pull request.
 Current audit on 2026-07-23: **not ready to publish**. GitHub immutable releases are disabled,
 neither protected release-preflight nor publication environment exists, no repository ruleset
 exists, private vulnerability reporting is disabled, and the public Docker Hub
-repository `juliusolsson05/workflow-mcp` returns 404. Do not create `v0.1.0` until this checklist is
+repository `juliusolsson/workflow-mcp` now exists (created 2026-07-23). Do not create `v0.1.0` until this checklist is
 complete; GitHub release immutability does not retroactively protect an earlier release.
 
-1. Create the public Docker Hub repository `juliusolsson05/workflow-mcp`.
+1. DONE 2026-07-23: public Docker Hub repository `juliusolsson/workflow-mcp` created (the operator's real Hub account is `juliusolsson`; `juliusolsson05` never existed on Docker Hub).
 2. Configure the repository's specific-tag immutability rule exactly as
    `^[0-9]+\.[0-9]+\.[0-9]+$`. It must be the only immutable-tag regex: an additional rule can
    freeze the resumable `candidate-*`, compatible-minor, or `latest` tags even when this exact rule

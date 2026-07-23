@@ -100,7 +100,7 @@ Use values copied from the candidate job summary and the immutable tag commit. `
 ```sh
 set -eu
 umask 077
-IMAGE=docker.io/juliusolsson05/workflow-mcp
+IMAGE=docker.io/juliusolsson/workflow-mcp
 DIGEST=sha256:REPLACE_WITH_64_HEX_DIGEST
 VERSION=X.Y.Z
 REVISION=REPLACE_WITH_40_HEX_COMMIT

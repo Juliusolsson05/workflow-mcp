@@ -285,7 +285,7 @@ keeps arbitrary local processes from *driving* runs through the HTTP MCP endpoin
 
 ### 6.1 Facts (from the release/distribution survey)
 
-- Image publishes to `docker.io/juliusolsson05/workflow-mcp` (`container-release.yml:20`),
+- Image publishes to `docker.io/juliusolsson/workflow-mcp` (namespace corrected 2026-07-23: the operator's real Hub account is `juliusolsson`) (`container-release.yml:20`),
   immutable `:X.Y.Z` first (`:589-607`), then `:X.Y` and `:latest` (`:707-718`);
   multi-arch, cosign-signed, SBOM/provenance-attested. **No release exists yet**; ten
   external prerequisites are open (`RELEASE_PREREQUISITES.md:6-38` — Docker Hub repo +

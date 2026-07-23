@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: docker.io/juliusolsson05/workflow-mcp
+  IMAGE: docker.io/juliusolsson/workflow-mcp
 
 jobs:
   validate:
@@ -90,6 +90,11 @@ jobs:
           npm ci --include=dev
           npm --prefix standalone ci --include=dev
           npm run typecheck
+          # The standalone package resolves `workflow-mcp` through its file:.. dependency, whose
+          # types live in the root dist. A fresh checkout has no dist, so standalone's typecheck
+          # fails with TS2307 unless the root package is built first — caught by the first real
+          # v0.1.0 release run; every other CI surface happened to build the root before checking.
+          npm run build
           npm --prefix standalone run check
 
   release-control-preflight:
@@ -165,7 +170,7 @@ jobs:
           ')
           repository=$(curl --fail --silent --show-error \
             --header "Authorization: Bearer $bearer" \
-            https://hub.docker.com/v2/namespaces/juliusolsson05/repositories/workflow-mcp)
+            https://hub.docker.com/v2/namespaces/juliusolsson/repositories/workflow-mcp)
           # WHY: proving that the SemVer regex is present is insufficient when a second rule can
           # also freeze candidate, compatible-minor, or latest tags. That drift can make the
           # qualification rerun or convenience-tag update fail only after public state exists.
@@ -193,7 +198,7 @@ jobs:
       - name: Install pinned Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          cosign-release: v3.0.6
+          cosign-release: v2.4.3
       - name: Discover a previously signed candidate checkpoint
         id: checkpoint
         shell: bash
@@ -290,7 +295,7 @@ jobs:
               const labels=JSON.parse(process.argv[1]);
               if(labels["org.opencontainers.image.revision"]!==process.env.GITHUB_SHA) process.exit(1);
               if(labels["org.opencontainers.image.version"]!==process.argv[2]) process.exit(1);
-              if(labels["io.modelcontextprotocol.server.name"]!=="io.github.juliusolsson05/workflow-mcp") process.exit(1);
+              if(labels["io.modelcontextprotocol.server.name"]!=="io.github.Juliusolsson05/workflow-mcp") process.exit(1);
             ' "$raw" "${{ needs.validate.outputs.version }}"
             raw=$(docker buildx imagetools inspect --raw "$IMAGE@$attestation")
             node -e '
@@ -298,7 +303,12 @@ jobs:
               const child=process.argv[2];
               if(manifest.subject!==undefined&&manifest.subject?.digest!==child) process.exit(1);
               const types=new Set((manifest.layers??[]).map(layer=>layer.annotations?.["in-toto.io/predicate-type"]));
-              if(!types.has("https://slsa.dev/provenance/v0.2") || !types.has("https://spdx.dev/Document")) process.exit(1);
+              // WHY both SLSA versions: the predicate version is chosen by the pinned BuildKit,
+              // not by this workflow — current BuildKit emits provenance v1 where older releases
+              // emitted v0.2 (the first real v0.1.0 run failed on exactly this drift, with both
+              // attestations present and correct). Either version proves the same mode=max
+              // provenance requirement; absence of any SLSA predicate remains fatal.
+              if(!(types.has("https://slsa.dev/provenance/v1") || types.has("https://slsa.dev/provenance/v0.2")) || !types.has("https://spdx.dev/Document")) process.exit(1);
             ' "$raw" "$child"
           done <<EOF
           $descriptors
@@ -309,6 +319,14 @@ jobs:
           COSIGN_YES: "true"
         run: |
           if [ "${{ steps.checkpoint.outputs.exists }}" != true ]; then
+            # WHY cosign is pinned to v2.4.3 (see cosign-installer above): cosign v3 defaults to
+            # --new-bundle-format=true / the OCI 1.1 referrers API, which Docker Hub does not serve
+            # compatibly — sign exits 0 but writes no discoverable signature and the verify below
+            # fails "no signatures found" (the exact failure the first real v0.1.0 builds hit, and
+            # --registry-referrers-mode is not even a valid sign flag to override it). cosign v2
+            # writes the tag-based sha256-<digest>.sig artifact Docker Hub fully supports, with no
+            # flags, and its verify discovers the same tag. The RELEASE_NOTES verify example needs
+            # no special flags for the same reason.
             cosign sign "$IMAGE@${{ steps.identity.outputs.digest }}"
           fi
           cosign verify "$IMAGE@${{ steps.identity.outputs.digest }}" \
@@ -354,7 +372,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="docker.io/juliusolsson05/workflow-mcp@${{ needs.build.outputs.digest }}"
+          image="docker.io/juliusolsson/workflow-mcp@${{ needs.build.outputs.digest }}"
           docker pull --platform "${{ matrix.platform }}" "$image"
           test "$(docker run --rm --entrypoint /bin/uname "$image" -m)" = "${{ matrix.uname }}"
       - name: Enable nested Codex sandbox namespaces on the disposable runner
@@ -516,7 +534,7 @@ jobs:
           Backup/restore: offline, exact-instance/project identity, credentials excluded.
           Image: $IMAGE@$digest
 
-          Verify the image signature:
+          Verify the image signature (legacy tag-based signatures; required on Docker Hub):
           cosign verify $IMAGE@$digest --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME
 
           BuildKit attached SPDX SBOM and SLSA provenance attestations to both native manifest members.
@@ -557,6 +575,26 @@ jobs:
           echo 'ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac  publisher/mcp-publisher_linux_amd64.tar.gz' | sha256sum --check
           tar -xzf "publisher/$publisher_asset" -C publisher mcp-publisher
           publisher/mcp-publisher validate metadata/server.json
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # WHY this repeats the build job's setup: publish is a SEPARATE fresh runner, and the
+          # pre-publication launcher smoke runs `doctor`, whose codex-policy check launches the same
+          # nested Bubblewrap probe. Ubuntu 24.04 restricts unprivileged user namespaces by default,
+          # so without this the probe fails, doctor returns exit 3, and publication is blocked even
+          # though the candidate is sound — the exact latent failure the first real v0.1.0 release
+          # surfaced. These host changes last only for this no-secret VM.
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
+          fi
       - name: Reproduce the bundle from the candidate image and smoke it before publication
         shell: bash
         run: |
@@ -742,7 +780,24 @@ jobs:
           # WHY: pinning only the installer action still follows that action's changing default
           # Cosign release. Post-publication verification must use the same reviewed binary as the
           # pre-publication signature gate, or a default bump can make recovery nondeterministic.
-          cosign-release: v3.0.6
+          cosign-release: v2.4.3
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The post-publication release smoke is a third fresh runner that also runs the launcher
+          # smoke's doctor codex-policy Bubblewrap probe; it needs the same Ubuntu-24.04 userns
+          # relaxation as the build and publish jobs. Host changes last only for this no-secret VM.
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
+          fi
       - name: Verify immutable release and published assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -762,7 +817,7 @@ jobs:
           tar -xzf "release/${{ needs.publish.outputs.bundle }}" -C bundle
           (cd bundle && sha256sum --check SHA256SUMS)
           bundle/workflow-mcp-docker help >/dev/null
-          image="docker.io/juliusolsson05/workflow-mcp@${{ needs.publish.outputs.digest }}"
+          image="docker.io/juliusolsson/workflow-mcp@${{ needs.publish.outputs.digest }}"
           cosign verify "$image" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GH_REPO/.github/workflows/container-release.yml@refs/tags/$tag"
