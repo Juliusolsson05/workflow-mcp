@@ -47,6 +47,12 @@ cleanup() {
       "$installed" uninstall --delete-data "--confirm=$instance_id" >/dev/null 2>&1 || true
     fi
   fi
+  if [ -f "$temporary/hardened-project/.workflow-mcp/instance.json" ]; then
+    hardened_cleanup_id=$(sed -n 's/.*"instanceId":"\([^"]*\)".*/\1/p' "$temporary/hardened-project/.workflow-mcp/instance.json" | head -n 1)
+    "$temporary/hardened-project/.workflow-mcp/workflow-mcp-docker" down >/dev/null 2>&1 || true
+    [ -z "$hardened_cleanup_id" ] ||
+      "$temporary/hardened-project/.workflow-mcp/workflow-mcp-docker" uninstall --delete-data "--confirm=$hardened_cleanup_id" >/dev/null 2>&1 || true
+  fi
   # This is the exact private directory returned by mktemp above. Keeping all test state below one
   # leaf makes the release gate self-cleaning without ever resolving a user-provided removal path.
   rm -rf "$temporary"
@@ -192,7 +198,7 @@ bogus_adoption_volume=
 # authority, proving recovery is a startup invariant rather than only an in-process catch block.
 mkdir -m 700 "$project/.workflow-mcp/.upgrade-rollback" "$project/.workflow-mcp/.upgrade-stage"
 expected_image=$(sed -n '/^WORKFLOW_MCP_IMAGE=/p' "$project/.workflow-mcp/version.env")
-for name in LICENSE SHA256SUMS compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env .gitignore instance.json; do
+for name in LICENSE SHA256SUMS compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env .gitignore instance.json; do
   cp "$project/.workflow-mcp/$name" "$project/.workflow-mcp/.upgrade-rollback/$name"
 done
 printf 'workflow-mcp-upgrade-v1\n' > "$project/.workflow-mcp/.upgrade-transaction"
@@ -205,6 +211,13 @@ test ! -e "$project/.workflow-mcp/.upgrade-transaction"
 "$installed" status --json > "$temporary/status.json"
 grep -q '^{' "$temporary/status.json"
 grep -q '"lifecycle":"READY"' "$temporary/status.json"
+# The default profile turns the read-only dashboard on with no token. Prove the three properties
+# that replaced the bearer: loopback API answers unauthenticated, the daemon reports the default
+# authoring posture, and a foreign Host header is still refused (the DNS-rebinding guard stays).
+curl -fsS http://127.0.0.1:7331/readyz | grep -q '"status":"ready"'
+curl -fsS http://127.0.0.1:7331/api/v1/instance > "$temporary/web-instance.json"
+grep -q '"sourceMode":"authoring"' "$temporary/web-instance.json"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:7331/api/v1/instance)" = 421 ]
 "$installed" doctor > "$temporary/doctor.json"
 grep -q '"schemaVersion":1,"ok":true,"host":' "$temporary/doctor.json"
 grep -q '"container":{"schemaVersion":1,"ok":true' "$temporary/doctor.json"
@@ -234,6 +247,35 @@ fi
 "$installed" up
 "$installed" ui --snapshot > "$temporary/ui-snapshot.txt"
 grep -q '^Workflow MCP ' "$temporary/ui-snapshot.txt"
+
+# The hardened profile is the one recorded bit that must restore the entire original posture. If
+# this leg rots, "hardened" becomes marketing: prove the read-only source mode is derived from the
+# profile, that inline MCP authoring is refused again, and that a workflow visible at startup
+# still runs under the snapshot approval boundary — the exact behaviors the default removed.
+hardened_project=$temporary/hardened-project
+mkdir -p "$hardened_project/.claude/workflows"
+cat > "$hardened_project/.claude/workflows/hardened-smoke.js" <<'EOF'
+export const meta = { name: 'hardened-smoke', description: 'Hardened profile gate fixture' }
+return 'hardened gate passed'
+EOF
+chmod 0755 "$hardened_project" "$hardened_project/.claude" "$hardened_project/.claude/workflows"
+chmod 0644 "$hardened_project/.claude/workflows/hardened-smoke.js"
+"$launcher" install "$hardened_project" --hardened --no-codex >/dev/null
+hardened_launcher=$hardened_project/.workflow-mcp/workflow-mcp-docker
+hardened_instance=$(sed -n 's/.*"instanceId":"\([^"]*\)".*/\1/p' "$hardened_project/.workflow-mcp/instance.json" | head -n 1)
+"$hardened_launcher" up >/dev/null 2>&1
+"$hardened_launcher" status --json | grep -q '"sourceMode":"read-only"'
+cat > "$temporary/hardened-requests.jsonl" <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"hardened-smoke","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workflow_run","arguments":{"script":"export const meta = { name: 'refused', description: 'must not author' }\nreturn 1","idempotencyKey":"hardened-refusal"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workflow_run","arguments":{"name":"hardened-smoke","idempotencyKey":"hardened-startup-approved"}}}
+EOF
+"$hardened_launcher" mcp-proxy < "$temporary/hardened-requests.jsonl" > "$temporary/hardened-responses.jsonl"
+grep -q 'authoring-disabled' "$temporary/hardened-responses.jsonl"
+grep -q '"hardened-smoke"' "$temporary/hardened-responses.jsonl"
+"$hardened_launcher" down >/dev/null 2>&1
+"$hardened_launcher" uninstall --delete-data "--confirm=$hardened_instance" >/dev/null
 
 # A copied trusted bundle is the recovery entry point when the installed launcher is missing. It
 # must authenticate executable Compose policy against the immutable image, not a project-owned

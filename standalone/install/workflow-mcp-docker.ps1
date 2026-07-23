@@ -68,7 +68,7 @@ if (Test-Path -LiteralPath (Join-Path $ScriptDirectory "compose.yaml")) {
 } else {
   $BundleRoot = Split-Path -Parent $ScriptDirectory
 }
-$UpgradeNames = @("LICENSE", "compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.project-codex-mask.yaml", "workflow-mcp-docker", "workflow-mcp-docker.ps1", "version.env", "SHA256SUMS", ".gitignore", "instance.json")
+$UpgradeNames = @("LICENSE", "compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.auth-host-codex.yaml", "compose.hardened.yaml", "compose.project-codex-mask.yaml", "workflow-mcp-docker", "workflow-mcp-docker.ps1", "version.env", "SHA256SUMS", ".gitignore", "instance.json")
 
 function Write-InstalledChecksumManifest([string] $TargetDirectory) {
   $Source = Join-Path $BundleRoot "SHA256SUMS"
@@ -258,12 +258,27 @@ function Load-Instance([string] $ProjectPath) {
   $env:WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT = $script:DockerDaemonFingerprint
   # The instance record, not inherited process state or an earlier rollback load, decides which
   # optional Compose overlays exist for this exact identity.
-  Remove-Item Env:WORKFLOW_MCP_PORT, Env:WORKFLOW_MCP_WORKFLOW_DIR, Env:WORKFLOW_MCP_OPENAI_API_KEY_FILE -ErrorAction SilentlyContinue
+  Remove-Item Env:WORKFLOW_MCP_PORT, Env:WORKFLOW_MCP_WORKFLOW_DIR, Env:WORKFLOW_MCP_OPENAI_API_KEY_FILE, Env:WORKFLOW_MCP_PROFILE, Env:WORKFLOW_MCP_HOST_CODEX_AUTH -ErrorAction SilentlyContinue
   $script:ApiKeyUnavailable = $false
   if ($null -ne $script:InstanceWebPort) { $env:WORKFLOW_MCP_PORT = [string]$script:InstanceWebPort }
   if ($script:Instance.authoring) {
     Test-AuthoringPath $false
     $env:WORKFLOW_MCP_WORKFLOW_DIR = Join-Path $script:ProjectDirectory ".claude/workflows"
+  }
+  $HardenedProperty = $script:Instance.PSObject.Properties["hardened"]
+  $script:InstanceHardened = ($null -ne $HardenedProperty -and $HardenedProperty.Value -eq $true)
+  if ($script:InstanceHardened) { $env:WORKFLOW_MCP_PROFILE = "hardened" }
+  # Only the boolean is recorded; the path is re-resolved from the live Codex home each command so
+  # host-side rotation keeps working. A missing file downgrades to container-interactive auth.
+  $HostAuthProperty = $script:Instance.PSObject.Properties["hostCodexAuth"]
+  if ($null -ne $HostAuthProperty -and $HostAuthProperty.Value -eq $true) {
+    $LiveCodexAuth = Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "auth.json"
+    if ((Test-Path -LiteralPath $LiveCodexAuth -PathType Leaf) -and
+      -not ((Get-Item -Force -LiteralPath $LiveCodexAuth).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      $env:WORKFLOW_MCP_HOST_CODEX_AUTH = $LiveCodexAuth
+    } else {
+      Write-Host "Host Codex credential not found at $LiveCodexAuth; starting without inherited auth."
+    }
   }
   $ApiKeyProperty = $script:Instance.PSObject.Properties["apiKeyFile"]
   if ($null -ne $ApiKeyProperty) {
@@ -298,6 +313,8 @@ function Compose-Arguments() {
   if (Test-Path -LiteralPath $CodexDirectory -PathType Container) { $Arguments += @("-f", (Join-Path $script:Installation "compose.project-codex-mask.yaml")) }
   if ($null -ne $script:InstanceWebPort) { $Arguments += @("-f", (Join-Path $script:Installation "compose.web.yaml")) }
   if ($script:Instance.authoring) { $Arguments += @("-f", (Join-Path $script:Installation "compose.authoring.yaml")) }
+  if ($script:InstanceHardened) { $Arguments += @("-f", (Join-Path $script:Installation "compose.hardened.yaml")) }
+  if ($env:WORKFLOW_MCP_HOST_CODEX_AUTH) { $Arguments += @("-f", (Join-Path $script:Installation "compose.auth-host-codex.yaml")) }
   if ($env:WORKFLOW_MCP_OPENAI_API_KEY_FILE) {
     if (-not [IO.Path]::IsPathRooted($env:WORKFLOW_MCP_OPENAI_API_KEY_FILE)) { Fail "API key path must be absolute" }
     $Arguments += @("-f", (Join-Path $script:Installation "compose.auth-api-key.yaml"))
@@ -455,12 +472,15 @@ function Test-AdoptionPreflight([string] $InstanceId) {
 
 function Install-Command() {
   $WebPort = $null; $ApiKeyFile = $null; $AdoptInstance = $null; $Authoring = $false; $NoCodex = $false
+  $Hardened = $false; $NoWeb = $false
   foreach ($Argument in $Rest) {
     if ($Argument -match '^--web-port=(\d+)$') { $WebPort = [int]$Matches[1] }
     elseif ($Argument -eq "--authoring") { $Authoring = $true }
+    elseif ($Argument -eq "--hardened") { $Hardened = $true }
     elseif ($Argument -match '^--api-key-file=(.+)$') { $ApiKeyFile = $Matches[1] }
     elseif ($Argument -match '^--adopt-instance=(.+)$') { $AdoptInstance = $Matches[1] }
     elseif ($Argument -eq "--no-codex") { $NoCodex = $true }
+    elseif ($Argument -eq "--no-web") { $NoWeb = $true }
     else { Fail "unknown install option: $Argument" }
   }
   $script:ProjectDirectory = Canonical-Directory $Project
@@ -474,6 +494,23 @@ function Install-Command() {
     Fail "installation path already exists; inspect and remove it explicitly before install: $script:Installation"
   }
   Host-Doctor ($null -ne $WebPort)
+  # Default profile: the tokenless read-only dashboard is on unless opted out; an old engine only
+  # downgrades this default with the one-line fix, while an EXPLICIT --web-port keeps the hard
+  # Host-Doctor refusal above. Mirrors the POSIX launcher exactly.
+  if ($null -eq $WebPort -and -not $NoWeb -and -not $Hardened) {
+    if ([Version]$script:DockerServerVersion -ge [Version]"28.3.3") { $WebPort = 7331 }
+    else { Write-Host "Web UI disabled: loopback publication needs Docker Engine 28.3.3+ (found $script:DockerServerVersion). Update Docker, then reinstall." }
+  }
+  # Host Codex credential detection: record only the boolean; the live path is re-resolved every
+  # command. Explicit API key wins; hardened never inherits host credentials.
+  $HostCodexAuth = $false
+  if (-not $Hardened -and $null -eq $ApiKeyFile) {
+    $DetectedCodexAuth = Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "auth.json"
+    if ((Test-Path -LiteralPath $DetectedCodexAuth -PathType Leaf) -and
+      -not ((Get-Item -Force -LiteralPath $DetectedCodexAuth).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      $HostCodexAuth = $true
+    }
+  }
   docker image inspect $Image 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { docker pull $Image | Out-Null }
   Set-DockerDaemonFingerprint
@@ -502,7 +539,7 @@ function Install-Command() {
       ($CreatedInstallation.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
     Fail "installation root was not created as an ordinary directory"
   }
-  foreach ($Name in @("compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.project-codex-mask.yaml")) {
+  foreach ($Name in @("compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.auth-host-codex.yaml", "compose.hardened.yaml", "compose.project-codex-mask.yaml")) {
     Copy-Item -LiteralPath (Join-Path $BundleRoot $Name) -Destination (Join-Path $script:Installation $Name)
   }
   Copy-Item -LiteralPath (Join-Path $BundleRoot "LICENSE") -Destination (Join-Path $script:Installation "LICENSE")
@@ -520,6 +557,8 @@ function Install-Command() {
   if ($null -ne $AdoptInstance) { $Create += "--instance-id=$AdoptInstance" }
   if ($null -ne $WebPort) { $Create += "--web-port=$WebPort" }
   if ($Authoring) { $Create += "--authoring" }
+  if ($Hardened) { $Create += "--hardened" }
+  if ($HostCodexAuth) { $Create += "--host-codex-auth" }
   if ($null -ne $ApiKeyFile) { $Create += "--api-key-file=$ApiKeyFile" }
   $Record = & docker @Create
   if ($LASTEXITCODE -ne 0) { Fail "instance creation failed" }
@@ -628,7 +667,7 @@ function Uninstall-Command() {
   # The running PowerShell file cannot be removed reliably on every supported
   # Windows filesystem. All other exact, attested instance files are removed and
   # the operator receives an explicit final path for this one harmless remnant.
-  foreach ($Name in @("LICENSE", "compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.project-codex-mask.yaml", "version.env", "SHA256SUMS", "instance.json", ".gitignore", "workflow-mcp-docker")) {
+  foreach ($Name in @("LICENSE", "compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.auth-host-codex.yaml", "compose.hardened.yaml", "compose.project-codex-mask.yaml", "version.env", "SHA256SUMS", "instance.json", ".gitignore", "workflow-mcp-docker")) {
     $Target = Join-Path $script:Installation $Name
     if (Test-Path -LiteralPath $Target) { Remove-Item -Force -LiteralPath $Target }
   }
@@ -686,7 +725,7 @@ function Upgrade-Command() {
       if (-not (Test-Path -LiteralPath $Existing -PathType Leaf)) { Fail "installed bundle is incomplete: $Name" }
       Copy-Item -LiteralPath $Existing -Destination (Join-Path $RollbackStage $Name)
     }
-    foreach ($Name in @("compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.project-codex-mask.yaml")) {
+    foreach ($Name in @("compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.auth-host-codex.yaml", "compose.hardened.yaml", "compose.project-codex-mask.yaml")) {
       Copy-Item -LiteralPath (Join-Path $BundleRoot $Name) -Destination (Join-Path $UpgradeStage $Name)
     }
     Copy-Item -LiteralPath (Join-Path $BundleRoot "LICENSE") -Destination (Join-Path $UpgradeStage "LICENSE")
@@ -947,7 +986,22 @@ switch ($Command) {
       Invoke-Compose @("exec", "workflow-mcp", "workflow-mcp", "ui")
     }
   }
-  "mcp-proxy" { if ($Rest.Count -ne 0) { Fail "mcp-proxy accepts a project path only" }; Load-Instance $Project; Invoke-Compose @("exec", "-T", "workflow-mcp", "workflow-mcp", "mcp-proxy") }
+  "mcp-proxy" {
+    if ($Rest.Count -ne 0) { Fail "mcp-proxy accepts a project path only" }
+    Load-Instance $Project
+    # Auto-up: Codex connecting is the real lifecycle trigger; a stopped daemon must not make a
+    # rebooted machine look broken. stdout stays exclusively MCP JSON-RPC, so recovery-start
+    # progress is discarded here (PowerShell lacks a clean fd-2 redirect for external progress).
+    $Running = (& docker @((Compose-Arguments) + @("ps", "--status", "running", "--quiet", "workflow-mcp"))) 2>$null
+    if ([string]::IsNullOrWhiteSpace([string]$Running)) {
+      Require-RuntimeApiKey
+      if ($script:Instance.authoring) { Test-AuthoringPath $true }
+      Invoke-Compose @("create") | Out-Null
+      Attest-Volume
+      Invoke-Compose @("up", "--detach", "--wait") | Out-Null
+    }
+    Invoke-Compose @("exec", "-T", "workflow-mcp", "workflow-mcp", "mcp-proxy")
+  }
   "token" {
     Load-Instance $Project
     # Mirror the host stream, not Compose's default pseudo-terminal, so redirected callers retain

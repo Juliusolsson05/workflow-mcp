@@ -29,7 +29,12 @@ describe('standalone daemon', () => {
       dataDirectory: join(root, 'data'),
       host: '127.0.0.1',
       port: 0,
+      // This suite proves the token-gated hardened web surface (401 without a bearer). The
+      // consumer default is tokenless and is covered end-to-end by the launcher release smoke.
+      profile: 'hardened',
       sourceMode: 'read-only',
+      approvalMode: 'required',
+      webAuthMode: 'token',
       leaseMode: 'embedded',
       adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',

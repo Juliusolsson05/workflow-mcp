@@ -12,7 +12,7 @@ else
   bundle_root=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 fi
 
-upgrade_names='LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env SHA256SUMS .gitignore instance.json'
+upgrade_names='LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env SHA256SUMS .gitignore instance.json'
 
 cleanup_upgrade_directories() {
   [ ! -f "$1/.upgrade-transaction.preparing" ] || rm -- "$1/.upgrade-transaction.preparing"
@@ -223,6 +223,7 @@ load_instance() {
   # Instance metadata is the source of truth. Ambient values from a previous load/parent shell
   # must not silently enable an overlay that the attested record does not name.
   unset WORKFLOW_MCP_PORT WORKFLOW_MCP_WORKFLOW_DIR WORKFLOW_MCP_OPENAI_API_KEY_FILE
+  unset WORKFLOW_MCP_PROFILE WORKFLOW_MCP_HOST_CODEX_AUTH
   api_key_unavailable=false
   # ShellCheck cannot infer the fixed variables emitted by `instance inspect`; the strict parser in
   # the pinned image is the only producer and the validation immediately below still fails closed.
@@ -275,6 +276,22 @@ load_instance() {
       api_key_unavailable=true
     fi
   fi
+  # shellcheck disable=SC2154
+  if [ "$hardened" = true ]; then export WORKFLOW_MCP_PROFILE=hardened; fi
+  # The record stores only the host-auth BOOLEAN. The path is re-resolved from the live
+  # CODEX_HOME/HOME at every command so host-side rotation or relocation keeps working without a
+  # record rewrite. A missing file downgrades to container-interactive auth with a warning — the
+  # daemon must still start so the operator can use `auth login` instead — mirroring how a
+  # rotated-away API key is a hard refusal (an explicit credential) but an inherited one is not.
+  # shellcheck disable=SC2154
+  if [ "$host_codex_auth" = true ]; then
+    live_codex_auth="${CODEX_HOME:-$HOME/.codex}/auth.json"
+    if [ -f "$live_codex_auth" ] && [ ! -L "$live_codex_auth" ]; then
+      export WORKFLOW_MCP_HOST_CODEX_AUTH="$live_codex_auth"
+    else
+      note "Host Codex credential not found at $live_codex_auth; starting without inherited auth. Run codex login on the host, or $installation/workflow-mcp-docker auth login."
+    fi
+  fi
 }
 
 require_runtime_api_key() {
@@ -296,6 +313,11 @@ compose() {
   fi
   if [ -n "${web_port:-}" ]; then set -- -f "$installation/compose.web.yaml" "$@"; fi
   if [ "${authoring:-false}" = true ]; then set -- -f "$installation/compose.authoring.yaml" "$@"; fi
+  if [ "${hardened:-false}" = true ]; then set -- -f "$installation/compose.hardened.yaml" "$@"; fi
+  if [ -n "${WORKFLOW_MCP_HOST_CODEX_AUTH:-}" ]; then
+    set -- -f "$installation/compose.auth-host-codex.yaml" "$@"
+    export WORKFLOW_MCP_HOST_CODEX_AUTH
+  fi
   if [ -n "${WORKFLOW_MCP_OPENAI_API_KEY_FILE:-}" ]; then
     case "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" in /*) ;; *) fail "API key file path must be absolute" ;; esac
     [ -f "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" ] || fail "API key file does not exist"
@@ -495,14 +517,18 @@ install_command() {
   api_key_arg=''
   adopt_instance=''
   authoring_arg=false
+  hardened_arg=false
   no_codex=false
+  no_web=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --web-port=*) web_arg=${1#*=} ;;
       --authoring) authoring_arg=true ;;
+      --hardened) hardened_arg=true ;;
       --api-key-file=*) api_key_arg=${1#*=} ;;
       --adopt-instance=*) adopt_instance=${1#*=} ;;
       --no-codex) no_codex=true ;;
+      --no-web) no_web=true ;;
       *) fail "unknown install option: $1" ;;
     esac
     shift
@@ -517,6 +543,29 @@ install_command() {
     fail "installation path already exists; inspect and remove it explicitly before install: $installation"
   fi
   host_doctor "$( [ -n "$web_arg" ] && printf true || printf false )"
+  # The default profile turns the read-only browser dashboard on without being asked: it is
+  # zero-interaction (tokenless, loopback-only) and one of the product's main consumer surfaces.
+  # An explicit --web-port always wins; --no-web opts out; hardened keeps web strictly opt-in.
+  # An old engine only downgrades the default (with the one-line fix), never blocks the install —
+  # only an EXPLICIT --web-port on an old engine remains the hard host_doctor refusal above.
+  if [ -z "$web_arg" ] && [ "$no_web" = false ] && [ "$hardened_arg" = false ]; then
+    if version_at_least "$docker_server_version" 28.3.3; then
+      web_arg=7331
+    else
+      note "Web UI disabled: loopback publication needs Docker Engine 28.3.3+ (found $docker_server_version). Update Docker, then reinstall."
+    fi
+  fi
+  # Host Codex credential detection: the whole point of the default profile is that a person who
+  # already uses Codex on this machine needs no second login. An explicit API key still wins, and
+  # hardened never inherits host credentials. Only the boolean is recorded — the path is resolved
+  # again at every `up` from the live CODEX_HOME/HOME so host-side rotation keeps working.
+  host_codex_auth_arg=false
+  if [ "$hardened_arg" = false ] && [ -z "$api_key_arg" ]; then
+    detected_codex_auth="${CODEX_HOME:-$HOME/.codex}/auth.json"
+    if [ -f "$detected_codex_auth" ] && [ ! -L "$detected_codex_auth" ]; then
+      host_codex_auth_arg=true
+    fi
+  fi
   docker image inspect "$WORKFLOW_MCP_IMAGE" >/dev/null 2>&1 || docker pull "$WORKFLOW_MCP_IMAGE"
   fingerprint_current_daemon
   # These checks precede every project mutation. A conflicting Codex owner or mismatched preserved
@@ -539,7 +588,7 @@ install_command() {
     authoring_preflight
   fi
   mkdir -m 700 "$installation"
-  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml; do
     cp "$bundle_root/$name" "$installation/$name"
   done
   cp "$bundle_root/LICENSE" "$installation/LICENSE"
@@ -562,6 +611,8 @@ install_command() {
   [ -z "$adopt_instance" ] || set -- "$@" "--instance-id=$adopt_instance"
   [ -z "$web_arg" ] || set -- "$@" "--web-port=$web_arg"
   [ "$authoring_arg" = false ] || set -- "$@" --authoring
+  [ "$hardened_arg" = false ] || set -- "$@" --hardened
+  [ "$host_codex_auth_arg" = false ] || set -- "$@" --host-codex-auth
   [ -z "$api_key_arg" ] || set -- "$@" "--api-key-file=$api_key_arg"
   instance_json=$("$@")
   temporary=$(mktemp "$installation/instance.json.XXXXXX")
@@ -573,6 +624,7 @@ install_command() {
   [ "$no_codex" = true ] || install_codex_stanza
   note "Installed Workflow MCP instance $instance_id at $installation"
   [ -z "$adopt_instance" ] || note "Adopted preserved durable volume ${compose_project}_workflow-mcp-data."
+  [ "$host_codex_auth_arg" = false ] || note "Codex credentials will be inherited from the host login (read-only seed)."
   note "Start it with: $installation/workflow-mcp-docker up"
 }
 
@@ -627,7 +679,7 @@ uninstall_command() {
   fi
   # Every target is an exact file below the already-validated installation; the named volume is
   # preserved unless separately confirmed above.
-  for name in LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml version.env SHA256SUMS instance.json .gitignore workflow-mcp-docker.ps1; do
+  for name in LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml version.env SHA256SUMS instance.json .gitignore workflow-mcp-docker.ps1; do
     [ ! -e "$installation/$name" ] || rm "$installation/$name"
   done
   note "Uninstalled public bundle; durable data was $( [ "$delete_data" = true ] && printf deleted || printf preserved )."
@@ -682,7 +734,7 @@ upgrade_command() {
     [ -f "$installation/$name" ] || fail "installed bundle is incomplete: $name"
     cp "$installation/$name" "$rollback_stage/$name"
   done
-  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml; do
     cp "$bundle_root/$name" "$upgrade_stage/$name"
   done
   cp "$bundle_root/LICENSE" "$upgrade_stage/LICENSE"
@@ -932,7 +984,7 @@ restore_command() {
 usage() {
   cat <<'EOF'
 Usage:
-  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
+  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--no-web] [--hardened] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
   workflow-mcp-docker up [PROJECT]
   workflow-mcp-docker down|status|logs|doctor|ui|mcp-proxy [PROJECT]
   workflow-mcp-docker source [PROJECT] approvals|approve [options]
@@ -1005,7 +1057,22 @@ case "$command" in
           compose exec workflow-mcp workflow-mcp ui
         fi
         ;;
-      mcp-proxy) [ "$#" -eq 0 ] || fail "mcp-proxy accepts a project path only"; load_instance "$project_arg"; compose exec -T workflow-mcp workflow-mcp mcp-proxy ;;
+      mcp-proxy)
+        [ "$#" -eq 0 ] || fail "mcp-proxy accepts a project path only"
+        load_instance "$project_arg"
+        # WHY auto-up: Codex connecting is the product's real lifecycle trigger. Requiring a
+        # separate `up` first turned "restart Codex" into a two-command dance and made a rebooted
+        # machine look broken. stdout is exclusively MCP JSON-RPC, so every Compose progress byte
+        # of the recovery start must go to stderr; a failed start still fails the proxy loudly.
+        if ! compose ps --status running workflow-mcp 2>/dev/null | grep -q workflow-mcp; then
+          require_runtime_api_key
+          [ "${authoring:-false}" != true ] || authoring_preflight
+          compose create >&2
+          attest_volume
+          compose up --detach --wait >&2
+        fi
+        compose exec -T workflow-mcp workflow-mcp mcp-proxy
+        ;;
       token)
         load_instance "$project_arg"
         # Compose allocates a container TTY by default even when the host caller redirected stdout.

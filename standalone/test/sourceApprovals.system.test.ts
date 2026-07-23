@@ -24,7 +24,12 @@ describe('durable source approvals', () => {
       dataDirectory: join(root, 'data'),
       host: '127.0.0.1',
       port: 0,
+      // The durable approval store is hardened-profile machinery; the consumer default authorizes
+      // unconditionally, so this suite must opt into the gate it exists to prove.
+      profile: 'hardened',
       sourceMode: 'authoring',
+      approvalMode: 'required',
+      webAuthMode: 'token',
       leaseMode: 'embedded',
       adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',

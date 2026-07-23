@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
+import { lstatSync } from 'node:fs'
 import { join } from 'node:path'
 
 import type { WorkflowService } from 'workflow-mcp'
@@ -9,7 +10,7 @@ const AUTH_PIPE_REAP_GRACE_MS = 1_000
 
 export type AuthenticationStatus = Readonly<{
   schemaVersion: 1
-  mode: 'api-key-secret' | 'interactive'
+  mode: 'api-key-secret' | 'host-codex' | 'interactive'
   authenticated: boolean
   detail: string
 }>
@@ -27,17 +28,20 @@ export class CodexCredentialBroker {
   readonly #codexExecutable: string
   readonly #codexHome: string
   readonly #apiKeySecret: boolean
+  readonly #hostCodexAuthFile: string | undefined
 
   constructor(options: {
     service: WorkflowService
     codexExecutable: string
     dataDirectory: string
     apiKeySecret: boolean
+    hostCodexAuthFile?: string
   }) {
     this.#service = options.service
     this.#codexExecutable = options.codexExecutable
     this.#codexHome = join(options.dataDirectory, 'codex-home')
     this.#apiKeySecret = options.apiKeySecret
+    this.#hostCodexAuthFile = options.hostCodexAuthFile
   }
 
   async status(signal?: AbortSignal): Promise<AuthenticationStatus> {
@@ -47,6 +51,22 @@ export class CodexCredentialBroker {
         mode: 'api-key-secret',
         authenticated: true,
         detail: 'OpenAI API key is supplied through the configured external secret input',
+      })
+    }
+    if (this.#hostCodexAuthFile !== undefined) {
+      // Host-inherited auth: the mounted file only SEEDS the isolated home (rotation stays
+      // container-side), so status is a cheap mount-shape check rather than a Codex spawn. The
+      // authoritative login state belongs to the host's own `codex login`; reporting anything
+      // deeper here would race the host CLI over a file this daemon deliberately never writes.
+      const seed = lstatSyncSafe(this.#hostCodexAuthFile)
+      const usable = seed !== undefined && seed.isFile() && !seed.isSymbolicLink()
+      return Object.freeze({
+        schemaVersion: 1,
+        mode: 'host-codex',
+        authenticated: usable,
+        detail: usable
+          ? 'Codex credentials are inherited from the host Codex login'
+          : 'Mounted host Codex credential is missing; run `codex login` on the host, then restart',
       })
     }
     return this.#exclusive(async () => {
@@ -73,6 +93,12 @@ export class CodexCredentialBroker {
         'Interactive login is disabled while the API-key secret overlay is configured',
       ))
     }
+    if (this.#hostCodexAuthFile !== undefined) {
+      return Promise.reject(authError(
+        'auth-mode-conflict',
+        'Credentials are inherited from the host; run `codex login` on the host instead',
+      ))
+    }
     return this.#exclusive(async () => {
       const result = await runCodex(
         this.#codexExecutable,
@@ -90,6 +116,12 @@ export class CodexCredentialBroker {
       return Promise.reject(authError(
         'auth-mode-conflict',
         'Logout cannot remove a host-managed API-key secret; remove the Compose overlay instead',
+      ))
+    }
+    if (this.#hostCodexAuthFile !== undefined) {
+      return Promise.reject(authError(
+        'auth-mode-conflict',
+        'Credentials are inherited from the host; run `codex logout` on the host instead',
       ))
     }
     return this.#exclusive(async () => {
@@ -124,6 +156,14 @@ export class CodexCredentialBroker {
       HOME: this.#codexHome,
       CODEX_HOME: this.#codexHome,
     }
+  }
+}
+
+function lstatSyncSafe(path: string): ReturnType<typeof lstatSync> | undefined {
+  try {
+    return lstatSync(path)
+  } catch {
+    return undefined
   }
 }
 

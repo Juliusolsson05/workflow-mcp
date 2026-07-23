@@ -25,7 +25,27 @@ let dashboardRefreshInterval: number | undefined
 let inventoryAbort: AbortController | undefined
 const evidenceReconcileStates = new WeakMap<HTMLElement, { latest: RunSummary; running: boolean }>()
 
-renderLogin()
+void enter()
+
+// The default profile serves this API without bearer auth (loopback + Host/Origin checks carry
+// the protection), so the correct first experience is the dashboard itself. Probe once with an
+// empty token: an unauthenticated 200 means tokenless mode — go straight in; a 401 means a
+// hardened daemon — fall back to the token form. Any other failure also lands on the form, which
+// doubles as the connection-error surface.
+async function enter(): Promise<void> {
+  const candidate = new StandaloneApiClient({ token: '' })
+  try {
+    const instance = await candidate.instance()
+    tokenlessSession = true
+    client = candidate
+    resetRunInventory()
+    await renderDashboard(instance)
+  } catch {
+    renderLogin()
+  }
+}
+
+let tokenlessSession = false
 
 function renderLogin(message?: string): void {
   stopDashboardRefresh()
@@ -52,7 +72,11 @@ function renderLogin(message?: string): void {
   if (message !== undefined) form.append(element('p', 'form-error', message))
   form.addEventListener('submit', event => {
     event.preventDefault()
-    const token = input.value.trim()
+    // Strip ALL whitespace, not just the ends: a token copied out of a terminal can carry an
+    // invisible mid-string line break from soft wrapping, and an invalid header byte makes the
+    // browser's fetch throw before any request exists — which used to surface as the misleading
+    // "API temporarily unavailable". Tokens are base64url, so interior whitespace is never real.
+    const token = input.value.replace(/\s+/g, '')
     if (token.length === 0) return
     void authenticate(token)
   })
@@ -87,9 +111,15 @@ async function renderDashboard(instance: InstanceSummary): Promise<void> {
   identity.append(element('div', 'product-mark compact', 'WM'), element('div', undefined, 'Workflow MCP'))
   const facts = element('div', 'instance-facts')
   renderInstanceFacts(facts, instance, true)
-  const forget = element('button', 'ghost-button', 'Forget token')
-  forget.addEventListener('click', () => { client = undefined; renderLogin() })
-  header.append(identity, facts, forget)
+  // A tokenless session has nothing to forget; showing the button would offer a dead end whose
+  // only exit is a manual reload (enter() runs once per page load).
+  if (tokenlessSession) {
+    header.append(identity, facts)
+  } else {
+    const forget = element('button', 'ghost-button', 'Forget token')
+    forget.addEventListener('click', () => { client = undefined; renderLogin() })
+    header.append(identity, facts, forget)
+  }
   const content = element('div', 'content')
   const list = element('aside', 'run-list')
   list.append(element('div', 'section-heading', 'RUNS'), element('div', 'loading', 'Loading durable inventory…'))

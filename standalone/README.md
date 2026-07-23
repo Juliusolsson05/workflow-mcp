@@ -31,114 +31,51 @@ narrower lifecycle contract.
 
 <!-- mcp-name: io.github.juliusolsson05/workflow-mcp -->
 
-## Install a published release
+## Install
 
-The commands below apply after the matching release is published. Set `VERSION` to an exact stable
-release such as `0.1.0`; do not use `latest` as an installation identity.
+One command, in the project directory, after the matching release is published:
 
 ```bash
-set -eu
-umask 077
-VERSION=0.1.0
-TAG="v$VERSION"
-ASSET="workflow-mcp-install-$VERSION.tar.gz"
-
-[ ! -e workflow-mcp-release ] || { echo "workflow-mcp-release already exists" >&2; exit 1; }
-[ ! -e workflow-mcp-bundle ] || { echo "workflow-mcp-bundle already exists" >&2; exit 1; }
-mkdir workflow-mcp-release
-gh release download "$TAG" \
-  --repo Juliusolsson05/workflow-mcp \
-  --dir workflow-mcp-release
-gh release verify "$TAG" --repo Juliusolsson05/workflow-mcp
-for FILE in workflow-mcp-release/*; do
-  gh release verify-asset "$TAG" "$FILE" --repo Juliusolsson05/workflow-mcp
-  gh attestation verify "$FILE" --repo Juliusolsson05/workflow-mcp
-done
-(cd workflow-mcp-release && {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum --check SHA256SUMS
-  else shasum -a 256 --check SHA256SUMS
-  fi
-})
-
-mkdir workflow-mcp-bundle
-tar -xzf "workflow-mcp-release/$ASSET" -C workflow-mcp-bundle
-(cd workflow-mcp-bundle && {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum --check SHA256SUMS
-  else shasum -a 256 --check SHA256SUMS
-  fi
-})
-./workflow-mcp-bundle/workflow-mcp-docker install /absolute/path/to/project
-/absolute/path/to/project/.workflow-mcp/workflow-mcp-docker up
+curl -fsSL https://github.com/Juliusolsson05/workflow-mcp/releases/latest/download/install.sh | sh
 ```
 
-The release is deliberately not installed by piping a mutable URL to a shell. GitHub's immutable
-release attestation establishes publisher/tag/asset identity; the release checksum covers the
-download; the bundle's second checksum covers every file after extraction.
+The script needs only Docker. It pulls the release image pinned by immutable digest (the digest is
+baked into each released copy of `install.sh`, so the convenience URL never decides which bytes
+run), renders the checksummed install bundle from that image, installs the project-scoped
+launcher, writes the Codex stanza, starts the daemon, and installs a global `workflow-mcp` PATH
+shim so every later command is just `workflow-mcp <verb>` from anywhere inside the project. If the
+host has a Codex login (`~/.codex/auth.json`), the daemon inherits it read-only — no second login.
+The tokenless read-only dashboard comes up on `http://127.0.0.1:7331` unless `--no-web` or the
+port is taken by another instance.
 
-On Windows, use PowerShell 7 and Docker Desktop in Linux-container mode. The equivalent clean
-install verifies every downloaded asset before executing the PowerShell launcher:
-
-```powershell
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-$Version = "0.1.0"
-$Tag = "v$Version"
-$Release = Join-Path $PWD "workflow-mcp-release"
-$Bundle = Join-Path $PWD "workflow-mcp-bundle"
-function Assert-Native([string] $Operation) { if ($LASTEXITCODE -ne 0) { throw "$Operation failed" } }
-function New-VerifiedDirectory([string] $Path) {
-  if ($Path -match '[\p{Cc}\p{Cf}]') { throw "Extraction path contains terminal control, bidi, or format characters" }
-  $Full = [IO.Path]::GetFullPath($Path)
-  if ($Full -match '[\p{Cc}\p{Cf}]') { throw "Extraction path contains terminal control, bidi, or format characters" }
-  if ($Full -notmatch '^[A-Za-z]:[\\/]' -or $Full -match '^\\\\[?.]\\') { throw "Only local drive-qualified extraction paths are supported" }
-  if ($null -ne (Get-Item -Force -LiteralPath $Full -ErrorAction SilentlyContinue)) { throw "Extraction path already exists: $Full" }
-  $Parent = Get-Item -Force -LiteralPath ([IO.Path]::GetDirectoryName($Full))
-  if ($Parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Extraction parent may not be redirected: $($Parent.FullName)" }
-  New-Item -ItemType Directory -Path $Full | Out-Null
-}
-New-VerifiedDirectory $Release
-New-VerifiedDirectory $Bundle
-gh release download $Tag --repo Juliusolsson05/workflow-mcp --dir $Release
-Assert-Native "release download"
-gh release verify $Tag --repo Juliusolsson05/workflow-mcp
-Assert-Native "immutable release verification"
-Get-ChildItem -File $Release | ForEach-Object {
-  gh release verify-asset $Tag $_.FullName --repo Juliusolsson05/workflow-mcp
-  Assert-Native "release asset verification"
-  gh attestation verify $_.FullName --repo Juliusolsson05/workflow-mcp
-  Assert-Native "release asset attestation verification"
-}
-Get-Content (Join-Path $Release "SHA256SUMS") | ForEach-Object {
-  if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Malformed release checksum" }
-  if ((Get-FileHash -Algorithm SHA256 (Join-Path $Release $Matches[2])).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "Release checksum mismatch" }
-}
-tar -xzf (Join-Path $Release "workflow-mcp-install-$Version.tar.gz") -C $Bundle
-Assert-Native "bundle extraction"
-Get-Content (Join-Path $Bundle "SHA256SUMS") | ForEach-Object {
-  if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Malformed bundle checksum" }
-  if ((Get-FileHash -Algorithm SHA256 (Join-Path $Bundle $Matches[2])).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "Bundle checksum mismatch" }
-}
-pwsh -NoProfile -File (Join-Path $Bundle "workflow-mcp-docker.ps1") install C:\absolute\project
-Assert-Native "Workflow MCP installation"
-pwsh -NoProfile -File C:\absolute\project\.workflow-mcp\workflow-mcp-docker.ps1 up
-Assert-Native "Workflow MCP startup"
-```
+Operators who want to verify publisher attestations and checksums by hand before executing
+anything should follow the hardened bootstrap in [SECURITY.md](SECURITY.md#release-verification),
+which downloads and verifies the same bundle without piping anything to a shell.
 
 Installation creates `<project>/.workflow-mcp/`, writes one marked project-local Codex MCP stanza
 to `<project>/.codex/config.toml`, pulls the image pinned by digest, and records stable instance,
 Compose project, Docker context, Docker Engine ID fingerprint, project, and named-volume identities. Machine-specific files are
-gitignored. The project bind is read-only by default, no TCP port is published, and the daemon runs
-as UID/GID `10001:10001` with a read-only root filesystem.
+gitignored. In the default profile the project bind is writable — agents editing the user's own
+project is the product, the same authority any host-side coding agent gets — while the container
+root filesystem stays read-only, the daemon stays UID/GID `10001:10001`, `/data` and every secret
+mount stay unreadable to agent commands, and the project `.codex` directory stays masked. Install
+with `--hardened` to restore the original shipped posture: read-only project bind, startup/durable
+source approvals, token-gated web, and isolated container-only credentials, all from one recorded
+profile bit.
 
 Use `--no-codex` if another configuration manager owns `config.toml`. `instance codex-config`
 inside the image can render the exact stanza for recovery.
 
 ## Authentication
 
-The host Codex home is never mounted. Choose one credential path.
+By default the daemon inherits the host's existing Codex login: install detects
+`~/.codex/auth.json` (honoring `CODEX_HOME`) and mounts it read-only as a seed for the container's
+own writable Codex home. Token rotation happens container-side; the host file is never written,
+and host logout removes the seed at the next container start. No second login exists in the happy
+path. `--hardened` disables inheritance and keeps credentials container-isolated.
 
-For the stable non-interactive path, put only the key in an ordinary non-symlink file and bind its
-absolute path at installation:
+For the explicit non-interactive path, put only the key in an ordinary non-symlink file and bind
+its absolute path at installation (an explicit API key always wins over host inheritance):
 
 ```bash
 umask 077
@@ -203,55 +140,53 @@ previous, and first page. Inventory, result, and transcript cursors keep a fixed
 only the current content page is retained in memory. `ui --snapshot` is the non-interactive,
 non-ANSI fallback.
 
-Enable the browser UI only during installation:
-
-```bash
-./workflow-mcp-docker install /absolute/project --web-port=7331
-./workflow-mcp-docker up
-./workflow-mcp-docker token --purpose=web
-```
-
-Open `http://127.0.0.1:7331` and enter the token in the tab. The token is never placed in a URL,
-HTML, browser history, or ordinary log. The browser API is authenticated and read-only; it has no
-cancel, approval, auth, token-rotation, backup, or project-write route.
-Its inventory, result, and transcript controls page through bounded API responses and replace the
-current content page instead of accumulating an unbounded DOM transcript.
+The browser UI is on by default: open `http://127.0.0.1:7331` and the dashboard loads with no
+token. What replaced the bearer is invisible and free: the port binds to loopback only, foreign
+`Host` headers are refused (which defeats DNS rebinding — a rebound name arrives carrying the
+attacker's Host), cross-site `Origin`s are rejected, the API is GET-only, and there is no cancel,
+approval, auth, token-rotation, backup, or project-write route to protect in the first place.
+Inventory, result, and transcript controls page through bounded API responses and replace the
+current content page instead of accumulating an unbounded DOM transcript. Choose the port with
+`install --web-port=PORT`, opt out with `--no-web`; under `--hardened` the web API requires the
+bearer from `token --purpose=web` again, and the page shows its token form when it sees a 401.
 
 Web publication requires Docker Engine `28.3.3` or newer because earlier engines had a loopback
-publication bypass. The launcher refuses web mode below that floor. Base/terminal/MCP operation
-does not publish a host port and does not impose that web-specific floor.
+publication bypass. An explicit `--web-port` below that floor is refused; the web-on-by-default
+detection simply downgrades to no web UI with an upgrade hint. Base/terminal/MCP operation does
+not publish a host port and does not impose that web-specific floor.
 
-## Read-only and authoring modes
+## Profiles: default and hardened
 
-Read-only is the default. Existing visible `.claude/workflows/*.js` files are approved at daemon
-startup by canonical identity and exact SHA-256 bytes. Inline MCP source fails with
-`authoring-disabled` before any project filesystem operation.
+The default profile is built for one person on their own machine. Authoring is on: Codex can call
+`workflow_run` with an inline `script`, the source is persisted under the project's
+`.claude/workflows`, and it runs immediately — no approval command exists between an agent writing
+a workflow and executing it, because the operator launched this MCP against their own project and
+the workflow is their own agent's output. The MCP server instructions ship the complete authoring
+format on connect, so a fresh client needs no example files to learn the DSL.
 
-Narrow authoring is opt-in:
+`--hardened` restores the original review posture from a single recorded bit:
 
-```bash
-./workflow-mcp-docker install /absolute/project --authoring
-```
+- Sources are read-only. Existing visible `.claude/workflows/*.js` files are approved at daemon
+  startup by canonical identity and exact SHA-256 bytes; inline MCP source fails with
+  `authoring-disabled` before any project filesystem operation. Combine with `--authoring` for
+  the narrow writable-`.claude/workflows` overlay: the launcher rejects redirected paths and asks
+  UID 10001 in the exact image to create, fsync, rename, directory-fsync, and delete a probe
+  before enabling it (on native Linux, grant UID 10001 an ACL on that directory; the product does
+  not solve this by running as root).
+- Hardened-authored source never approves itself. The first MCP call persists a no-overwrite
+  definition and returns `source-approval-required`; an operator reviews its bytes and runs:
 
-Only `<project>/.claude/workflows` becomes writable; the rest of the project stays read-only. The
-launcher rejects redirected `.claude`/`workflows` paths and asks UID 10001 in the exact image to
-create, fsync, rename, directory-fsync, and delete a probe before enabling the overlay. On native
-Linux, grant UID 10001 an ACL or narrow ownership on that directory if the probe fails. The product
-does not solve this by running as root.
+  ```bash
+  ./workflow-mcp-docker source approvals --json
+  ./workflow-mcp-docker source approve --name=my-workflow --source-hash=<64-hex-source-hash>
+  ```
 
-Newly authored source never approves itself. The first MCP call persists a no-overwrite definition
-and returns `source-approval-required`. An operator reviews its bytes and runs:
-
-```bash
-./workflow-mcp-docker source approvals --json
-./workflow-mcp-docker source approve --name=my-workflow --source-hash=<64-hex-source-hash>
-```
-
-`<64-hex-source-hash>` is a visible placeholder for the exact hash returned by describe/run. The
-daemon re-reads the current visible workflow and rejects a mismatch. The durable record contains
-only hashed canonical identity, project hash, workflow name, source hash, and timestamp. A one-byte
-edit revokes authority, and copying/restoring records for another project identity does not grant
-execution.
+  The daemon re-reads the current visible workflow and rejects a mismatch. The durable record
+  contains only hashed canonical identity, project hash, workflow name, source hash, and
+  timestamp. A one-byte edit revokes authority, and copying/restoring records for another project
+  identity does not grant execution.
+- The project bind returns to read-only, the web API returns to bearer-token auth, and Codex
+  credentials stay container-isolated (host `auth.json` is never read).
 
 ## Backup, restore, and upgrade
 
