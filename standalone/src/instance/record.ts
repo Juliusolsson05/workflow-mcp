@@ -182,6 +182,12 @@ export function renderPosixInstanceEnvironment(record: StandaloneInstanceRecord)
     instance_id: record.instanceId,
     compose_project: record.composeProjectName,
     project_hash: record.projectHash,
+    // The spelling this instance was installed under. On a case-insensitive volume `/bin/sh`'s
+    // `pwd -P` returns the spelling the caller typed rather than the one on disk, so the same
+    // directory reached as `~/desktop/...` and `~/Desktop/...` hashes differently. The launcher
+    // compares filesystem identity against this recorded spelling before refusing, and adopts it
+    // so every later bind, hash, and Compose project name stays byte-identical.
+    recorded_project_directory: record.projectDirectory,
     recorded_context: record.dockerContext,
     recorded_endpoint: record.dockerEndpoint,
     recorded_daemon_fingerprint: record.dockerDaemonFingerprint,

@@ -278,7 +278,33 @@ load_instance() {
   [ "$docker_daemon_fingerprint" = "$recorded_daemon_fingerprint" ] ||
     fail "Docker daemon changed since install; cross-daemon identity import is not supported in v1"
   actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
-  [ "$actual_hash" = "$project_hash" ] || fail "instance.json belongs to a different canonical project path"
+  if [ "$actual_hash" != "$project_hash" ]; then
+    # WHY a same-directory fallback instead of a flat refusal: this launcher is `#!/bin/sh`, and a
+    # POSIX shell's `pwd -P` returns the spelling the caller typed, not the one stored on disk. On
+    # macOS's case-insensitive volumes `cd ~/desktop` and `cd ~/Desktop` therefore canonicalize to
+    # different strings for one directory, so an install recorded through one spelling refused every
+    # command issued through the other — including the PATH shim, which resolves from the user's own
+    # $PWD and so broke in one terminal while working in another.
+    #
+    # Identity still may not cross directories: only a path that IS the recorded directory is
+    # accepted. `-ef` compares device AND inode, which is what "same directory" actually means —
+    # an inode number alone is unique only within one filesystem, so two directories on separate
+    # volumes routinely share one (two tmpfs mounts both report inode 1) and comparing inodes
+    # alone would let a copied bundle adopt an unrelated project on another volume. A moved,
+    # copied, or unrelated directory therefore still fails here. On success adopt the recorded
+    # spelling so the hash, bind source, and Compose project name remain byte-identical to
+    # installation. `-ef` is not in POSIX test, but every shell this launcher runs under supports
+    # it (verified: macOS /bin/sh, dash, and the image's BusyBox ash).
+    # shellcheck disable=SC2154
+    if [ -z "${recorded_project_directory:-}" ] || [ ! -d "$recorded_project_directory" ] ||
+      [ ! "$project_directory" -ef "$recorded_project_directory" ]; then
+      fail "instance.json belongs to a different canonical project path"
+    fi
+    project_directory=$recorded_project_directory
+    actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
+    [ "$actual_hash" = "$project_hash" ] ||
+      fail "instance.json belongs to a different canonical project path"
+  fi
   export WORKFLOW_MCP_IMAGE WORKFLOW_MCP_INSTANCE_ID="$instance_id"
   export WORKFLOW_MCP_PROJECT_HASH="$project_hash" WORKFLOW_MCP_PROJECT_DIR="$project_directory"
   export WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT="$docker_daemon_fingerprint"

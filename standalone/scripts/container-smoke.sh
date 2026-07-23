@@ -16,6 +16,7 @@ secret_volume=workflow-mcp-smoke-secret-$suffix
 export_volume=workflow-mcp-smoke-export-$suffix
 input_volume=workflow-mcp-smoke-input-$suffix
 catalog_mask_volume=workflow-mcp-smoke-catalog-mask-$suffix
+hostile_mask_volume=workflow-mcp-smoke-hostile-mask-$suffix
 stdio_volume=workflow-mcp-smoke-stdio-$suffix
 network=workflow-mcp-smoke-network-$suffix
 listener=workflow-mcp-smoke-listener-$suffix
@@ -24,7 +25,7 @@ export_container=workflow-mcp-smoke-export-$suffix
 
 cleanup() {
   docker rm -f "$container" "$replacement_container" "$listener" "$staging_container" "$export_container" >/dev/null 2>&1 || true
-  docker volume rm "$volume" "$restore_volume" "$secret_volume" "$export_volume" "$input_volume" "$catalog_mask_volume" "$stdio_volume" >/dev/null 2>&1 || true
+  docker volume rm "$volume" "$restore_volume" "$hostile_mask_volume" "$secret_volume" "$export_volume" "$input_volume" "$catalog_mask_volume" "$stdio_volume" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   docker image rm "$derived_image" >/dev/null 2>&1 || true
   # `temporary` is an exact mktemp result owned by this process. No user-supplied or unresolved
@@ -78,6 +79,7 @@ docker volume create "$secret_volume" >/dev/null
 docker volume create "$export_volume" >/dev/null
 docker volume create "$input_volume" >/dev/null
 docker volume create "$catalog_mask_volume" >/dev/null
+docker volume create "$hostile_mask_volume" >/dev/null
 docker volume create "$stdio_volume" >/dev/null
 docker network create "$network" >/dev/null
 docker run -d --name "$listener" --network "$network" --entrypoint /usr/local/bin/node "$image" \
@@ -127,6 +129,42 @@ docker run --rm --network none --read-only --user 10001:10001 \
   --mount "type=bind,src=$temporary/catalog-workspace,dst=/workspace,readonly" \
   --tmpfs /workspace/.codex:ro,size=1m,mode=0555,uid=10001,gid=10001 \
   --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null
+
+# REGRESSION: a genuinely mounted mask must be accepted even when the caller rebuilt a minimal
+# environment and dropped the attestation variable. The credential broker does exactly that so a
+# login child cannot inherit credentials, and because installation always writes the project Codex
+# stanza into <project>/.codex, dropping the flag made `auth status`/`auth login` refuse on 100% of
+# default installations — surfacing to operators as an unreadable EPIPE. The mount, not the
+# variable, is the security boundary; proving it here keeps that fix from silently regressing.
+docker run --rm --network none --read-only --user 10001:10001 \
+  --mount "type=bind,src=$temporary/catalog-workspace,dst=/workspace,readonly" \
+  --tmpfs /workspace/.codex:ro,size=1m,mode=0555,uid=10001,gid=10001 \
+  --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null
+
+# The converse must still hold with the flag absent: an unmasked project `.codex` is refused, so
+# trusting the mount never became "trust anything".
+if docker run --rm --network none --read-only --user 10001:10001 \
+  --mount "type=bind,src=$temporary/catalog-workspace,dst=/workspace,readonly" \
+  --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null 2>&1; then
+  echo 'unmasked project Codex configuration was accepted without the attestation flag' >&2
+  exit 1
+fi
+
+# A WRITABLE mount whose directory mode merely excludes the runtime UID must be refused. This is the
+# exact shape that defeats a naive proof: `find` fails with "Permission denied" and prints nothing
+# (reading as empty), `[ -w ]` is false because uid 10001 lacks write, yet Codex can still read
+# config.toml and another writer sharing the volume can repopulate it after the check. Only the
+# mount's own `ro` option rules it out, so assert that a read-write mount never satisfies the mask.
+docker run --rm --network none --read-only --user 0:0 \
+  --mount "type=volume,src=$hostile_mask_volume,dst=/mask" --entrypoint /bin/sh "$image" \
+  -c 'printf hostile > /mask/config.toml; chmod 0644 /mask/config.toml; chmod 0111 /mask'
+if docker run --rm --network none --read-only --user 10001:10001 \
+  --mount "type=bind,src=$temporary/catalog-workspace,dst=/workspace,readonly" \
+  --mount "type=volume,src=$hostile_mask_volume,dst=/workspace/.codex" \
+  --entrypoint /opt/workflow-mcp/bin/codex-isolated "$image" --version >/dev/null 2>&1; then
+  echo 'a read-write project Codex mount satisfied the mask proof' >&2
+  exit 1
+fi
 
 # Authoring uses the same immutable policy but a real nested writable mount. Prove that exact
 # allowlist can perform durable file primitives while sibling project paths, state, credentials,

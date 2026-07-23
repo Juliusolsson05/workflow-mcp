@@ -124,6 +124,44 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
       message: 'final image policy probe is unavailable in embedded development mode',
     })
   }
+  // WHY agent-startup is its own check, and why it sits HERE: readiness proves the HTTP surface and
+  // store ownership, not that the provider can execute, so a daemon whose every agent will fail
+  // still reports READY and only reveals it hours later as an EPIPE buried in a workflow result —
+  // the isolation wrapper exits before the SDK can write the prompt. Running the exact wrapper the
+  // provider runs surfaces its own refusal sentence in `doctor`, which is where operators are told
+  // to look. It must come AFTER the data-layout gate and share its refusal, because the validated
+  // layout selector is the only authority for interpreting anything below /data: launching any
+  // executable against an unknown-newer tree would break the same absolute no-touch boundary the
+  // policy probe protects.
+  if (process.platform === 'linux' && basename(config.codexExecutable) === 'codex-isolated') {
+    if (!layoutReady) {
+      checks.push({
+        id: 'agent-startup',
+        status: 'fail',
+        message: 'agent startup proof is unavailable until the current data layout is validated',
+      })
+    } else {
+      try {
+        await executeAgentStartupProbe(config.codexExecutable)
+        checks.push({
+          id: 'agent-startup',
+          // Deliberately narrow: this proves the wrapper's gates admit a provider process, which is
+          // exactly the failure that used to surface as EPIPE. It is NOT a claim that a model call
+          // would succeed — credential state is reported by the separate authentication check.
+          status: 'pass',
+          message: 'the provider isolation wrapper starts, so agent launches are not blocked by project or secret policy',
+        })
+      } catch (error) {
+        checks.push({
+          id: 'agent-startup',
+          status: 'fail',
+          message: `workflow agents cannot start: ${
+            error instanceof Error ? error.message.slice(0, 400) : String(error).slice(0, 400)
+          }`,
+        })
+      }
+    }
+  }
   if (config.leaseMode === 'inherited-flock') {
     await tmpfsCheck(checks, dirname(config.adminSocketPath))
     if (config.lockFileDescriptor === undefined) {
@@ -167,6 +205,53 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
     dependencies: { codexSdk: CODEX_SDK_VERSION, mcpSdk: MCP_SDK_VERSION },
     checks,
   }
+}
+
+async function executeAgentStartupProbe(executable: string): Promise<void> {
+  // Deliberately the plain wrapper entry with `--version`: it passes exactly the gates a real
+  // attempt passes (project `.codex` masking, credential-secret readability) and then exits without
+  // contacting a model or mutating durable state. Its stderr is the operator-facing sentence we
+  // want in doctor, so surface that rather than a generic exit-code message. Isolate HOME/CODEX_HOME
+  // to a one-shot /tmp tree for the same reason the policy probe does: an observational command must
+  // not create Codex lock or cache entries in the durable volume without the daemon's flock.
+  const probeRoot = await mkdtemp('/tmp/workflow-mcp-doctor-startup-')
+  const probeHome = join(probeRoot, 'home')
+  const probeCache = join(probeRoot, 'cache')
+  const probeConfig = join(probeRoot, 'config')
+  const probeData = join(probeRoot, 'share')
+  try {
+    await Promise.all([
+      mkdir(probeHome, { mode: 0o700 }),
+      mkdir(probeCache, { mode: 0o700 }),
+      mkdir(probeConfig, { mode: 0o700 }),
+      mkdir(probeData, { mode: 0o700 }),
+    ])
+    await execute(executable, ['--version'], {
+      timeout: 15_000,
+      maxBuffer: 64 * 1_024,
+      // Every conventional state/cache root is redirected for the same reason the policy probe does
+      // it: an inherited XDG variable can point back under the durable volume, and an observational
+      // command must never create Codex lock or cache entries there without the daemon's flock.
+      env: {
+        ...process.env,
+        HOME: probeHome,
+        CODEX_HOME: probeHome,
+        TMPDIR: probeRoot,
+        XDG_CACHE_HOME: probeCache,
+        XDG_CONFIG_HOME: probeConfig,
+        XDG_DATA_HOME: probeData,
+      },
+    })
+  } catch (error) {
+    const stderr = isRecord(error) && typeof error.stderr === 'string' ? error.stderr.trim() : ''
+    throw new Error(stderr.length > 0 ? stderr : (error instanceof Error ? error.message : String(error)))
+  } finally {
+    await rm(probeRoot, { recursive: true, force: true })
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
 }
 
 async function executeCodexPolicyProbe(executable: string): Promise<string> {

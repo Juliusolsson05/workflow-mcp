@@ -125,9 +125,13 @@ describe('installation instance identity', () => {
     expect(output).toContain("api_key_file='/secrets/operator'\\''s key'")
     expect(output).not.toContain('$((')
     expect(output).toContain(`recorded_daemon_fingerprint='${DOCKER_DAEMON_FINGERPRINT}'`)
-    expect(output.split('\n')).toHaveLength(13)
+    expect(output.split('\n')).toHaveLength(14)
     expect(output).toContain("hardened='false'")
     expect(output).toContain("host_codex_auth='false'")
+    // The launcher compares filesystem identity against this recorded spelling before refusing a
+    // differently-cased path on a case-insensitive volume, so it must always be rendered — and it
+    // must survive the same single-quote escaping as every other host path.
+    expect(output).toContain("recorded_project_directory='/projects/operator'\\''s project'")
 
     // Encoding contract: a record with NO hardened field is from a pre-profile release whose only
     // shipped posture was the hardened one — it must render hardened, never silently relax on

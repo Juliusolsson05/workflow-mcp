@@ -172,12 +172,22 @@ export class CodexCredentialBroker {
     // Authentication receives only the process mechanics it needs. In particular, an API key,
     // admin bearer, or Compose secret path must not accidentally become a credential source for a
     // supposedly interactive login or appear in a Codex child diagnostic.
+    //
+    // The project-Codex mask attestation is forwarded because it is policy state, not a credential:
+    // dropping it is what made every `auth status`/`auth login` on a default install hit the
+    // isolation wrapper's unmasked refusal (a default install always creates <project>/.codex for
+    // the Codex stanza). The wrapper now proves the mask from the mount itself, so this forward is
+    // no longer load-bearing for correctness — it is kept so the wrapper's own diagnostics stay
+    // accurate about what the caller intended.
     return {
       PATH: process.env.PATH,
       LANG: process.env.LANG ?? 'C.UTF-8',
       TERM: process.env.TERM ?? 'dumb',
       HOME: this.#codexHome,
       CODEX_HOME: this.#codexHome,
+      ...(process.env.WORKFLOW_MCP_PROJECT_CODEX_MASKED === undefined
+        ? {}
+        : { WORKFLOW_MCP_PROJECT_CODEX_MASKED: process.env.WORKFLOW_MCP_PROJECT_CODEX_MASKED }),
     }
   }
 }
