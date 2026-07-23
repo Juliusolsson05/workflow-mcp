@@ -361,14 +361,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
-          # WHY: Ubuntu 24.04's AppArmor host default blocks Bubblewrap user namespaces before the
-          # candidate can prove its own no-capabilities/no-new-privileges sandbox. Release evidence
-          # must run that boundary, not skip it or relax the container; this change lasts only for
-          # the no-secret platform-gate VM and is verified before candidate execution.
-          if test -e "$control"; then
-            echo 0 | sudo tee "$control" >/dev/null
-            test "$(cat "$control")" = 0
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          # WHY: Ubuntu 24.04's AppArmor control and the runner's generic clone control can each
+          # block Bubblewrap before the candidate proves its no-capabilities/no-new-privileges
+          # sandbox. Release evidence must run that boundary, not relax the container; both changes
+          # last only for this no-secret VM and are verified before candidate execution.
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
           fi
       - name: Exercise native final-image contracts
         run: standalone/scripts/container-smoke.sh "$IMAGE@${{ needs.build.outputs.digest }}"

@@ -66,14 +66,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
-          # WHY: Ubuntu 24.04's host AppArmor default blocks Bubblewrap before the container's own
-          # no-capabilities/no-new-privileges policy can be tested. This ephemeral no-secret VM is
-          # the security fixture itself, so enable the kernel feature Codex requires for one boot
-          # and prove the write took effect; never replace the sandbox with an unconfined mode.
-          if test -e "$control"; then
-            echo 0 | sudo tee "$control" >/dev/null
-            test "$(cat "$control")" = 0
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          # WHY: Ubuntu 24.04's AppArmor control and hosted-runner clone control can each block
+          # Bubblewrap before the container's own no-capabilities/no-new-privileges policy is
+          # tested. This ephemeral no-secret VM is the security fixture itself, so enable both
+          # kernel features for one boot and prove each write; never unconfine the sandbox.
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
           fi
       - name: Exercise final-image contracts
         run: standalone/scripts/container-smoke.sh workflow-mcp:ci

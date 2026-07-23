@@ -15,9 +15,11 @@ also scanned at the release threshold. The build job attaches max provenance and
 index and signs that digest; promotion must copy that index rather than rebuild it.
 
 Those Ubuntu 24.04 platform-gate VMs explicitly set
-`kernel.apparmor_restrict_unprivileged_userns=0` for that one disposable, credential-free job before
-the final-image probe. Ubuntu documents this as a one-boot way to permit unprivileged user
-namespaces. This is test-host preparation, not a relaxation of the candidate container: the image
+`kernel.apparmor_restrict_unprivileged_userns=0` and, when exposed by the runner kernel,
+`kernel.unprivileged_userns_clone=1` for that one disposable, credential-free job before the
+final-image probe. Ubuntu documents the AppArmor control as a one-boot way to permit unprivileged
+user namespaces; Bubblewrap also requires the generic clone control. This is test-host preparation,
+not a relaxation of the candidate container: the image
 still runs non-root with all capabilities dropped, `no-new-privileges`, the default seccomp profile,
 and a read-only root. Production Linux evidence must record either a narrow AppArmor policy that
 permits the nested Bubblewrap namespace or the reviewed host setting; Docker Desktop evidence must

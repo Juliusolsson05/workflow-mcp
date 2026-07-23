@@ -11,9 +11,10 @@ Codex's Linux Bubblewrap boundary requires unprivileged user namespaces on the D
 Desktop supplies that Linux-VM capability. Native Linux operators must allow the container runtime
 to create nested user namespaces; Ubuntu 24.04 enables an AppArmor restriction that can deny them
 unless the administrator supplies an appropriate AppArmor policy or changes the documented
-`kernel.apparmor_restrict_unprivileged_userns` host setting. The launcher/doctor fails closed when
-the real sandbox probe cannot start. Do not work around this prerequisite with a privileged
-container, `seccomp=unconfined`, or a disabled Codex sandbox. See the
+`kernel.apparmor_restrict_unprivileged_userns` host setting. Hosts that expose
+`kernel.unprivileged_userns_clone` must also enable it. The launcher/doctor fails closed when the
+real sandbox probe cannot start. Do not work around this prerequisite with a privileged container,
+`seccomp=unconfined`, or a disabled Codex sandbox. See the
 [Ubuntu 24.04 security notes](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
 
 The normal installation is one long-lived daemon per project. Codex connects to a tiny STDIO proxy

@@ -27,13 +27,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
           # WHY: current-ecosystem qualification must execute the real Bubblewrap boundary. Ubuntu
-          # 24.04 otherwise denies nested unprivileged namespaces at the host AppArmor layer and
-          # would measure the runner image rather than Workflow MCP's hardened container contract.
-          if test -e "$control"; then
-            echo 0 | sudo tee "$control" >/dev/null
-            test "$(cat "$control")" = 0
+          # 24.04 AppArmor and the runner's generic clone control can independently deny the nested
+          # namespace and measure the runner image instead of Workflow MCP's hardened container.
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
           fi
       - name: Test source and build the native image
         run: |
