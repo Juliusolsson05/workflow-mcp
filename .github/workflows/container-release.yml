@@ -90,6 +90,11 @@ jobs:
           npm ci --include=dev
           npm --prefix standalone ci --include=dev
           npm run typecheck
+          # The standalone package resolves `workflow-mcp` through its file:.. dependency, whose
+          # types live in the root dist. A fresh checkout has no dist, so standalone's typecheck
+          # fails with TS2307 unless the root package is built first — caught by the first real
+          # v0.1.0 release run; every other CI surface happened to build the root before checking.
+          npm run build
           npm --prefix standalone run check
 
   release-control-preflight:
