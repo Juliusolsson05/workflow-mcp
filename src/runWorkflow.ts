@@ -171,6 +171,8 @@ export type WorkflowRun = {
   events: AsyncIterable<WorkflowEvent>
   result: Promise<unknown>
   cancel(reason?: string): Promise<void>
+  /** Host lifecycle interruption is recoverable evidence, not a user cancellation. */
+  interrupt(reason?: string): Promise<void>
   /** False while an adapter execution survived every cooperative and hard-stop deadline. */
   ownershipReleaseSafe?(): boolean
   /** Settles only after every already-quarantined adapter execution has actually stopped. */
@@ -187,6 +189,13 @@ export class WorkflowCancelledError extends Error {
   constructor(message = 'Workflow cancelled') {
     super(message)
     this.name = 'AbortError'
+  }
+}
+
+export class WorkflowInterruptedError extends Error {
+  constructor(message = 'Workflow host interrupted execution') {
+    super(message)
+    this.name = 'WorkflowInterruptedError'
   }
 }
 
@@ -426,9 +435,10 @@ class WorkflowRuntime {
   #budgetSpent = 0
   #terminal = false
   #failing = false
-  #terminalOwner: 'completion' | 'failure' | 'cancellation' | undefined
+  #terminalOwner: 'completion' | 'failure' | 'cancellation' | 'interruption' | undefined
   #emitTail: Promise<void> = Promise.resolve()
   #cancelPromise: Promise<void> | undefined
+  #interruptPromise: Promise<void> | undefined
   #wallClockTimer: NodeJS.Timeout | undefined
   #underutilizationTimer: NodeJS.Timeout | undefined
   #lastUnderutilizationSignature: string | undefined
@@ -489,6 +499,7 @@ class WorkflowRuntime {
       events: this.#stream,
       result: this.#result.promise,
       cancel: (reason?: string) => this.cancel(reason),
+      interrupt: (reason?: string) => this.interrupt(reason),
       ownershipReleaseSafe: () => (
         this.#quarantinedExecutions.size === 0 && this.#tasks.size === 0
       ),
@@ -515,8 +526,15 @@ class WorkflowRuntime {
   async cancel(reason = 'Workflow cancelled'): Promise<void> {
     if (this.#terminal) return
     if (this.#cancelPromise) return this.#cancelPromise
-    this.#cancelPromise = this.#cancel(reason)
+    this.#cancelPromise = this.#terminate(reason, 'cancellation')
     return this.#cancelPromise
+  }
+
+  async interrupt(reason = 'Workflow host interrupted execution'): Promise<void> {
+    if (this.#terminal) return
+    if (this.#interruptPromise) return this.#interruptPromise
+    this.#interruptPromise = this.#terminate(reason, 'interruption')
+    return this.#interruptPromise
   }
 
   async #run(): Promise<void> {
@@ -616,7 +634,7 @@ class WorkflowRuntime {
         return
       }
       if (this.#controller.signal.aborted && !this.#failing) {
-        if (!this.#cancelPromise) {
+        if (!this.#cancelPromise && !this.#interruptPromise) {
           await this.cancel(abortReason(this.#controller.signal)).catch(() => undefined)
         }
         return
@@ -629,14 +647,21 @@ class WorkflowRuntime {
     }
   }
 
-  async #cancel(reason: string): Promise<void> {
+  async #terminate(
+    reason: string,
+    mode: 'cancellation' | 'interruption',
+  ): Promise<void> {
     if (this.#terminal) return
-    if (!this.#claimTerminal('cancellation')) return
+    if (!this.#claimTerminal(mode)) return
+
+    const terminalError = mode === 'cancellation'
+      ? new WorkflowCancelledError(reason)
+      : new WorkflowInterruptedError(reason)
 
     // Abort first. Event sinks are external code and may be slow or wedged; they must never delay
     // stopping credentialed provider work after the user or wall-clock limit requested cancel.
     if (!this.#controller.signal.aborted) {
-      this.#controller.abort(new WorkflowCancelledError(reason))
+      this.#controller.abort(terminalError)
     }
     this.#clearWallClockTimer()
     for (const worker of this.#workers) this.#sendBestEffort(worker, { type: 'cancel', reason })
@@ -644,10 +669,12 @@ class WorkflowRuntime {
     // Diagnostic persistence has its own finite deadline, but process shutdown should not spend
     // even that budget before escalation begins. The serialized emit tail preserves ordering if
     // storage recovers; the storage-degraded fence closes admission if it does not.
-    void this.#emit({
-      type: 'run.cancellation_requested',
-      payload: reason.length === 0 ? {} : { reason },
-    }).catch(() => undefined)
+    if (mode === 'cancellation') {
+      void this.#emit({
+        type: 'run.cancellation_requested',
+        payload: reason.length === 0 ? {} : { reason },
+      }).catch(() => undefined)
+    }
 
     await Promise.race([
       Promise.allSettled([...this.#tasks]),
@@ -676,20 +703,25 @@ class WorkflowRuntime {
     ])
 
     try {
-      await this.#failOpenPhases(new WorkflowCancelledError(reason))
+      await this.#failOpenPhases(terminalError)
     } catch {
       // A storage-degraded run may be unable to persist phase diagnostics. Terminal settlement and
       // process cleanup remain mandatory even when those explanatory events cannot be appended.
     }
 
     try {
-      await this.#emit({
-        type: 'run.cancelled',
-        payload: reason.length === 0 ? {} : { reason },
-      })
+      await this.#emit(mode === 'cancellation'
+        ? {
+            type: 'run.cancelled',
+            payload: reason.length === 0 ? {} : { reason },
+          }
+        : {
+            type: 'run.interrupted',
+            payload: { reason },
+          })
     } finally {
       this.#terminal = true
-      this.#result.reject(new WorkflowCancelledError(reason))
+      this.#result.reject(terminalError)
       this.#stream.close()
     }
   }
@@ -760,7 +792,7 @@ class WorkflowRuntime {
     this.#lastUnderutilizationSignature = undefined
   }
 
-  #claimTerminal(owner: 'completion' | 'failure' | 'cancellation'): boolean {
+  #claimTerminal(owner: 'completion' | 'failure' | 'cancellation' | 'interruption'): boolean {
     if (this.#terminalOwner !== undefined) return false
     this.#terminalOwner = owner
     return true

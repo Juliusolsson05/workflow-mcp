@@ -39,6 +39,8 @@ import type {
   WorkflowAgentResultsPage,
   WorkflowAgentTranscriptPage,
   WorkflowResultPage,
+  WorkflowRunListInput,
+  WorkflowRunListPage,
   WorkflowStore,
   WorkflowStoreLease,
 } from './workflowStore.js'
@@ -193,6 +195,7 @@ export type WorkflowServiceErrorCode =
   | 'scope-forbidden'
   | 'workflow-not-found'
   | 'run-not-resumable'
+  | 'service-stopping'
   | 'service-stopped'
   | 'unsafe-provider-active'
   | 'source-approval-required'
@@ -201,6 +204,7 @@ export type WorkflowServiceErrorCode =
   | 'result-not-found'
   | 'agent-not-found'
   | 'result-expired'
+  | 'cursor-ahead'
   | 'invalid-cursor'
   | 'invalid-request'
 
@@ -295,6 +299,14 @@ function parseAgentResultsCursor(
 
 export type WorkflowServiceListener = (event: StoredWorkflowEvent) => void
 
+export type WorkflowServiceLifecycleState =
+  | 'NEW'
+  | 'INITIALIZING'
+  | 'READY'
+  | 'QUIESCING'
+  | 'STOPPED'
+  | 'FAILED'
+
 /**
  * Long-lived owner for workflow discovery, execution, persistence, and recovery.
  *
@@ -319,8 +331,10 @@ export class WorkflowService {
   #storeLeaseRelease: Promise<void> | undefined
   #initializePromise: Promise<void> | undefined
   #stopPromise: Promise<void> | undefined
-  #initialized = false
-  #stopped = false
+  #closingMode: 'cancellation' | 'interruption' | undefined
+  #lifecycle: WorkflowServiceLifecycleState = 'NEW'
+  #admittedMutations = 0
+  readonly #admissionDrainWaiters = new Set<() => void>()
 
   constructor(options: WorkflowServiceOptions) {
     this.#options = options
@@ -330,15 +344,28 @@ export class WorkflowService {
   }
 
   async initialize(): Promise<void> {
-    if (this.#stopped) {
+    if (this.#lifecycle === 'READY') return
+    if (this.#lifecycle === 'QUIESCING') {
+      throw new WorkflowServiceError('service-stopping', 'Workflow service is stopping')
+    }
+    if (this.#lifecycle === 'STOPPED') {
       throw new WorkflowServiceError('service-stopped', 'Workflow service is stopped')
     }
-    if (this.#initialized) return
+    if (this.#lifecycle === 'FAILED') {
+      throw new WorkflowServiceError('invalid-request', 'Workflow service initialization failed')
+    }
     if (this.#initializePromise) return this.#initializePromise
+    this.#lifecycle = 'INITIALIZING'
     const initialization = this.#initializeOnce()
     this.#initializePromise = initialization
     try {
       await initialization
+      // A concurrent quiesce owns the state transition once it has closed admission. Initialization
+      // may finish cleaning up after that point, but it must never reopen a daemon that is stopping.
+      if (this.#lifecycle === 'INITIALIZING') this.#lifecycle = 'READY'
+    } catch (error) {
+      if (this.#lifecycle === 'INITIALIZING') this.#lifecycle = 'FAILED'
+      throw error
     } finally {
       if (this.#initializePromise === initialization) this.#initializePromise = undefined
     }
@@ -354,24 +381,23 @@ export class WorkflowService {
         `workflow-service:${randomUUID()}`,
       )
       this.#storeLease = acquiredLease
-      if (this.#stopped) {
+      if (this.#isClosing()) {
         await this.#releaseStoreLease()
-        throw new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+        throw this.#initializationClosingError()
       }
       await this.#options.store.initialize()
       // stop() may arrive while an asynchronous store repair is in flight. It deliberately waits
       // for this initialization owner rather than stealing the lease, so this owner must notice the
       // stop before advertising availability or creating recovery successors.
-      if (this.#stopped) {
-        throw new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+      if (this.#isClosing()) {
+        throw this.#initializationClosingError()
       }
-      this.#initialized = true
       const manifests = await this.#options.store.listManifests()
       // The manifest scan can itself be a long filesystem operation on a FAT history. Recheck at
       // each awaited boundary: otherwise a stop which lands during the scan can return only after
       // initialization has unexpectedly launched every automatic-recovery run.
-      if (this.#stopped) {
-        throw new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+      if (this.#isClosing()) {
+        throw this.#initializationClosingError()
       }
       const continuedRuns = new Set(
         manifests.flatMap((manifest) => (
@@ -460,7 +486,6 @@ export class WorkflowService {
       // the lock after a store scan failure creates a service that refuses requests yet blocks the
       // next healthy process from recovering. Recovery is retriable only from a clean ownership
       // boundary.
-      this.#initialized = false
       // Only the initializer which acquired this generation may release it. A concurrent caller
       // awaits the same promise, so it cannot tear down a lease another successful initializer won.
       if (this.#storeLease === acquiredLease) {
@@ -481,33 +506,66 @@ export class WorkflowService {
   }
 
   async stop(reason = 'Workflow service is stopping'): Promise<void> {
+    return this.#beginStop(reason, 'cancellation')
+  }
+
+  /**
+   * Stop the host without claiming that an operator cancelled its workflows.
+   *
+   * This is additive because Agent Code historically uses stop() as an explicit cancellation
+   * boundary. Container replacement has different semantics: the durable history must say that
+   * the owner disappeared and leave replay-safe work eligible for recovery.
+   */
+  async quiesce(reason = 'Workflow service host is stopping'): Promise<void> {
+    return this.#beginStop(reason, 'interruption')
+  }
+
+  lifecycleState(): WorkflowServiceLifecycleState {
+    return this.#lifecycle
+  }
+
+  #beginStop(reason: string, mode: 'cancellation' | 'interruption'): Promise<void> {
     if (this.#stopPromise) return this.#stopPromise
-    this.#stopped = true
-    const stopping = this.#stopOnce(reason)
+    if (this.#lifecycle === 'STOPPED') return Promise.resolve()
+
+    // This assignment and mutation admission happen synchronously on one JavaScript turn. Closing
+    // the gate before the first await is what prevents an async source lookup from registering a
+    // provider after shutdown has already taken its active-run snapshot.
+    this.#lifecycle = 'QUIESCING'
+    this.#closingMode = mode
+    for (const waiters of this.#waiters.values()) for (const wake of waiters) wake()
+    this.#waiters.clear()
+
+    const stopping = this.#stopOnce(reason, mode)
     this.#stopPromise = stopping
-    try {
-      await stopping
-    } finally {
+    void stopping.then(
+      () => { this.#lifecycle = 'STOPPED' },
+      () => { this.#lifecycle = 'FAILED' },
+    ).finally(() => {
       // FileWorkflowStore.release() deliberately remains retryable after transient I/O failure.
       // Do not memoize a rejected service stop forever or callers can never exercise that retry.
       if (this.#stopPromise === stopping) this.#stopPromise = undefined
-    }
+    })
+    return stopping
   }
 
-  async #stopOnce(reason: string): Promise<void> {
+  async #stopOnce(reason: string, mode: 'cancellation' | 'interruption'): Promise<void> {
     // Initialization owns the lease transition and recovery scan. Cancelling/releasing in the
     // middle would let a second host enter while the first still mutates manifests. Once the shared
     // initialization promise settles, this stop owns a clean, deterministic teardown boundary.
     await this.#initializePromise?.catch(() => undefined)
+    // An admitted start may be between its first filesystem lookup and registration in #active.
+    // Waiting for the admission transaction is the only point at which the run snapshot is closed.
+    await this.#waitForAdmissionDrain()
     let ownershipCanTransfer = true
     try {
       const runs = [...this.#active.values()]
-      await Promise.allSettled(runs.map((run) => run.cancel(reason)))
+      await Promise.allSettled(runs.map((run) => (
+        mode === 'interruption' ? run.interrupt(reason) : run.cancel(reason)
+      )))
       this.#active.clear()
       ownershipCanTransfer = [...this.#ownedRuns.values()]
         .every((run) => run.ownershipReleaseSafe?.() !== false)
-      for (const waiters of this.#waiters.values()) for (const wake of waiters) wake()
-      this.#waiters.clear()
     } finally {
       // WHY an unconfirmed adapter keeps the store lease even after its logical run failed: the
       // old execution may still be mutating its workspace and can wake later with callbacks into
@@ -545,6 +603,18 @@ export class WorkflowService {
     }))
   }
 
+  /** Path-redacted, bounded inventory used by standalone control surfaces. */
+  async listRuns(input: WorkflowRunListInput = {}): Promise<WorkflowRunListPage> {
+    this.#assertAvailable()
+    if (this.#options.store.listRuns === undefined) {
+      throw new WorkflowServiceError(
+        'invalid-request',
+        'This workflow store does not support bounded run inventory',
+      )
+    }
+    return this.#options.store.listRuns(input)
+  }
+
   /** Synchronous process lease used by hosts which must not replace a provider executable mid-run. */
   hasActiveRuns(): boolean {
     return this.#active.size > 0 || this.#ownedRuns.size > 0
@@ -563,9 +633,14 @@ export class WorkflowService {
   }
 
   async start(scope: WorkflowServiceScope, input: WorkflowStartInput): Promise<WorkflowRunStartResult> {
-    this.#assertAvailable()
-    validateIdempotencyKey(input.idempotencyKey)
-    return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => this.#startOnce(scope, input))
+    return this.#withMutationAdmission(async () => {
+      validateIdempotencyKey(input.idempotencyKey)
+      return this.#serializeIdempotentStart(
+        scope,
+        input.idempotencyKey,
+        () => this.#startOnce(scope, input),
+      )
+    })
   }
 
   async #startOnce(scope: WorkflowServiceScope, input: WorkflowStartInput): Promise<WorkflowRunStartResult> {
@@ -614,10 +689,12 @@ export class WorkflowService {
 
   async #healthFromSnapshot(snapshot: WorkflowRunSnapshot): Promise<WorkflowRunHealth> {
     const runId = snapshot.manifest.runId
-    const successor = (await this.#options.store.listManifests())
-      .filter((manifest) => manifest.resumedFromRunId === runId)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-      .at(-1)
+    const successor = this.#options.store.findLatestSuccessor === undefined
+      ? (await this.#options.store.listManifests())
+          .filter((manifest) => manifest.resumedFromRunId === runId)
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+          .at(-1)
+      : await this.#options.store.findLatestSuccessor(runId)
     const attempts = snapshot.state.agents.flatMap((agent) => agent.attempts)
     const progressTimes = attempts
       .map((attempt) => attempt.lastProgressAt)
@@ -671,13 +748,28 @@ export class WorkflowService {
     const waitMs = boundedInteger(input.waitMs ?? 0, 'waitMs', 0, MAX_WAIT_MS)
     let manifest = await this.status(scope, input.runId)
     const observedVersion = this.#runVersions.get(input.runId) ?? 0
-    let page = await this.#options.store.readEvents(input.runId, after, limit)
+    let page = await this.#readEventPage(input.runId, after, limit)
     if (page.events.length > 0 || waitMs === 0 || TERMINAL_STATUSES.has(manifest.status)) return page
 
     await this.#waitForEvent(input.runId, waitMs, observedVersion)
     manifest = await this.status(scope, input.runId)
-    page = await this.#options.store.readEvents(input.runId, after, limit)
+    page = await this.#readEventPage(input.runId, after, limit)
     return page
+  }
+
+  async #readEventPage(runId: string, after: number, limit: number): Promise<WorkflowEventPage> {
+    try {
+      return await this.#options.store.readEvents(runId, after, limit)
+    } catch (cause) {
+      if (hasErrorCode(cause, 'cursor-ahead')) {
+        throw new WorkflowServiceError(
+          'cursor-ahead',
+          `Workflow event cursor ${after} is ahead of the durable stream for ${runId}`,
+          { cause },
+        )
+      }
+      throw cause
+    }
   }
 
   async readResult(
@@ -1060,25 +1152,31 @@ export class WorkflowService {
     runId: string,
     reason = 'Cancelled by workflow client',
   ): Promise<WorkflowRunManifest> {
-    const manifest = await this.status(scope, runId)
-    if (TERMINAL_STATUSES.has(manifest.status)) return manifest
-    const active = this.#active.get(runId)
-    if (!active) {
-      // A non-terminal manifest without an active owner can only exist between startup and recovery
-      // or after an invariant failure. Refusing to fabricate cancellation preserves the distinction
-      // that run.interrupted exists to communicate.
-      throw new WorkflowServiceError('invalid-request', `Workflow run is not active: ${runId}`)
-    }
-    await active.cancel(reason)
-    return this.status(scope, runId)
+    return this.#withMutationAdmission(async () => {
+      const manifest = await this.#requiredScopedManifest(scope, runId)
+      if (TERMINAL_STATUSES.has(manifest.status)) return manifest
+      const active = this.#active.get(runId)
+      if (!active) {
+        // A non-terminal manifest without an active owner can only exist between startup and recovery
+        // or after an invariant failure. Refusing to fabricate cancellation preserves the distinction
+        // that run.interrupted exists to communicate.
+        throw new WorkflowServiceError('invalid-request', `Workflow run is not active: ${runId}`)
+      }
+      await active.cancel(reason)
+      // Quiesce may close admission while this already-admitted cancellation waits for its durable
+      // event. Calling public status() here would turn successful cancellation into a misleading
+      // service-stopping error, so finish the same admission transaction with an internal read.
+      return this.#requiredScopedManifest(scope, runId)
+    })
   }
 
   async resume(scope: WorkflowServiceScope, input: WorkflowResumeInput): Promise<WorkflowRunStartResult> {
-    this.#assertAvailable()
-    validateIdempotencyKey(input.idempotencyKey)
-    return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => (
-      'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeRunId(scope, input)
-    ))
+    return this.#withMutationAdmission(async () => {
+      validateIdempotencyKey(input.idempotencyKey)
+      return this.#serializeIdempotentStart(scope, input.idempotencyKey, () => (
+        'claudeRunPath' in input ? this.#resumeClaude(scope, input) : this.#resumeRunId(scope, input)
+      ))
+    })
   }
 
   async #resumeRunId(
@@ -1162,7 +1260,7 @@ export class WorkflowService {
         `[workflow-mcp] Operator abandoned ${abandoned} unconfirmed provider execution(s) before resuming ${input.runId}`,
       )
     }
-    const original = await this.status(scope, input.runId)
+    const original = await this.#requiredScopedManifest(scope, input.runId)
     if (!['interrupted', 'failed', 'cancelled', 'completed_with_errors'].includes(original.status)) {
       throw new WorkflowServiceError(
         'run-not-resumable',
@@ -1194,6 +1292,8 @@ export class WorkflowService {
       : originalArgs
     const priorJournal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(input.runId),
+      [],
+      this.#options.store.journalWriteCoordinator?.(),
     )
     const priorSnapshots = priorJournal.getSnapshots()
     const exactSourceAndArgs =
@@ -1387,6 +1487,7 @@ export class WorkflowService {
     const journal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(runId),
       input.journalSnapshots,
+      this.#options.store.journalWriteCoordinator?.(),
     )
     const circuitKey = this.#options.providerCircuitKey?.(provider, providerContext) ?? provider.name
     if (circuitKey.length === 0) {
@@ -1483,7 +1584,7 @@ export class WorkflowService {
         void run.waitForOwnershipRelease?.().then(async () => {
           if (run.ownershipReleaseSafe?.() === false) return
           this.#ownedRuns.delete(runId)
-          if (this.#stopped && [...this.#ownedRuns.values()]
+          if ((this.#lifecycle === 'QUIESCING' || this.#lifecycle === 'FAILED') && [...this.#ownedRuns.values()]
             .every((owned) => owned.ownershipReleaseSafe?.() !== false)) {
             await this.#releaseStoreLease()
           }
@@ -1517,6 +1618,9 @@ export class WorkflowService {
     lineageId: string,
     predecessorRunId: string,
   ): Promise<WorkflowRunManifest | undefined> {
+    if (this.#options.store.findActiveLineageSuccessor !== undefined) {
+      return this.#options.store.findActiveLineageSuccessor(lineageId, predecessorRunId)
+    }
     return (await this.#options.store.listManifests())
       .filter((manifest) => (
         manifest.runId !== predecessorRunId &&
@@ -1578,6 +1682,15 @@ export class WorkflowService {
     return manifest
   }
 
+  async #requiredScopedManifest(
+    scope: WorkflowServiceScope,
+    runId: string,
+  ): Promise<WorkflowRunManifest> {
+    const manifest = await this.#requiredManifest(runId)
+    this.#assertScope(scope, manifest)
+    return manifest
+  }
+
   #assertScope(scope: WorkflowServiceScope, manifest: WorkflowRunManifest): void {
     if (resolve(scope.cwd) === manifest.cwd) return
     // Manifests store resolve()d paths, but a client may address the same project through a
@@ -1597,10 +1710,50 @@ export class WorkflowService {
   }
 
   #assertAvailable(): void {
-    if (this.#stopped) throw new WorkflowServiceError('service-stopped', 'Workflow service is stopped')
-    if (!this.#initialized) {
+    if (this.#lifecycle === 'QUIESCING') {
+      throw new WorkflowServiceError('service-stopping', 'Workflow service is stopping')
+    }
+    if (this.#lifecycle === 'STOPPED') {
+      throw new WorkflowServiceError('service-stopped', 'Workflow service is stopped')
+    }
+    if (this.#lifecycle !== 'READY') {
       throw new WorkflowServiceError('invalid-request', 'Workflow service must be initialized first')
     }
+  }
+
+  #isClosing(): boolean {
+    // Kept as a method because lifecycle may change while an awaited store operation is in flight;
+    // TypeScript's local control-flow narrowing cannot observe that asynchronous transition.
+    return this.#lifecycle === 'QUIESCING' || this.#lifecycle === 'STOPPED'
+  }
+
+  #initializationClosingError(): WorkflowServiceError {
+    // Preserve stop()'s historical code for Agent Code while the additive daemon quiesce path gets
+    // the typed transitional outcome needed by clients deciding whether to reconnect.
+    return this.#closingMode === 'interruption'
+      ? new WorkflowServiceError('service-stopping', 'Workflow service stopped during initialization')
+      : new WorkflowServiceError('service-stopped', 'Workflow service stopped during initialization')
+  }
+
+  #withMutationAdmission<T>(mutation: () => Promise<T>): Promise<T> {
+    this.#assertAvailable()
+    this.#admittedMutations += 1
+    return (async () => {
+      try {
+        return await mutation()
+      } finally {
+        this.#admittedMutations -= 1
+        if (this.#admittedMutations === 0) {
+          for (const wake of this.#admissionDrainWaiters) wake()
+          this.#admissionDrainWaiters.clear()
+        }
+      }
+    })()
+  }
+
+  #waitForAdmissionDrain(): Promise<void> {
+    if (this.#admittedMutations === 0) return Promise.resolve()
+    return new Promise(resolveDrain => this.#admissionDrainWaiters.add(resolveDrain))
   }
 
   async #automaticRecoveryIsSafe(manifest: WorkflowRunManifest): Promise<boolean> {
@@ -1635,6 +1788,8 @@ export class WorkflowService {
     ))
     const journal = await PersistentWorkflowJournal.open(
       this.#options.store.journalPath(manifest.runId),
+      [],
+      this.#options.store.journalWriteCoordinator?.(),
     )
     const terminalJournalCalls = new Set(
       journal.getSnapshots().flatMap((journalSnapshot) => (

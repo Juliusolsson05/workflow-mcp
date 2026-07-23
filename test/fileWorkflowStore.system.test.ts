@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
+import { PersistentWorkflowJournal } from '../src/persistentWorkflowJournal.js'
 import type { WorkflowEvent } from '../src/workflowEvents.js'
 import { createJournalKey } from '../src/workflowJournal.js'
 
@@ -67,8 +68,72 @@ describe('FileWorkflowStore', () => {
 
     expect(stored.cursor).toBe(1)
     expect(page).toMatchObject({ fromCursor: 0, toCursor: 1, hasMore: false })
+    await expect(store.readEvents('run_store', 1, 10)).resolves.toMatchObject({
+      fromCursor: 1,
+      toCursor: 1,
+      events: [],
+      hasMore: false,
+    })
+    await expect(store.readEvents('run_store', 2, 10)).rejects.toMatchObject({
+      code: 'cursor-ahead',
+    })
     expect(snapshot).toMatchObject({ cursor: 1, state: { status: 'running', sequence: 1 } })
     await expect(store.loadArgs('run_store')).resolves.toEqual({ provided: true, value: { a: 1 } })
+  })
+
+  it('fences store and persistent-journal writers before releasing ownership', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-store-writer-fence-'))
+    const store = new FileWorkflowStore(root)
+    const lease = await store.acquireLease('fenced-writer')
+    await store.initialize()
+    await store.createRun({ runId: 'run_fenced', cwd: root, workflow: loaded() })
+    const journal = await PersistentWorkflowJournal.open(
+      store.journalPath('run_fenced'),
+      [],
+      store.journalWriteCoordinator(),
+    )
+    const run = journal.beginRun({ workflowId: 'root', sourceHash: loaded().sourceHash })
+    run.admit({ agentId: 'agent_1', prompt: 'before release' })
+
+    await lease.release()
+
+    await expect(store.appendEvent('run_fenced', started('run_fenced'))).rejects.toMatchObject({
+      code: 'owner-conflict',
+    })
+    expect(() => run.admit({ agentId: 'agent_2', prompt: 'after release' })).toThrow(
+      expect.objectContaining({ code: 'owner-conflict' }),
+    )
+  })
+
+  it('paginates a path-redacted run inventory with filter-bound keyset cursors', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-store-inventory-'))
+    const store = new FileWorkflowStore(root)
+    await store.acquireLease('inventory-writer')
+    await store.initialize()
+    for (const runId of ['run_a', 'run_b', 'run_c']) {
+      await store.createRun({ runId, cwd: join(root, 'private-project'), workflow: loaded() })
+    }
+    await store.appendEvent('run_b', started('run_b'))
+
+    const collected: string[] = []
+    let cursor: string | undefined
+    do {
+      const page = await store.listRuns({ limit: 1, ...(cursor === undefined ? {} : { cursor }) })
+      collected.push(...page.items.map(item => item.runId))
+      expect(JSON.stringify(page.items)).not.toContain('private-project')
+      cursor = page.nextCursor
+      if (!page.hasMore) break
+    } while (true)
+    expect(collected).toEqual(['run_a', 'run_b', 'run_c'])
+
+    const running = await store.listRuns({ statuses: ['running'], limit: 10 })
+    expect(running.items).toEqual([expect.objectContaining({ runId: 'run_b', status: 'running' })])
+    const first = await store.listRuns({ limit: 1 })
+    await expect(store.listRuns({
+      cursor: first.nextCursor!,
+      limit: 1,
+      statuses: ['running'],
+    })).rejects.toMatchObject({ code: 'invalid-cursor' })
   })
 
   it('truncates only a torn final JSONL append during startup recovery', async () => {

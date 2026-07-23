@@ -475,6 +475,27 @@ describe('cancellation, journal, and composition', () => {
     expect(provider.activeExecutions).toBe(0)
   })
 
+  it('records host interruption without claiming the operator cancelled the run', async () => {
+    const source = workflow(`return await agent('wait for host restart')`)
+    const { provider, run, events } = start(source, [
+      { outcome: { type: 'wait-for-abort' } },
+    ], { limits: { cancellationGraceMs: 100 } })
+    const rejection = run.result.catch((error: unknown) => error)
+
+    while (provider.activeExecutions === 0) await new Promise((resolveWait) => setTimeout(resolveWait, 2))
+    await run.interrupt('daemon is restarting')
+
+    await expect(rejection).resolves.toMatchObject({ name: 'WorkflowInterruptedError' })
+    const captured = await events
+    expect(captured.some((event) => event.type === 'run.cancellation_requested')).toBe(false)
+    expect(captured.at(-1)).toMatchObject({
+      type: 'run.interrupted',
+      payload: { reason: 'daemon is restarting' },
+    })
+    expect(projectWorkflowState(run.id, captured).status).toBe('interrupted')
+    expect(provider.activeExecutions).toBe(0)
+  })
+
   it('cancels queued agents without inventing provider attempts', async () => {
     const source = workflow(`
       return await parallel([

@@ -29,7 +29,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc",
+    "generate:metadata": "node scripts/generate-build-metadata.mjs",
+    "build": "npm run generate:metadata && node scripts/clean-dist.mjs && tsc",
     "typecheck": "tsc --noEmit && npm run check:browser-state",
     "test": "npm run build && vitest run --project core && vitest run --project system && vitest run --project corpus",
     "test:core": "npm run build && vitest run --project core",

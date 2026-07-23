@@ -361,6 +361,10 @@ describe('WorkflowService', () => {
     )
     expect(firstPage).toMatchObject({ fromCursor: 0, toCursor: 2, hasMore: true })
     const before = await service.status({ cwd: fixture.cwd }, run.runId)
+    await expect(service.readEvents(
+      { cwd: fixture.cwd },
+      { runId: run.runId, after: before.cursor + 1, waitMs: 1_000 },
+    )).rejects.toMatchObject({ code: 'cursor-ahead' })
     const timeoutStart = Date.now()
     const empty = await service.readEvents(
       { cwd: fixture.cwd },
@@ -385,6 +389,90 @@ describe('WorkflowService', () => {
     expect(all.events.at(-1)?.event.type).toBe('run.cancelled')
     expect((await service.status({ cwd: fixture.cwd }, run.runId)).status).toBe('cancelled')
     await service.stop()
+  })
+
+  it('quiesces active work as interrupted, wakes long polls, and closes mutation admission', async () => {
+    const fixture = await project(`export const meta = { name: 'quiesce-me', description: 'Restart fixture' }
+      return await agent('wait for host restart')`)
+    const store = new FileWorkflowStore(fixture.storeRoot)
+    const service = new WorkflowService({
+      store,
+      provider: new FakeAgentProvider([{ outcome: { type: 'wait-for-abort' } }]),
+    })
+    await service.initialize()
+    const run = await service.start({ cwd: fixture.cwd }, { name: 'quiesce-me' })
+    let manifest = await service.status({ cwd: fixture.cwd }, run.runId)
+    while (manifest.cursor < 5) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+      manifest = await service.status({ cwd: fixture.cwd }, run.runId)
+    }
+
+    const polling = service.readEvents(
+      { cwd: fixture.cwd },
+      { runId: run.runId, after: manifest.cursor, waitMs: 1_000 },
+    )
+    // Let the request finish its initial replay and actually register the long-poll waiter. Without
+    // this boundary the interruption event can legitimately arrive during the initial page read.
+    await new Promise(resolveWait => setTimeout(resolveWait, 20))
+    const quiescing = service.quiesce('container replacement')
+    expect(service.lifecycleState()).toBe('QUIESCING')
+    await expect(polling).rejects.toMatchObject({ code: 'service-stopping' })
+    await expect(service.start(
+      { cwd: fixture.cwd },
+      { name: 'quiesce-me' },
+    )).rejects.toMatchObject({ code: 'service-stopping' })
+    await quiescing
+    expect(service.lifecycleState()).toBe('STOPPED')
+
+    const stopped = await store.getManifest(run.runId)
+    expect(stopped?.status).toBe('interrupted')
+    const events = await store.readEvents(run.runId, 0, 1_000)
+    expect(events.events.some(stored => stored.event.type === 'run.cancellation_requested')).toBe(false)
+    expect(events.events.at(-1)?.event).toMatchObject({
+      type: 'run.interrupted',
+      payload: { reason: 'container replacement' },
+    })
+  })
+
+  it('drains a start admitted before quiesce and interrupts the run it registers', async () => {
+    const fixture = await project(`export const meta = { name: 'admission-race', description: 'Admission fixture' }
+      return await agent('wait after registration')`)
+    let enterLookup!: () => void
+    let releaseLookup!: () => void
+    const lookupEntered = new Promise<void>(resolveEntered => { enterLookup = resolveEntered })
+    const lookupGate = new Promise<void>(resolveGate => { releaseLookup = resolveGate })
+    class GatedStore extends FileWorkflowStore {
+      override async findByIdempotencyKey(cwd: string, key: string) {
+        enterLookup()
+        await lookupGate
+        return super.findByIdempotencyKey(cwd, key)
+      }
+    }
+    const store = new GatedStore(fixture.storeRoot)
+    const service = new WorkflowService({
+      store,
+      provider: new FakeAgentProvider([{ outcome: { type: 'wait-for-abort' } }]),
+    })
+    await service.initialize()
+
+    const starting = service.start(
+      { cwd: fixture.cwd },
+      { name: 'admission-race', idempotencyKey: 'already-admitted' },
+    )
+    await lookupEntered
+    const quiescing = service.quiesce('admission race restart')
+    let quiesceSettled = false
+    void quiescing.finally(() => { quiesceSettled = true })
+    await new Promise(resolveWait => setTimeout(resolveWait, 10))
+    expect(quiesceSettled).toBe(false)
+
+    releaseLookup()
+    const run = await starting
+    await quiescing
+    expect((await store.getManifest(run.runId))?.status).toBe('interrupted')
+    expect((await store.readEvents(run.runId, 0, 1_000)).events.at(-1)?.event.type).toBe(
+      'run.interrupted',
+    )
   })
 
   it('exposes and reads every byte of a truncated 1,186-line result after service restart', async () => {

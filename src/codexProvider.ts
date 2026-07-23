@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import type {
   CodexOptions,
   Input,
@@ -24,6 +26,7 @@ import type {
   ProviderSessionReference,
 } from './agentProvider.js'
 import { ProcessOwnedCodexHost } from './processOwnedProviderHost.js'
+import { CODEX_SDK_VERSION } from './generatedBuildMetadata.js'
 
 export type CodexThreadLike = {
   readonly id: string | null
@@ -104,13 +107,17 @@ export type CodexConfigurationIsolation = {
   effectiveConfigurationFingerprint?: string
 }
 
+export type CodexRecoveryFingerprintInput = {
+  executableEvidence?: CodexExecutableEvidence
+  configurationIsolation?: CodexConfigurationIsolation
+  capabilities: CodexExecutionCapabilities
+  modelAliases?: Readonly<Record<string, string | null>>
+  baseUrl?: string
+  config?: CodexOptions['config']
+}
+
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const CLAUDE_MODEL_NAMES = new Set(['haiku', 'sonnet', 'opus', 'inherit'])
-// Keep this literal beside the adapter and the exact package.json pin. Reading package metadata at
-// runtime fails under some package export maps and bundlers; a mismatched upgrade should therefore
-// be an obvious one-line review change rather than silently reporting the wrong installed version.
-const CODEX_SDK_VERSION = '0.144.4'
-
 /**
  * Supported Codex SDK adapter for one workflow `agent()` call.
  *
@@ -124,6 +131,7 @@ export class CodexAgentProvider implements AgentProvider {
   readonly #host: ProcessOwnedCodexHost | undefined
   readonly #modelAliases: Readonly<Record<string, string | null>>
   readonly #capabilities: CodexExecutionCapabilities
+  readonly recoveryFingerprint?: string
 
   constructor(options: CodexProviderOptions = {}) {
     const {
@@ -143,6 +151,17 @@ export class CodexAgentProvider implements AgentProvider {
         ? {}
         : { mcpServers: capabilities.mcpServers.map((server) => ({ ...server })) }),
     }
+    const recoveryFingerprint = client === undefined
+      ? buildCodexRecoveryFingerprint({
+          ...(executableEvidence === undefined ? {} : { executableEvidence }),
+          ...(configurationIsolation === undefined ? {} : { configurationIsolation }),
+          capabilities: this.#capabilities,
+          modelAliases: this.#modelAliases,
+          ...(codexOptions.baseUrl === undefined ? {} : { baseUrl: codexOptions.baseUrl }),
+          ...(codexOptions.config === undefined ? {} : { config: codexOptions.config }),
+        })
+      : undefined
+    if (recoveryFingerprint !== undefined) this.recoveryFingerprint = recoveryFingerprint
     if (client) {
       // Injected clients are an in-process conformance seam. Production never takes this branch;
       // preserving it keeps adapter tests focused on event translation without spawning hosts.
@@ -282,6 +301,57 @@ export class CodexAgentProvider implements AgentProvider {
       (server) => server.effect === 'read-only' || server.effect === 'idempotent',
     )
   }
+}
+
+/**
+ * Canonical evidence used on both sides of crash recovery.
+ *
+ * API keys are intentionally absent: persisting a hash of a secret creates a credential oracle and
+ * rotation does not change the local capability policy. Executable bytes, SDK behavior, explicit
+ * config, the effective configuration-layer attestation, aliases, and exposed MCP effects are the
+ * inputs which can change whether replay is the same execution contract.
+ */
+export function buildCodexRecoveryFingerprint(
+  input: CodexRecoveryFingerprintInput,
+): string | undefined {
+  if (
+    input.capabilities.inheritedMcpServers !== 'disabled' ||
+    input.executableEvidence === undefined ||
+    input.configurationIsolation?.effectiveConfigurationFingerprint === undefined ||
+    input.configurationIsolation.effectiveConfigurationFingerprint.length === 0
+  ) return undefined
+
+  const evidence = {
+    schemaVersion: 1,
+    provider: 'codex',
+    sdkVersion: CODEX_SDK_VERSION,
+    executable: input.executableEvidence,
+    effectiveConfigurationFingerprint:
+      input.configurationIsolation.effectiveConfigurationFingerprint,
+    capabilities: {
+      inheritedMcpServers: 'disabled',
+      mcpServers: [...(input.capabilities.mcpServers ?? [])]
+        .map(server => ({ name: server.name, effect: server.effect }))
+        .sort((left, right) => (
+          left.name.localeCompare(right.name) || left.effect.localeCompare(right.effect)
+        )),
+    },
+    modelAliases: Object.fromEntries(
+      Object.entries(input.modelAliases ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
+    ...(input.config === undefined ? {} : { config: input.config }),
+  }
+  return `codex:v1:${createHash('sha256').update(canonicalJson(evidence)).digest('hex')}`
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  const object = value as Record<string, unknown>
+  return `{${Object.keys(object).sort().map(key => (
+    `${JSON.stringify(key)}:${canonicalJson(object[key])}`
+  )).join(',')}}`
 }
 
 /**

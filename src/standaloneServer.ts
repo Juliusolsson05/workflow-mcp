@@ -9,6 +9,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 
 import type { WorkflowService, WorkflowServiceScope } from './workflowService.js'
 import { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
+import { WORKFLOW_MCP_VERSION } from './generatedBuildMetadata.js'
 
 export type WorkflowMcpHttpServer = {
   host: '127.0.0.1'
@@ -20,7 +21,7 @@ export type WorkflowMcpHttpServer = {
 
 function createServerWithTools(service: WorkflowService, scope: WorkflowServiceScope): McpServer {
   const server = new McpServer(
-    { name: 'workflow-mcp', version: '0.0.0' },
+    { name: 'workflow-mcp', version: WORKFLOW_MCP_VERSION },
     {
       // MCP initialization instructions are the only guidance guaranteed to reach a client before
       // it chooses a tool. Keeping the authoring loop here prevents success from depending on a

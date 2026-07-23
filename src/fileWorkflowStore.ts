@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { COPYFILE_EXCL } from 'node:constants'
 import { execFile } from 'node:child_process'
-import { createReadStream } from 'node:fs'
+import { createReadStream, readFileSync } from 'node:fs'
 import {
   chmod,
   copyFile,
@@ -44,13 +44,19 @@ import type {
   WorkflowEventPage,
   WorkflowResultArtifact,
   WorkflowResultPage,
+  WorkflowRunListInput,
+  WorkflowRunListPage,
   WorkflowRunManifest,
   WorkflowRunSnapshot,
   WorkflowRunStatus,
+  WorkflowRunSummary,
   WorkflowStore,
   WorkflowStoreLease,
+  WorkflowStoreLeaseBackend,
   WorkflowResultReadInput,
 } from './workflowStore.js'
+import { LeaseScopedWriteCoordinator } from './workflowWriteCoordinator.js'
+import type { WorkflowJournalWriteCoordinator } from './workflowWriteCoordinator.js'
 
 const TERMINAL_STATUSES = new Set<WorkflowRunStatus>([
   'completed',
@@ -70,6 +76,7 @@ export const DEFAULT_MAX_WORKFLOW_RESULT_BYTES = 64 * 1024 * 1024
 export const MAX_WORKFLOW_RESULT_BYTES = 512 * 1024 * 1024
 const MAX_RESULT_METADATA_BYTES = 8 * 1024
 const EVENT_INDEX_STRIDE = 256
+const MAX_RUNS_PER_PAGE = 200
 const OWNER_LOCK_DIRECTORY = 'service-owner.lock'
 const OWNER_METADATA_FILE = 'owner.json'
 const OWNER_ACQUIRE_ATTEMPTS = 16
@@ -99,6 +106,7 @@ export class WorkflowStoreError extends Error {
     | 'invalid-result'
     | 'result-not-found'
     | 'agent-not-found'
+    | 'cursor-ahead'
     | 'invalid-cursor'
 
   constructor(code: WorkflowStoreError['code'], message: string, options?: { cause?: unknown }) {
@@ -137,19 +145,30 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly #appendTails = new Map<string, Promise<void>>()
   #createTail: Promise<void> = Promise.resolve()
   readonly #quarantinedRuns = new Map<string, WorkflowStoreError>()
+  readonly #runSummaries = new Map<string, WorkflowRunSummary>()
+  readonly #runKeysByStatus = new Map<WorkflowRunStatus, string[]>()
+  readonly #lineageMembers = new Map<string, Set<string>>()
+  readonly #successors = new Map<string, Set<string>>()
   readonly #maxEventFileBytes: number
   readonly #maxResultBytes: number
   #leaseToken: string | undefined
-  #leaseWasAcquired = false
+  #leaseActive = false
+  readonly #leaseBackend: WorkflowStoreLeaseBackend | undefined
+  readonly #writers = new LeaseScopedWriteCoordinator()
 
   constructor(
     rootDirectory: string,
-    options: { maxEventFileBytes?: number; maxResultBytes?: number } = {},
+    options: {
+      maxEventFileBytes?: number
+      maxResultBytes?: number
+      leaseBackend?: WorkflowStoreLeaseBackend
+    } = {},
   ) {
     this.rootDirectory = resolve(rootDirectory)
     this.runsDirectory = join(this.rootDirectory, 'runs')
     this.#maxEventFileBytes = options.maxEventFileBytes ?? DEFAULT_MAX_EVENT_FILE_BYTES
     this.#maxResultBytes = options.maxResultBytes ?? DEFAULT_MAX_WORKFLOW_RESULT_BYTES
+    this.#leaseBackend = options.leaseBackend
     if (!Number.isSafeInteger(this.#maxEventFileBytes) || this.#maxEventFileBytes <= 0) {
       throw new TypeError('maxEventFileBytes must be a positive safe integer')
     }
@@ -165,20 +184,29 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async initialize(): Promise<void> {
+    return this.#writers.run(() => this.#initialize())
+  }
+
+  async #initialize(): Promise<void> {
     // initialize() is not read-only: crash-tail recovery can rewrite manifests. A convenience
     // store handle which never acquired the owner lease must therefore be fenced just like append
     // and create, or a second process can race recovery before WorkflowService sees it.
-    await this.#assertLease()
     await mkdir(this.runsDirectory, { recursive: true, mode: 0o700 })
     await chmod(this.rootDirectory, 0o700).catch(() => undefined)
     await chmod(this.runsDirectory, 0o700)
 
     this.#quarantinedRuns.clear()
+    this.#runSummaries.clear()
+    this.#runKeysByStatus.clear()
+    this.#lineageMembers.clear()
+    this.#successors.clear()
     const entries = await readdir(this.runsDirectory, { withFileTypes: true })
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       try {
         await this.#recoverEventTail(entry.name)
+        const manifest = await this.getManifest(entry.name)
+        if (manifest !== undefined) this.#indexManifest(manifest)
       } catch (cause) {
         const error = cause instanceof WorkflowStoreError
           ? cause
@@ -202,9 +230,17 @@ export class FileWorkflowStore implements WorkflowStore {
     }))
   }
 
+  journalWriteCoordinator(): WorkflowJournalWriteCoordinator {
+    return this.#writers
+  }
+
   async acquireLease(ownerId: string): Promise<WorkflowStoreLease> {
     if (ownerId.length === 0) throw new TypeError('Workflow store ownerId must not be empty')
+    if (this.#leaseActive) {
+      throw new WorkflowStoreError('owner-conflict', 'This workflow store handle already owns a lease')
+    }
     await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 })
+    if (this.#leaseBackend !== undefined) return this.#acquireInjectedLease(ownerId)
     const lockDirectory = join(this.rootDirectory, OWNER_LOCK_DIRECTORY)
     const metadataPath = join(lockDirectory, OWNER_METADATA_FILE)
     const token = randomUUID()
@@ -241,7 +277,8 @@ export class FileWorkflowStore implements WorkflowStore {
         }
         await rename(candidateDirectory, lockDirectory)
         this.#leaseToken = token
-        this.#leaseWasAcquired = true
+        this.#leaseActive = true
+        this.#writers.activate(() => this.#assertDefaultLeaseOwned(token, metadataPath))
         let released = false
         return {
           ownerId,
@@ -250,6 +287,10 @@ export class FileWorkflowStore implements WorkflowStore {
             if (released) return
             let completed = false
             try {
+              // The writer gate closes before any awaited namespace operation. Every permit spans
+              // through its final fsync, so once this drain finishes the lease can transfer without
+              // an old continuation waking up against the new owner's bytes.
+              await this.#writers.closeAndDrain()
               try {
                 const current = JSON.parse(await readFile(metadataPath, 'utf8')) as { token?: unknown }
                 // WHY release checks the random fencing token instead of blindly unlinking: a stale
@@ -273,6 +314,8 @@ export class FileWorkflowStore implements WorkflowStore {
               if (completed) {
                 released = true
                 if (this.#leaseToken === token) this.#leaseToken = undefined
+                this.#leaseActive = false
+                this.#writers.deactivate()
               }
             }
           },
@@ -312,20 +355,41 @@ export class FileWorkflowStore implements WorkflowStore {
     throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership changed while acquiring it')
   }
 
+  async #acquireInjectedLease(ownerId: string): Promise<WorkflowStoreLease> {
+    const backendLease = await this.#leaseBackend!.acquire({
+      rootDirectory: this.rootDirectory,
+      ownerId,
+    })
+    this.#leaseActive = true
+    this.#writers.activate(() => backendLease.assertOwned())
+    let released = false
+    return {
+      ownerId,
+      generation: backendLease.generation,
+      release: async () => {
+        if (released) return
+        await this.#writers.closeAndDrain()
+        await backendLease.release()
+        released = true
+        this.#leaseActive = false
+        this.#writers.deactivate()
+      },
+    }
+  }
+
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest> {
     const previous = this.#createTail
     let release!: () => void
     this.#createTail = new Promise<void>((resolveCreate) => { release = resolveCreate })
     await previous.catch(() => undefined)
     try {
-      return await this.#createRun(input)
+      return await this.#writers.run(() => this.#createRun(input))
     } finally {
       release()
     }
   }
 
   async #createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest> {
-    await this.#assertLease()
     if (input.resumedFromRunId !== undefined) {
       const lineageId = input.lineageId ?? input.resumedFromRunId
       const active = (await this.listManifests()).find((manifest) => (
@@ -404,6 +468,7 @@ export class FileWorkflowStore implements WorkflowStore {
         writeInitialWorkflowJournal(this.journalPath(input.runId), input.journalSnapshots)
       }
       await this.#writeManifest(manifest)
+      this.#indexManifest(manifest)
       return manifest
     } catch (cause) {
       await rm(directory, { recursive: true, force: true })
@@ -438,6 +503,89 @@ export class FileWorkflowStore implements WorkflowStore {
     return manifests.sort((left, right) => left.createdAt.localeCompare(right.createdAt))
   }
 
+  async listRuns(input: WorkflowRunListInput = {}): Promise<WorkflowRunListPage> {
+    const limit = input.limit ?? 50
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_RUNS_PER_PAGE) {
+      throw new TypeError(`Run page limit must be an integer from 1 through ${MAX_RUNS_PER_PAGE}`)
+    }
+    const statuses = [...new Set(input.statuses ?? [...RUN_STATUSES])].sort()
+    if (statuses.length === 0 || statuses.some(status => !RUN_STATUSES.has(status))) {
+      throw new TypeError('Run status filter is empty or contains an unknown status')
+    }
+    const fingerprint = createHash('sha256').update(JSON.stringify(statuses)).digest('hex')
+    const parsed = input.cursor === undefined ? undefined : parseRunListCursor(input.cursor)
+    if (parsed !== undefined && parsed.filter !== fingerprint) {
+      throw new WorkflowStoreError('invalid-cursor', 'Run inventory cursor belongs to another filter')
+    }
+    const allKeys = [...this.#runSummaries.values()].map(runIndexKey).sort()
+    const highWater = parsed?.highWater ?? allKeys.at(-1) ?? ''
+    const after = parsed?.after ?? ''
+    if (after > highWater) {
+      throw new WorkflowStoreError('invalid-cursor', 'Run inventory cursor is beyond its high-water mark')
+    }
+
+    // Each status has its own sorted keyset. A sparse status filter therefore reads O(page size),
+    // not every historical manifest, while merging the fixed status union preserves the immutable
+    // (createdAt, runId) order. Status moves between pages have the documented weak consistency;
+    // immutable unfiltered inventory neither duplicates nor skips keys under concurrent creation.
+    const selections = statuses.map(status => {
+      const keys = this.#runKeysByStatus.get(status) ?? []
+      return { keys, index: firstKeyAfter(keys, after) }
+    })
+    const selected: WorkflowRunSummary[] = []
+    while (selected.length <= limit) {
+      let nextKey: string | undefined
+      let selectedList: (typeof selections)[number] | undefined
+      for (const selection of selections) {
+        const candidate = selection.keys[selection.index]
+        if (candidate === undefined || candidate > highWater) continue
+        if (nextKey === undefined || candidate < nextKey) {
+          nextKey = candidate
+          selectedList = selection
+        }
+      }
+      if (nextKey === undefined || selectedList === undefined) break
+      selectedList.index += 1
+      const runId = nextKey.slice(nextKey.indexOf('\0') + 1)
+      const summary = this.#runSummaries.get(runId)
+      if (summary !== undefined) selected.push(summary)
+    }
+    const hasMore = selected.length > limit
+    if (hasMore) selected.pop()
+    const last = selected.at(-1)
+    return {
+      items: selected,
+      hasMore,
+      ...(hasMore && last !== undefined
+        ? { nextCursor: encodeRunListCursor(fingerprint, highWater, runIndexKey(last)) }
+        : {}),
+    }
+  }
+
+  async findActiveLineageSuccessor(
+    lineageId: string,
+    predecessorRunId: string,
+  ): Promise<WorkflowRunManifest | undefined> {
+    const candidates = [...(this.#lineageMembers.get(lineageId) ?? [])]
+      .filter(runId => runId !== predecessorRunId)
+      .map(runId => this.#runSummaries.get(runId))
+      .filter((summary): summary is WorkflowRunSummary => (
+        summary !== undefined && !TERMINAL_STATUSES.has(summary.status)
+      ))
+      .sort((left, right) => runIndexKey(left).localeCompare(runIndexKey(right)))
+    const winner = candidates.at(-1)
+    return winner === undefined ? undefined : this.getManifest(winner.runId)
+  }
+
+  async findLatestSuccessor(runId: string): Promise<WorkflowRunManifest | undefined> {
+    const candidates = [...(this.#successors.get(runId) ?? [])]
+      .map(candidate => this.#runSummaries.get(candidate))
+      .filter((summary): summary is WorkflowRunSummary => summary !== undefined)
+      .sort((left, right) => runIndexKey(left).localeCompare(runIndexKey(right)))
+    const winner = candidates.at(-1)
+    return winner === undefined ? undefined : this.getManifest(winner.runId)
+  }
+
   async findByIdempotencyKey(cwd: string, key: string): Promise<WorkflowRunManifest | undefined> {
     const scopedCwd = resolve(cwd)
     const manifests = await this.listManifests()
@@ -451,7 +599,7 @@ export class FileWorkflowStore implements WorkflowStore {
     this.#appendTails.set(runId, owned)
     await previous.catch(() => undefined)
     try {
-      return await this.#appendEvent(runId, event)
+      return await this.#writers.run(() => this.#appendEvent(runId, event))
     } finally {
       releaseTail()
       if (this.#appendTails.get(runId) === owned) this.#appendTails.delete(runId)
@@ -459,7 +607,6 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   async #appendEvent(runId: string, event: WorkflowEvent): Promise<StoredWorkflowEvent> {
-    await this.#assertLease()
     const manifest = await this.#requiredManifest(runId)
     if (event.runId !== runId) {
       throw new WorkflowStoreError(
@@ -507,7 +654,9 @@ export class FileWorkflowStore implements WorkflowStore {
       await handle.close()
     }
 
-    await this.#writeManifest(applyEventToManifest(manifest, stored))
+    const updatedManifest = applyEventToManifest(manifest, stored)
+    await this.#writeManifest(updatedManifest)
+    this.#indexManifest(updatedManifest)
     await this.#appendAgentTranscript(stored)
     if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) {
       const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()
@@ -530,6 +679,15 @@ export class FileWorkflowStore implements WorkflowStore {
 
   async readEvents(runId: string, after: number, limit: number): Promise<WorkflowEventPage> {
     const manifest = await this.#requiredManifest(runId)
+    if (after > manifest.cursor) {
+      // WHY this is an error instead of an empty page: echoing an invented future cursor tells a
+      // long-poll client it has consumed bytes which do not exist. The client will then wait until
+      // the real stream catches up to its typo, potentially forever for a terminal run.
+      throw new WorkflowStoreError(
+        'cursor-ahead',
+        `Workflow event cursor ${after} is ahead of durable cursor ${manifest.cursor}: ${runId}`,
+      )
+    }
     const selected: StoredWorkflowEvent[] = []
     for await (const event of this.#events(runId, Number.MAX_SAFE_INTEGER, after)) {
       if (event.cursor <= after) continue
@@ -554,7 +712,13 @@ export class FileWorkflowStore implements WorkflowStore {
     runId: string,
     result: WorkflowResultMaterialization,
   ): Promise<ContentReference> {
-    await this.#assertLease()
+    return this.#writers.run(() => this.#persistResult(runId, result))
+  }
+
+  async #persistResult(
+    runId: string,
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference> {
     const manifest = await this.#requiredManifest(runId)
     if (TERMINAL_STATUSES.has(manifest.status)) {
       throw new WorkflowStoreError(
@@ -1015,29 +1179,14 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
-  async #assertLease(): Promise<void> {
-    const lockDirectory = join(this.rootDirectory, OWNER_LOCK_DIRECTORY)
-    const metadataPath = join(lockDirectory, OWNER_METADATA_FILE)
-    if (!this.#leaseWasAcquired) {
-      // Mutations never get an "unowned means safe" fast path. Checking for no lock and then
-      // appending is a classic check/use race: a service can publish its lock between those two
-      // operations and both handles become writers. Requiring every mutator to have acquired the
-      // lease makes acquisition itself the one linearization point.
-      throw new WorkflowStoreError(
-        'owner-conflict',
-        'Workflow store mutations require an acquired owner lease',
-      )
-    }
-    if (this.#leaseToken === undefined) {
-      throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership has been released')
-    }
+  #assertDefaultLeaseOwned(token: string, metadataPath: string): void {
     try {
-      const current = JSON.parse(await readFile(metadataPath, 'utf8')) as { token?: unknown }
+      const current = JSON.parse(readFileSync(metadataPath, 'utf8')) as { token?: unknown }
       // WHY every externally initiated mutation rechecks the token: PID-only locks prevent two
       // normal starts, but they do not fence an old asynchronous owner after its lock was reclaimed
       // or replaced. A stale service must fail before appending, even if its JavaScript stack wakes
       // much later with a previously valid store object.
-      if (current.token !== this.#leaseToken) {
+      if (current.token !== token || this.#leaseToken !== token) {
         throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership was fenced by another service')
       }
     } catch (error) {
@@ -1046,6 +1195,43 @@ export class FileWorkflowStore implements WorkflowStore {
         throw new WorkflowStoreError('owner-conflict', 'Workflow store ownership file disappeared')
       }
       throw new WorkflowStoreError('io-error', 'Cannot verify workflow store ownership', { cause: error })
+    }
+  }
+
+  #indexManifest(manifest: WorkflowRunManifest): void {
+    const previous = this.#runSummaries.get(manifest.runId)
+    if (previous !== undefined) {
+      removeSortedKey(this.#runKeysByStatus.get(previous.status), runIndexKey(previous))
+    }
+    const summary: WorkflowRunSummary = {
+      schemaVersion: 1,
+      runId: manifest.runId,
+      status: manifest.status,
+      cursor: manifest.cursor,
+      createdAt: manifest.createdAt,
+      updatedAt: manifest.updatedAt,
+      workflow: {
+        name: manifest.workflow.name,
+        description: manifest.workflow.description,
+        ...(manifest.workflow.title === undefined ? {} : { title: manifest.workflow.title }),
+      },
+      lineageId: manifest.lineageId ?? manifest.runId,
+      ...(manifest.resumedFromRunId === undefined
+        ? {}
+        : { resumedFromRunId: manifest.resumedFromRunId }),
+      ...(manifest.recoveryMode === undefined ? {} : { recoveryMode: manifest.recoveryMode }),
+    }
+    this.#runSummaries.set(manifest.runId, summary)
+    const statusKeys = this.#runKeysByStatus.get(summary.status) ?? []
+    insertSortedKey(statusKeys, runIndexKey(summary))
+    this.#runKeysByStatus.set(summary.status, statusKeys)
+    const lineage = this.#lineageMembers.get(summary.lineageId) ?? new Set<string>()
+    lineage.add(summary.runId)
+    this.#lineageMembers.set(summary.lineageId, lineage)
+    if (summary.resumedFromRunId !== undefined) {
+      const successors = this.#successors.get(summary.resumedFromRunId) ?? new Set<string>()
+      successors.add(summary.runId)
+      this.#successors.set(summary.resumedFromRunId, successors)
     }
   }
 
@@ -1139,7 +1325,14 @@ export class FileWorkflowStore implements WorkflowStore {
     agentId: string,
     result: WorkflowResultMaterialization,
   ): Promise<ContentReference> {
-    await this.#assertLease()
+    return this.#writers.run(() => this.#persistAgentResult(runId, agentId, result))
+  }
+
+  async #persistAgentResult(
+    runId: string,
+    agentId: string,
+    result: WorkflowResultMaterialization,
+  ): Promise<ContentReference> {
     await this.#requiredManifest(runId)
     this.#assertAgentId(agentId)
     const mediaType = result.reference.mediaType
@@ -1466,6 +1659,61 @@ export class FileWorkflowStore implements WorkflowStore {
       locators.set(agent.agentId, { source: 'journal', coverageGap: record.coverageGap })
     }
     return locators
+  }
+}
+
+function runIndexKey(summary: Pick<WorkflowRunSummary, 'createdAt' | 'runId'>): string {
+  return `${summary.createdAt}\0${summary.runId}`
+}
+
+function firstKeyAfter(keys: readonly string[], after: string): number {
+  let low = 0
+  let high = keys.length
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    if (keys[middle]! <= after) low = middle + 1
+    else high = middle
+  }
+  return low
+}
+
+function insertSortedKey(keys: string[], key: string): void {
+  const index = firstKeyAfter(keys, key)
+  if (keys[index - 1] !== key) keys.splice(index, 0, key)
+}
+
+function removeSortedKey(keys: string[] | undefined, key: string): void {
+  if (keys === undefined) return
+  const index = firstKeyAfter(keys, key) - 1
+  if (keys[index] === key) keys.splice(index, 1)
+}
+
+function encodeRunListCursor(filter: string, highWater: string, after: string): string {
+  return Buffer.from(JSON.stringify({ version: 1, filter, highWater, after }), 'utf8')
+    .toString('base64url')
+}
+
+function parseRunListCursor(cursor: string): {
+  filter: string
+  highWater: string
+  after: string
+} {
+  if (cursor.length === 0 || cursor.length > 2_048) {
+    throw new WorkflowStoreError('invalid-cursor', 'Run inventory cursor is malformed')
+  }
+  try {
+    const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as unknown
+    if (
+      !isObject(value) ||
+      value.version !== 1 ||
+      typeof value.filter !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(value.filter) ||
+      typeof value.highWater !== 'string' ||
+      typeof value.after !== 'string'
+    ) throw new Error('invalid cursor fields')
+    return { filter: value.filter, highWater: value.highWater, after: value.after }
+  } catch (cause) {
+    throw new WorkflowStoreError('invalid-cursor', 'Run inventory cursor is malformed', { cause })
   }
 }
 
