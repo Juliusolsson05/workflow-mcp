@@ -16,10 +16,11 @@ COPY scripts/clean-dist.mjs scripts/generate-build-metadata.mjs ./scripts/
 COPY src ./src
 RUN npm run build
 
-COPY standalone/package.json standalone/package-lock.json standalone/tsconfig.json ./standalone/
+COPY standalone/package.json standalone/package-lock.json standalone/tsconfig.json standalone/tsconfig.web.json ./standalone/
 RUN npm --prefix standalone ci --include=dev
 COPY standalone/scripts ./standalone/scripts
 COPY standalone/src ./standalone/src
+COPY standalone/web ./standalone/web
 RUN npm --prefix standalone run build \
     && find /build/dist /build/standalone/dist -type f \
       \( -name '*.map' -o -name '*.d.ts' \) -delete

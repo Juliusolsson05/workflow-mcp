@@ -29,7 +29,7 @@ describe('standalone daemon', () => {
       sourceMode: 'read-only',
       leaseMode: 'embedded',
       codexExecutable: '/unused/fake-codex',
-      webEnabled: false,
+      webEnabled: true,
     })
     const daemon = await startStandaloneDaemon(config, {
       provider: new FakeAgentProvider([{ outcome: { type: 'wait-for-abort' } }]),
@@ -38,6 +38,18 @@ describe('standalone daemon', () => {
     expect(await (await fetch(`${base}/healthz`)).json()).toEqual({ status: 'live' })
     expect((await fetch(`${base}/readyz`)).status).toBe(200)
     expect((await fetch(`${base}/api/v1/instance`)).status).toBe(401)
+    const web = await fetch(`${base}/`)
+    expect(web.status).toBe(200)
+    expect(web.headers.get('content-security-policy')).toContain("default-src 'self'")
+    const html = await web.text()
+    expect(html).toContain('Workflow MCP')
+    expect(html).not.toContain(daemon.tokens.web)
+    const scriptPath = /src="([^"]+\.js)"/.exec(html)?.[1]
+    expect(scriptPath).toMatch(/^\/assets\//)
+    const script = await fetch(`${base}${scriptPath}`)
+    expect(script.status).toBe(200)
+    expect(script.headers.get('cache-control')).toContain('immutable')
+    expect((await fetch(`${base}/assets/..%2Fpackage.json`)).status).toBe(404)
 
     const client = new Client({ name: 'daemon-test', version: '1' })
     const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
