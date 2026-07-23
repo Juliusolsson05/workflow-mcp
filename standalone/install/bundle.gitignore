@@ -1,0 +1,6 @@
+# Public bundle files may be committed; machine/instance identity and local credentials may not.
+instance.json
+*.tmp
+*.token
+auth/
+backups/

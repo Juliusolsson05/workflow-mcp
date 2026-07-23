@@ -1,0 +1,291 @@
+#!/bin/sh
+set -eu
+umask 077
+
+fail() { printf 'workflow-mcp-docker: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+if [ -f "$script_dir/compose.yaml" ]; then
+  bundle_root=$script_dir
+else
+  bundle_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+fi
+version_file=$bundle_root/version.env
+if [ ! -f "$version_file" ] && [ -f "$bundle_root/install/version.env" ]; then
+  version_file=$bundle_root/install/version.env
+fi
+[ -f "$version_file" ] || fail "version.env is missing beside the verified bundle"
+
+verify_bundle() {
+  [ -f "$bundle_root/SHA256SUMS" ] || return 0
+  # Release attestation authenticates the bundle as a whole; this second check
+  # catches corruption after extraction. Source-tree development intentionally
+  # has no checksum file because its inputs are still changing.
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$bundle_root" && sha256sum --check SHA256SUMS) >/dev/null || fail "bundle checksum verification failed"
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$bundle_root" && shasum -a 256 --check SHA256SUMS) >/dev/null || fail "bundle checksum verification failed"
+  else
+    fail "sha256sum or shasum is required to verify this release bundle"
+  fi
+}
+
+verify_bundle
+# version.env is sourced only after its release-bundle digest has been checked;
+# it is generated from validated values and contains assignments only.
+# shellcheck disable=SC1090
+. "$version_file"
+: "${WORKFLOW_MCP_IMAGE:?version.env has no WORKFLOW_MCP_IMAGE}"
+
+canonical_directory() {
+  [ -d "$1" ] || fail "directory does not exist: $1"
+  (CDPATH= cd -- "$1" && pwd -P)
+}
+
+version_at_least() {
+  actual=$1 minimum=$2
+  old_ifs=$IFS; IFS=.
+  set -- $actual; a1=${1:-0}; a2=${2:-0}; a3=${3:-0}
+  set -- $minimum; m1=${1:-0}; m2=${2:-0}; m3=${3:-0}
+  IFS=$old_ifs
+  [ "$a1" -gt "$m1" ] || { [ "$a1" -eq "$m1" ] && [ "$a2" -gt "$m2" ]; } ||
+    { [ "$a1" -eq "$m1" ] && [ "$a2" -eq "$m2" ] && [ "$a3" -ge "$m3" ]; }
+}
+
+host_doctor() {
+  need_web=${1:-false}
+  command -v docker >/dev/null 2>&1 || fail "Docker CLI is not installed"
+  docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
+  compose_version=$(docker compose version --short | sed 's/[^0-9.].*$//')
+  version_at_least "$compose_version" 2.32.0 || fail "Docker Compose 2.32.0 or newer is required (found $compose_version)"
+  docker_context=$(docker context show)
+  docker_endpoint=$(docker context inspect "$docker_context" --format '{{.Endpoints.docker.Host}}')
+  case "$docker_endpoint" in
+    unix://*) ;;
+    *) fail "remote/non-local Docker context is unsupported: $docker_context ($docker_endpoint)" ;;
+  esac
+  if [ "$need_web" = true ]; then
+    engine_version=$(docker version --format '{{.Server.Version}}' | sed 's/[^0-9.].*$//')
+    version_at_least "$engine_version" 28.3.3 || fail "loopback web publication requires Docker Engine 28.3.3+ (found $engine_version)"
+  fi
+}
+
+installation_for_project() { printf '%s/.workflow-mcp\n' "$1"; }
+
+default_project() {
+  # A copied launcher is an instance-scoped control plane. Resolving from its own
+  # directory makes the path printed by `install` truthful even when invoked from
+  # an unrelated shell directory. The source-tree launcher deliberately falls
+  # back to cwd because it has not yet been bound to an instance.
+  if [ -f "$script_dir/instance.json" ]; then
+    dirname -- "$script_dir"
+  else
+    printf '.\n'
+  fi
+}
+
+json_string_field() {
+  field=$1 file=$2
+  sed -n "s/.*\"$field\":\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
+}
+
+json_scalar_field() {
+  field=$1 file=$2
+  sed -n "s/.*\"$field\":\([^,}]*\).*/\1/p" "$file" | head -n 1 | tr -d '"'
+}
+
+load_instance() {
+  project_directory=$(canonical_directory "${1:-.}")
+  installation=$(installation_for_project "$project_directory")
+  instance_file=$installation/instance.json
+  [ -f "$instance_file" ] || fail "not installed for $project_directory; run install first"
+  instance_id=$(json_string_field instanceId "$instance_file")
+  compose_project=$(json_string_field composeProjectName "$instance_file")
+  project_hash=$(json_string_field projectHash "$instance_file")
+  recorded_context=$(json_string_field dockerContext "$instance_file")
+  recorded_endpoint=$(json_string_field dockerEndpoint "$instance_file")
+  recorded_image=$(json_string_field image "$instance_file")
+  web_port=$(json_scalar_field webPort "$instance_file")
+  authoring=$(json_scalar_field authoring "$instance_file")
+  case "$instance_id" in ????????-????-????-????-????????????) ;; *) fail "instance.json has an invalid instance ID" ;; esac
+  case "$compose_project" in workflow-mcp-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;; *) fail "instance.json has an invalid Compose project" ;; esac
+  [ "$recorded_image" = "$WORKFLOW_MCP_IMAGE" ] || fail "bundle image and instance image differ; run the explicit upgrade flow"
+  host_doctor "$( [ -n "$web_port" ] && printf true || printf false )"
+  current_context=$(docker context show)
+  current_endpoint=$(docker context inspect "$current_context" --format '{{.Endpoints.docker.Host}}')
+  [ "$current_context" = "$recorded_context" ] && [ "$current_endpoint" = "$recorded_endpoint" ] ||
+    fail "Docker context changed since install; use instance move/adopt after reviewing state"
+  actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
+  [ "$actual_hash" = "$project_hash" ] || fail "instance.json belongs to a different canonical project path"
+  export WORKFLOW_MCP_IMAGE WORKFLOW_MCP_INSTANCE_ID=$instance_id
+  export WORKFLOW_MCP_PROJECT_HASH=$project_hash WORKFLOW_MCP_PROJECT_DIR=$project_directory
+  if [ -n "$web_port" ]; then export WORKFLOW_MCP_PORT=$web_port; fi
+  if [ "$authoring" = true ]; then export WORKFLOW_MCP_WORKFLOW_DIR=$project_directory/.claude/workflows; fi
+}
+
+compose() {
+  if [ -d "$project_directory/.codex" ] && [ ! -L "$project_directory/.codex" ]; then
+    set -- -f "$installation/compose.project-codex-mask.yaml" "$@"
+  fi
+  if [ -n "${web_port:-}" ]; then set -- -f "$installation/compose.web.yaml" "$@"; fi
+  if [ "${authoring:-false}" = true ]; then set -- -f "$installation/compose.authoring.yaml" "$@"; fi
+  if [ -n "${WORKFLOW_MCP_OPENAI_API_KEY_FILE:-}" ]; then
+    case "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" in /*) ;; *) fail "API key file path must be absolute" ;; esac
+    [ -f "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" ] || fail "API key file does not exist"
+    set -- -f "$installation/compose.auth-api-key.yaml" "$@"
+    export WORKFLOW_MCP_OPENAI_API_KEY_FILE
+  fi
+  set -- -p "$compose_project" --project-directory "$installation" -f "$installation/compose.yaml" "$@"
+  docker compose "$@"
+}
+
+attest_volume() {
+  volume=${compose_project}_workflow-mcp-data
+  driver=$(docker volume inspect "$volume" --format '{{.Driver}}' 2>/dev/null) || fail "expected Compose volume is missing: $volume"
+  options=$(docker volume inspect "$volume" --format '{{json .Options}}')
+  label_instance=$(docker volume inspect "$volume" --format '{{index .Labels "io.workflow-mcp.instance-id"}}')
+  label_project=$(docker volume inspect "$volume" --format '{{index .Labels "io.workflow-mcp.project-hash"}}')
+  [ "$driver" = local ] || fail "unsupported volume driver $driver for $volume"
+  [ "$options" = null ] || [ "$options" = '{}' ] || fail "optioned local volumes are unsupported: $options"
+  [ "$label_instance" = "$instance_id" ] && [ "$label_project" = "$project_hash" ] ||
+    fail "volume labels do not match this installation; refusing adoption"
+}
+
+install_codex_stanza() {
+  config_directory=$project_directory/.codex
+  [ ! -L "$config_directory" ] || fail "refusing symlinked Codex config directory"
+  mkdir -p "$config_directory"
+  config_file=$config_directory/config.toml
+  if [ -f "$config_file" ] && grep -q '^\[mcp_servers\.workflow_mcp\]$' "$config_file"; then
+    fail "Codex already has mcp_servers.workflow_mcp; leaving it unchanged"
+  fi
+  snippet=$(docker run --rm --user 0:0 -v "$installation:/bundle:ro" "$WORKFLOW_MCP_IMAGE" instance codex-config --file=/bundle/instance.json --compose-file="$installation/compose.yaml")
+  temporary=$(mktemp "$config_directory/config.toml.workflow-mcp.XXXXXX")
+  if [ -f "$config_file" ]; then cp "$config_file" "$temporary"; fi
+  printf '\n%s\n' "$snippet" >> "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$config_file"
+  note "Installed project-scoped Codex MCP stanza in $config_file"
+}
+
+install_command() {
+  project_arg=${1:-.}; shift || true
+  web_arg= authoring_arg=false no_codex=false
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --web-port=*) web_arg=${1#*=} ;;
+      --authoring) authoring_arg=true ;;
+      --no-codex) no_codex=true ;;
+      *) fail "unknown install option: $1" ;;
+    esac
+    shift
+  done
+  project_directory=$(canonical_directory "$project_arg")
+  installation=$(installation_for_project "$project_directory")
+  [ ! -e "$installation/instance.json" ] || fail "an installation already exists at $installation"
+  host_doctor "$( [ -n "$web_arg" ] && printf true || printf false )"
+  docker image inspect "$WORKFLOW_MCP_IMAGE" >/dev/null 2>&1 || docker pull "$WORKFLOW_MCP_IMAGE"
+  if [ "$authoring_arg" = true ]; then
+    [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
+    mkdir -p "$project_directory/.claude/workflows"
+  fi
+  mkdir -p "$installation"
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
+    cp "$bundle_root/$name" "$installation/$name"
+  done
+  cp "$bundle_root/install/workflow-mcp-docker" "$installation/workflow-mcp-docker" 2>/dev/null || cp "$bundle_root/workflow-mcp-docker" "$installation/workflow-mcp-docker"
+  cp "$bundle_root/install/workflow-mcp-docker.ps1" "$installation/workflow-mcp-docker.ps1" 2>/dev/null || cp "$bundle_root/workflow-mcp-docker.ps1" "$installation/workflow-mcp-docker.ps1"
+  cp "$version_file" "$installation/version.env"
+  if [ -f "$bundle_root/install/bundle.gitignore" ]; then
+    cp "$bundle_root/install/bundle.gitignore" "$installation/.gitignore"
+  else
+    cp "$bundle_root/.gitignore" "$installation/.gitignore"
+  fi
+  chmod 755 "$installation/workflow-mcp-docker"
+  create_args=""
+  [ -z "$web_arg" ] || create_args="--web-port=$web_arg"
+  [ "$authoring_arg" = false ] || create_args="$create_args --authoring"
+  instance_json=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance create \
+    --project="$project_directory" --docker-context="$docker_context" \
+    --docker-endpoint="$docker_endpoint" --image="$WORKFLOW_MCP_IMAGE" $create_args)
+  temporary=$(mktemp "$installation/instance.json.XXXXXX")
+  printf '%s\n' "$instance_json" > "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$installation/instance.json"
+  load_instance "$project_directory"
+  [ "$no_codex" = true ] || install_codex_stanza
+  note "Installed Workflow MCP instance $instance_id at $installation"
+  note "Start it with: $installation/workflow-mcp-docker up"
+}
+
+remove_codex_stanza() {
+  config_file=$project_directory/.codex/config.toml
+  [ -f "$config_file" ] || return 0
+  begin="# BEGIN WORKFLOW MCP $instance_id" end="# END WORKFLOW MCP $instance_id"
+  grep -qFx "$begin" "$config_file" || return 0
+  temporary=$(mktemp "$project_directory/.codex/config.toml.workflow-mcp.XXXXXX")
+  awk -v begin="$begin" -v end="$end" '$0 == begin { skip=1; next } $0 == end { skip=0; next } !skip { print }' "$config_file" > "$temporary"
+  chmod 600 "$temporary"; mv "$temporary" "$config_file"
+}
+
+uninstall_command() {
+  project_arg=${1:-.}; shift || true
+  delete_data=false confirmation=
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --delete-data) delete_data=true ;; --confirm=*) confirmation=${1#*=} ;; *) fail "unknown uninstall option: $1" ;; esac
+    shift
+  done
+  load_instance "$project_arg"
+  compose down --remove-orphans
+  remove_codex_stanza
+  if [ "$delete_data" = true ]; then
+    [ "$confirmation" = "$instance_id" ] || fail "data deletion requires --confirm=$instance_id"
+    attest_volume
+    docker volume rm "${compose_project}_workflow-mcp-data"
+  fi
+  # Every target is an exact file below the already-validated installation; the named volume is
+  # preserved unless separately confirmed above.
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml version.env instance.json .gitignore workflow-mcp-docker.ps1; do
+    [ ! -e "$installation/$name" ] || rm "$installation/$name"
+  done
+  note "Uninstalled public bundle; durable data was $( [ "$delete_data" = true ] && printf deleted || printf preserved )."
+  [ "$script_dir" != "$installation" ] || note "Remove $installation/workflow-mcp-docker after this command returns."
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--authoring] [--no-codex]
+  workflow-mcp-docker up [PROJECT]
+  workflow-mcp-docker down|status|logs|doctor|ui|mcp-proxy [PROJECT]
+  workflow-mcp-docker token [PROJECT] --purpose=mcp|web
+  workflow-mcp-docker uninstall [PROJECT] [--delete-data --confirm=INSTANCE_ID]
+EOF
+}
+
+command=${1:-help}; shift || true
+case "$command" in
+  install) install_command "$@" ;;
+  help|-h|--help) usage ;;
+  up|down|status|logs|doctor|ui|mcp-proxy|token|uninstall)
+    project_arg=$(default_project)
+    # Options belong to the selected command, while a non-option first argument
+    # remains an explicit project override for source-tree and fleet workflows.
+    if [ "$#" -gt 0 ]; then
+      case "$1" in --*) ;; *) project_arg=$1; shift ;; esac
+    fi
+    case "$command" in
+      up) load_instance "$project_arg"; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
+      down) load_instance "$project_arg"; compose down --remove-orphans ;;
+      status) load_instance "$project_arg"; compose ps; compose exec -T workflow-mcp workflow-mcp status "$@" ;;
+      logs) load_instance "$project_arg"; compose logs --follow workflow-mcp "$@" ;;
+      doctor) load_instance "$project_arg"; attest_volume; compose config --quiet; compose exec -T workflow-mcp workflow-mcp doctor --json ;;
+      ui) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp ui ;;
+      mcp-proxy) load_instance "$project_arg"; exec docker compose -p "$compose_project" --project-directory "$installation" -f "$installation/compose.yaml" exec -T workflow-mcp workflow-mcp mcp-proxy ;;
+      token) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp token show "$@" ;;
+      uninstall) uninstall_command "$project_arg" "$@" ;;
+    esac
+    ;;
+  *) fail "unknown command $command" ;;
+esac

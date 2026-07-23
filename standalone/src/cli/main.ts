@@ -2,6 +2,7 @@
 
 import { serveWorkflowMcpStdio } from 'workflow-mcp'
 import { join } from 'node:path'
+import { readFile } from 'node:fs/promises'
 
 import { loadStandaloneConfig } from '../config/loadConfig.js'
 import { StandaloneConfigurationError } from '../config/schema.js'
@@ -10,6 +11,14 @@ import { inspectContainer } from '../daemon/health.js'
 import { startStandaloneDaemon } from '../daemon/lifecycle.js'
 import { printDoctor } from './output.js'
 import { startWorkflowMcpProxy } from '../mcp/proxy.js'
+import { StandaloneApiClient } from '../client/apiClient.js'
+import { runTerminalUi } from '../tui/application.js'
+import {
+  createInstanceRecord,
+  hashProjectIdentity,
+  readInstanceRecord,
+  renderCodexMcpConfiguration,
+} from '../instance/record.js'
 
 const EXIT_USAGE = 2
 const EXIT_UNAVAILABLE = 3
@@ -34,6 +43,49 @@ async function main(arguments_: string[]): Promise<void> {
     printDoctor(report, parsed.flags.json === true)
     if (!report.ok) process.exitCode = EXIT_UNAVAILABLE
     return
+  }
+  if (command === 'instance') {
+    const action = parsed.positionals[0]
+    if (action === 'create') {
+      const projectDirectory = requiredStringArgument(parsed.flags, 'project')
+      const webPortValue = stringArgument(parsed.flags, 'web-port')
+      const record = createInstanceRecord({
+        projectDirectory,
+        dockerContext: requiredStringArgument(parsed.flags, 'docker-context'),
+        dockerEndpoint: requiredStringArgument(parsed.flags, 'docker-endpoint'),
+        image: requiredStringArgument(parsed.flags, 'image'),
+        ...(webPortValue === undefined ? {} : { webPort: parsePort(webPortValue, 'web-port') }),
+        authoring: parsed.flags.authoring === true,
+        ...(stringArgument(parsed.flags, 'api-key-file') === undefined
+          ? {}
+          : { apiKeyFile: stringArgument(parsed.flags, 'api-key-file')! }),
+      })
+      process.stdout.write(`${JSON.stringify(record)}\n`)
+      return
+    }
+    if (action === 'inspect') {
+      const record = await readInstanceRecord(requiredStringArgument(parsed.flags, 'file'))
+      const field = stringArgument(parsed.flags, 'field')
+      if (field === undefined) process.stdout.write(`${JSON.stringify(record)}\n`)
+      else if (['instanceId', 'composeProjectName', 'projectHash', 'dockerContext', 'dockerEndpoint', 'image', 'webPort', 'authoring', 'apiKeyFile'].includes(field)) {
+        const value = record[field as keyof typeof record]
+        process.stdout.write(value === undefined ? '' : `${String(value)}\n`)
+      } else throw new StandaloneConfigurationError('Unsupported instance field')
+      return
+    }
+    if (action === 'hash') {
+      process.stdout.write(`${hashProjectIdentity(requiredStringArgument(parsed.flags, 'project'))}\n`)
+      return
+    }
+    if (action === 'codex-config') {
+      const record = await readInstanceRecord(requiredStringArgument(parsed.flags, 'file'))
+      process.stdout.write(renderCodexMcpConfiguration(
+        record,
+        requiredStringArgument(parsed.flags, 'compose-file'),
+      ))
+      return
+    }
+    throw new StandaloneConfigurationError('instance requires create, inspect, hash, or codex-config')
   }
   if (command === 'daemon') {
     const config = loadStandaloneConfig(parsed.flags)
@@ -60,6 +112,39 @@ async function main(arguments_: string[]): Promise<void> {
     installShutdown(() => proxy.close())
     return
   }
+  if (command === 'status') {
+    const config = loadStandaloneConfig(parsed.flags)
+    const token = await readAudienceToken(config.dataDirectory, 'web')
+    const client = new StandaloneApiClient({
+      baseUrl: process.env.WORKFLOW_MCP_ENDPOINT ?? `http://127.0.0.1:${config.port}`,
+      token,
+    })
+    const [instance, runs] = await Promise.all([client.instance(), client.runs({ limit: 50 })])
+    if (parsed.flags.json === true) process.stdout.write(`${JSON.stringify({ instance, runs })}\n`)
+    else process.stdout.write(`${instance.lifecycle} · ${instance.version} · ${runs.items.length} runs\n`)
+    return
+  }
+  if (command === 'ui') {
+    const config = loadStandaloneConfig(parsed.flags)
+    await runTerminalUi({
+      endpoint: process.env.WORKFLOW_MCP_ENDPOINT ?? `http://127.0.0.1:${config.port}`,
+      token: await readAudienceToken(config.dataDirectory, 'web'),
+      snapshot: parsed.flags.snapshot === true,
+    })
+    return
+  }
+  if (command === 'token' && parsed.positionals[0] === 'show') {
+    const config = loadStandaloneConfig(parsed.flags)
+    const purpose = stringArgument(parsed.flags, 'purpose')
+    if (purpose !== 'mcp' && purpose !== 'web') {
+      throw new StandaloneConfigurationError('--purpose must be mcp or web')
+    }
+    if (!process.stdout.isTTY && parsed.flags.force !== true) {
+      throw new StandaloneConfigurationError('Refusing to print a token without a TTY; pass --force for deliberate automation')
+    }
+    process.stdout.write(`${await readAudienceToken(config.dataDirectory, purpose)}\n`)
+    return
+  }
   if (command === 'serve') {
     if (parsed.positionals[0] !== undefined && parsed.positionals[0] !== '--stdio') {
       parsed.flags.workspace = parsed.positionals[0]
@@ -74,6 +159,31 @@ async function main(arguments_: string[]): Promise<void> {
     return
   }
   throw new StandaloneConfigurationError(`Unknown command ${JSON.stringify(command)}`)
+}
+
+async function readAudienceToken(dataDirectory: string, purpose: 'mcp' | 'web'): Promise<string> {
+  const value = await readFile(join(dataDirectory, 'secrets', `${purpose}.token`), 'utf8')
+  return value.trim()
+}
+
+function stringArgument(flags: Readonly<Record<string, string | boolean>>, name: string): string | undefined {
+  const value = flags[name]
+  return typeof value === 'string' ? value : undefined
+}
+
+function requiredStringArgument(flags: Readonly<Record<string, string | boolean>>, name: string): string {
+  const value = stringArgument(flags, name)
+  if (value === undefined) throw new StandaloneConfigurationError(`--${name} requires a value`)
+  return value
+}
+
+function parsePort(value: string, name: string): number {
+  if (!/^\d+$/.test(value)) throw new StandaloneConfigurationError(`--${name} must be a TCP port`)
+  const port = Number(value)
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new StandaloneConfigurationError(`--${name} must be a TCP port`)
+  }
+  return port
 }
 
 function installShutdown(shutdown: (signal: string) => Promise<void>): void {
@@ -131,5 +241,9 @@ Usage:
   workflow-mcp doctor --container [--json] [--workspace=/workspace] [--data-dir=/data]
   workflow-mcp healthcheck [--port=7331]
   workflow-mcp mcp-proxy [--port=7331]
+  workflow-mcp status [--json] [--port=7331]
+  workflow-mcp ui [--snapshot] [--port=7331]
+  workflow-mcp token show --purpose=mcp|web [--force]
+  workflow-mcp instance create|inspect|hash|codex-config [options]
 `)
 }

@@ -10,6 +10,7 @@ import { applySecurityHeaders, routeReadOnlyApi, sendJson, validLocalHost } from
 import type { StandaloneConfig } from '../config/schema.js'
 import { createStandaloneApplication, type StandaloneApplication } from './application.js'
 import { loadOrCreateTokens, type StandaloneTokens } from './tokens.js'
+import { loadStaticWebRouter, type StaticWebRouter } from '../web/staticRouter.js'
 
 export type StandaloneDaemon = {
   host: StandaloneConfig['host']
@@ -28,6 +29,7 @@ export async function startStandaloneDaemon(
   let application: StandaloneApplication | undefined
   let tokens: StandaloneTokens | undefined
   let mcp: WorkflowMcpHttpHandler | undefined
+  let web: StaticWebRouter | undefined
   const http = createServer((request, response) => {
     void (async () => {
       applySecurityHeaders(response)
@@ -44,7 +46,7 @@ export async function startStandaloneDaemon(
         sendJson(response, ready ? 200 : 503, { status: ready ? 'ready' : 'not-ready' })
         return
       }
-      if (!ready || application === undefined || tokens === undefined || mcp === undefined) {
+      if (!ready || application === undefined || tokens === undefined || mcp === undefined || web === undefined) {
         sendJson(response, 503, { status: 'not-ready' })
         return
       }
@@ -54,6 +56,7 @@ export async function startStandaloneDaemon(
         config,
         webToken: tokens.web,
       })) return
+      if (web.handle(request, response)) return
       sendJson(response, 404, { schemaVersion: 1, error: { code: 'not-found' } })
     })().catch(error => {
       if (!response.headersSent) {
@@ -85,6 +88,7 @@ export async function startStandaloneDaemon(
       { cwd: config.workspace },
       tokens.mcp,
     )
+    web = await loadStaticWebRouter(config.webEnabled)
     ready = true
   } catch (error) {
     await closeHttp(http)

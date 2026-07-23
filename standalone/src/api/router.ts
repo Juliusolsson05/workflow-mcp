@@ -159,10 +159,13 @@ export async function routeReadOnlyApi(
 type ProtocolRunStatus = NonNullable<WorkflowRunListInput['statuses']>[number]
 
 export function applySecurityHeaders(response: ServerResponse): void {
-  response.setHeader('content-security-policy', "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+  response.setHeader('content-security-policy', "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
   response.setHeader('x-content-type-options', 'nosniff')
   response.setHeader('x-frame-options', 'DENY')
   response.setHeader('referrer-policy', 'no-referrer')
+  response.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=(), payment=()')
+  response.setHeader('cross-origin-opener-policy', 'same-origin')
+  response.setHeader('cross-origin-resource-policy', 'same-origin')
   response.setHeader('cache-control', 'no-store')
 }
 
