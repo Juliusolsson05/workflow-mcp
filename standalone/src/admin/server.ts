@@ -26,12 +26,27 @@ export async function startStandaloneAdminServer(options: {
 }): Promise<StandaloneAdminServer> {
   const socketPath = options.config.adminSocketPath
   await prepareSocketPath(socketPath)
+  const requestControllers = new Set<AbortController>()
+  let closing = false
   const server = createServer((request, response) => {
-    void routeAdminRequest(request, response, options).catch(error => {
+    if (closing) {
+      sendJson(response, 503, { schemaVersion: 1, error: { code: 'service-stopping' } })
+      return
+    }
+    // Every route gets a cancellation lifetime, not only device login. `codex login status` and
+    // `codex logout` are external programs too, so either can wedge shutdown if a broken binary
+    // ignores TERM. Keeping the controller at the HTTP boundary also cancels work when the caller
+    // disconnects instead of holding the global administrative writer for an orphaned request.
+    const controller = new AbortController()
+    requestControllers.add(controller)
+    response.once('close', () => {
+      if (!response.writableEnded) controller.abort()
+    })
+    void routeAdminRequest(request, response, options, controller.signal).catch(error => {
       if (!response.headersSent) {
         sendJson(response, 500, adminError('internal-error', error))
       } else if (!response.writableEnded) response.end()
-    })
+    }).finally(() => requestControllers.delete(controller))
   })
   await listen(server, socketPath)
   try {
@@ -47,7 +62,14 @@ export async function startStandaloneAdminServer(options: {
   return {
     socketPath,
     close(): Promise<void> {
-      closePromise ??= closeAndRemove(server, socketPath)
+      if (closePromise === undefined) {
+        // Device auth can legitimately wait for a human for minutes. Abort those requests before
+        // server.close() so daemon shutdown is bounded by the broker's TERM→KILL reap policy rather
+        // than Docker's outer grace timeout.
+        closing = true
+        for (const controller of requestControllers) controller.abort()
+        closePromise = closeAndRemove(server, socketPath)
+      }
       return closePromise
     },
   }
@@ -63,6 +85,7 @@ async function routeAdminRequest(
     auth: CodexCredentialBroker
     token: string
   },
+  signal: AbortSignal,
 ): Promise<void> {
   response.setHeader('cache-control', 'no-store')
   response.setHeader('x-content-type-options', 'nosniff')
@@ -74,15 +97,15 @@ async function routeAdminRequest(
   const url = new URL(request.url ?? '/', 'http://workflow-mcp-admin.invalid')
   try {
     if (request.method === 'POST' && url.pathname === '/v1/auth/login') {
-      await streamAuthenticationLogin(request, response, options.auth)
+      await streamAuthenticationLogin(request, response, options.auth, signal)
       return
     }
     if (request.method === 'GET' && url.pathname === '/v1/auth/status') {
-      sendJson(response, 200, await options.auth.status())
+      sendJson(response, 200, await options.auth.status(signal))
       return
     }
     if (request.method === 'POST' && url.pathname === '/v1/auth/logout') {
-      await options.auth.logout()
+      await options.auth.logout(signal)
       sendJson(response, 200, { schemaVersion: 1, status: 'logged-out' })
       return
     }
@@ -118,7 +141,7 @@ async function routeAdminRequest(
     }
     sendJson(response, 404, { schemaVersion: 1, error: { code: 'not-found' } })
   } catch (error) {
-    const code = errorCode(error)
+    const code = publicErrorCode(error)
     const status = code === 'workflow-not-found' ? 404
       : code === 'source-changed' ? 409
         : code === 'auth-busy' || code === 'auth-mode-conflict' ? 409
@@ -134,11 +157,8 @@ async function streamAuthenticationLogin(
   request: IncomingMessage,
   response: ServerResponse,
   auth: CodexCredentialBroker,
+  signal: AbortSignal,
 ): Promise<void> {
-  const abort = new AbortController()
-  response.once('close', () => {
-    if (!response.writableEnded) abort.abort()
-  })
   response.statusCode = 200
   response.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
   response.setHeader('cache-control', 'no-store')
@@ -146,13 +166,14 @@ async function streamAuthenticationLogin(
     if (!response.destroyed) response.write(`${JSON.stringify(value)}\n`)
   }
   try {
-    await auth.login((stream, text) => frame({ type: 'output', stream, text }), abort.signal)
+    await auth.login((stream, text) => frame({ type: 'output', stream, text }), signal)
     frame({ type: 'complete' })
   } catch (error) {
+    const code = publicErrorCode(error)
     frame({
       type: 'error',
-      code: errorCode(error),
-      message: error instanceof Error ? error.message : String(error),
+      code,
+      message: publicErrorMessage(code, error),
     })
   } finally {
     if (!response.writableEnded) response.end()
@@ -228,17 +249,39 @@ function requestError(message: string, cause?: unknown): Error & { code: 'invali
   })
 }
 
-function errorCode(error: unknown): string {
-  return typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+const PUBLIC_ADMIN_ERROR_CODES = new Set([
+  'workflow-not-found',
+  'source-changed',
+  'auth-busy',
+  'auth-mode-conflict',
+  'authentication-failed',
+  'authentication-cancelled',
+  'service-stopping',
+  'service-stopped',
+  'invalid-request',
+])
+
+function publicErrorCode(error: unknown): string {
+  const candidate = typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
     ? error.code
-    : 'internal-error'
+    : undefined
+  // WHY: an arbitrary `.code` property does not make a provider/store exception public. Both the
+  // code and message can contain credential fragments or private paths, so only the deliberately
+  // documented administrative vocabulary crosses the authenticated socket boundary. Everything
+  // else collapses to the same non-oracular failure used by the browser and MCP transports.
+  return candidate !== undefined && PUBLIC_ADMIN_ERROR_CODES.has(candidate) ? candidate : 'internal-error'
 }
 
 function adminError(code: string, error: unknown): object {
   return {
     schemaVersion: 1,
-    error: { code, message: error instanceof Error ? error.message : String(error) },
+    error: { code, message: publicErrorMessage(code, error) },
   }
+}
+
+function publicErrorMessage(code: string, error: unknown): string {
+  if (code === 'internal-error') return 'Workflow MCP could not complete the request.'
+  return error instanceof Error ? error.message : String(error)
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

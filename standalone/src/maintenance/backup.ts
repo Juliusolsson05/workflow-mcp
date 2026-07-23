@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
 import {
   lstat,
+  link,
   mkdir,
   open,
   opendir,
@@ -9,14 +10,26 @@ import {
   readdir,
   rename,
   rm,
+  statfs,
+  unlink,
+  writeFile,
 } from 'node:fs/promises'
 import { basename, dirname, join, posix, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { createGunzip, createGzip } from 'node:zlib'
 
+import {
+  RESTORE_IN_PROGRESS_FILE,
+  RESTORE_PREPARING_FILE,
+  RESTORE_RESET_CLAIM_FILE,
+  RESTORE_RESET_PREPARING_FILE,
+} from '../daemon/dataLayout.js'
+
 const MAGIC = Buffer.from('WORKFLOW-MCP-BACKUP-V1\n', 'utf8')
 const MAX_HEADER_BYTES = 64 * 1024
 const MAX_ENTRIES = 1_000_000
+const MAX_BACKUP_PAYLOAD_BYTES = 16 * 1024 * 1024 * 1024
+const RESTORE_FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024
 const PAYLOAD_ROOTS = ['approvals', 'config', 'store', 'workspaces'] as const
 const DURABLE_DIRECTORIES = [
   '.coordination', 'store', 'codex-home', 'config', 'secrets', 'approvals', 'backups', 'workspaces',
@@ -63,9 +76,15 @@ export async function createOfflineBackup(input: {
   const createdAt = new Date().toISOString()
   const temporary = `${outputPath}.tmp-${process.pid}`
   const checksumTemporary = `${checksumPath}.tmp-${process.pid}`
+  const selfCheckPath = `${temporary}.sha256`
   try {
     await writeArchive(temporary, dataDirectory, entries, { ...input.identity, createdAt })
     const archiveSha256 = await hashFile(temporary)
+    // Creation and hostile-input verification intentionally share one parser. This catches a
+    // writer/parser grammar drift before either half of the public two-file commit is published.
+    await writeFile(selfCheckPath, `${archiveSha256}  ${basename(temporary)}\n`, { flag: 'wx', mode: 0o600 })
+    await verifyOfflineBackup({ inputPath: temporary, expectedIdentity: input.identity })
+    await rm(selfCheckPath)
     const checksum = await open(checksumTemporary, 'wx', 0o600)
     try {
       await checksum.writeFile(`${archiveSha256}  ${basename(outputPath)}\n`, 'utf8')
@@ -92,8 +111,53 @@ export async function createOfflineBackup(input: {
   } catch (error) {
     await rm(temporary, { force: true }).catch(() => undefined)
     await rm(checksumTemporary, { force: true }).catch(() => undefined)
+    await rm(selfCheckPath, { force: true }).catch(() => undefined)
     throw error
   }
+}
+
+export async function commitHostBackup(input: {
+  directory: string
+  archiveTemporary: string
+  checksumTemporary: string
+  archive: string
+  checksum: string
+}): Promise<void> {
+  const directory = resolve(input.directory)
+  await requireOrdinaryDirectory(directory)
+  for (const [name, value] of Object.entries(input).filter(([name]) => name !== 'directory')) {
+    // The launchers deliberately consume the full portable NAME_MAX budget for the PowerShell
+    // checksum staging leaf. Keep this independently callable root helper at 255 bytes too: allowing
+    // 256 here would turn an apparent validation success into a filesystem-dependent ENAMETOOLONG.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/.test(value)) {
+      throw new Error(`Host backup ${name} is not a safe leaf name`)
+    }
+  }
+  const archiveTemporary = join(directory, input.archiveTemporary)
+  const checksumTemporary = join(directory, input.checksumTemporary)
+  const archive = join(directory, input.archive)
+  const checksum = join(directory, input.checksum)
+  if (exists(await lstat(archive).catch(missing)) || exists(await lstat(checksum).catch(missing))) {
+    throw new Error('Host backup destination already exists')
+  }
+  for (const path of [archiveTemporary, checksumTemporary]) {
+    const info = await lstat(path)
+    if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
+      throw new Error('Host backup temporary input is not an ordinary single-link file')
+    }
+    const handle = await open(path, 'r')
+    try { await handle.sync() } finally { await handle.close() }
+  }
+  // WHY: rename overwrites on POSIX and has different no-clobber behavior on Windows shares.
+  // Hard-link publication is atomic and fails if a concurrent writer created the destination.
+  // The checksum remains the commit record and is linked only after archive bytes and directory
+  // metadata are durable. This helper runs from the pinned image against one explicit host bind.
+  await link(archiveTemporary, archive)
+  await unlink(archiveTemporary)
+  await fsyncDirectory(directory)
+  await link(checksumTemporary, checksum)
+  await unlink(checksumTemporary)
+  await fsyncDirectory(directory)
 }
 
 export async function verifyOfflineBackup(input: {
@@ -103,8 +167,9 @@ export async function verifyOfflineBackup(input: {
   const inputPath = resolve(input.inputPath)
   const info = await lstat(inputPath)
   if (!info.isFile() || info.isSymbolicLink()) throw new Error('Backup input is not an ordinary file')
-  const archiveSha256 = await verifyOuterChecksum(inputPath)
-  const reader = new ArchiveReader(createReadStream(inputPath).pipe(createGunzip()))
+  const expectedArchiveSha256 = await readOuterChecksum(inputPath)
+  const archive = openHashedArchive(inputPath)
+  const reader = archive.reader
   const magic = await reader.readExact(MAGIC.length)
   if (!magic.equals(MAGIC)) throw new Error('Backup archive magic is invalid')
   const manifest = parseManifest(await reader.readHeader())
@@ -130,6 +195,9 @@ export async function verifyOfflineBackup(input: {
     if (entry.path <= previousPath) throw new Error('Backup entries are duplicated or not sorted')
     previousPath = entry.path
     bytes += entry.size
+    if (bytes > MAX_BACKUP_PAYLOAD_BYTES) {
+      throw new Error(`Backup payload exceeds ${MAX_BACKUP_PAYLOAD_BYTES} bytes`)
+    }
     if (entry.kind === 'file') {
       const hash = createHash('sha256')
       await reader.consume(entry.size, chunk => { hash.update(chunk) })
@@ -137,6 +205,8 @@ export async function verifyOfflineBackup(input: {
     }
   }
   await reader.assertEnd()
+  const archiveSha256 = archive.digest()
+  if (archiveSha256 !== expectedArchiveSha256) throw new Error('Backup archive checksum failed')
   return Object.freeze({
     schemaVersion: 1,
     format: 'workflow-mcp-backup-v1',
@@ -156,25 +226,73 @@ export async function restoreOfflineBackup(input: {
   identity: BackupIdentity
 }): Promise<BackupVerification> {
   // Verify the complete archive before creating the first payload inode. A corrupt input therefore
-  // leaves the target reusable; a crash during the later extraction intentionally leaves a
-  // non-empty target that requires operator cleanup rather than guessing which files committed.
+  // leaves the target reusable; a crash during the later extraction intentionally leaves an
+  // identity-marked target that requires the explicit locked reset path rather than guessing which
+  // files committed or permitting ordinary healthy-volume deletion.
   const verification = await verifyOfflineBackup({
     inputPath: input.inputPath,
     expectedIdentity: input.identity,
   })
   const dataDirectory = resolve(input.dataDirectory)
   await assertRestoreTargetEmpty(dataDirectory)
+  const filesystem = await statfs(dataDirectory)
+  const availableBytes = filesystem.bavail * filesystem.bsize
+  if (availableBytes < verification.bytes + RESTORE_FREE_SPACE_MARGIN_BYTES) {
+    throw new Error(
+      `Restore requires ${verification.bytes + RESTORE_FREE_SPACE_MARGIN_BYTES} free bytes; ${availableBytes} available`,
+    )
+  }
+  const restoreMarkerPath = join(dataDirectory, RESTORE_IN_PROGRESS_FILE)
+  const restorePreparingPath = join(dataDirectory, RESTORE_PREPARING_FILE)
+  const restoreMarker = await open(restorePreparingPath, 'wx', 0o600)
+  try {
+    await restoreMarker.writeFile(`${JSON.stringify({
+      schemaVersion: 1,
+      instanceId: input.identity.instanceId,
+      projectHash: input.identity.projectHash,
+      archiveSha256: verification.archiveSha256,
+    })}\n`, 'utf8')
+    await restoreMarker.sync()
+  } finally {
+    await restoreMarker.close()
+  }
+  // WHY: extraction does not begin until a complete identity marker is atomically published. A
+  // crash during the preparing write leaves a recognizable poison state that reset may delete
+  // safely without parsing, because no archive payload inode can exist before this rename.
+  await rename(restorePreparingPath, restoreMarkerPath)
+  await fsyncDirectory(dataDirectory)
   for (const directory of DURABLE_DIRECTORIES) {
     await mkdir(join(dataDirectory, directory), { recursive: true, mode: 0o700 })
   }
 
-  const reader = new ArchiveReader(createReadStream(resolve(input.inputPath)).pipe(createGunzip()))
-  await reader.readExact(MAGIC.length)
-  parseManifest(await reader.readHeader())
+  const archive = openHashedArchive(resolve(input.inputPath))
+  const reader = archive.reader
+  const magic = await reader.readExact(MAGIC.length)
+  if (!magic.equals(MAGIC)) throw new Error('Backup archive magic changed after verification')
+  const manifest = parseManifest(await reader.readHeader())
+  if (
+    manifest.instanceId !== verification.instanceId ||
+    manifest.projectHash !== verification.projectHash ||
+    manifest.createdAt !== verification.createdAt
+  ) throw new Error('Backup manifest changed after verification')
+  let previousPath = ''
+  let entries = 0
+  let bytes = 0
   while (true) {
     const raw = await reader.readHeader()
-    if (isObject(raw) && raw.kind === 'end') break
+    if (isObject(raw) && raw.kind === 'end') {
+      if (raw.entries !== entries) throw new Error('Backup end record changed after verification')
+      break
+    }
     const entry = parseEntry(raw)
+    entries += 1
+    if (entries > MAX_ENTRIES) throw new Error(`Backup exceeds ${MAX_ENTRIES} entries`)
+    if (entry.path <= previousPath) throw new Error('Backup entries changed order after verification')
+    previousPath = entry.path
+    bytes += entry.size
+    if (bytes > MAX_BACKUP_PAYLOAD_BYTES) {
+      throw new Error(`Backup payload exceeds ${MAX_BACKUP_PAYLOAD_BYTES} bytes`)
+    }
     const target = join(dataDirectory, ...entry.path.split('/'))
     if (entry.kind === 'directory') {
       await mkdir(target, { recursive: true, mode: entry.mode })
@@ -183,8 +301,10 @@ export async function restoreOfflineBackup(input: {
     }
     const handle = await open(target, 'wx', entry.mode)
     let position = 0
+    const hash = createHash('sha256')
     try {
       await reader.consume(entry.size, async chunk => {
+        hash.update(chunk)
         let offset = 0
         while (offset < chunk.length) {
           const written = await handle.write(chunk, offset, chunk.length - offset, position)
@@ -193,6 +313,9 @@ export async function restoreOfflineBackup(input: {
           position += written.bytesWritten
         }
       })
+      if (hash.digest('hex') !== entry.sha256) {
+        throw new Error(`Backup entry changed after verification: ${entry.path}`)
+      }
       await handle.sync()
     } finally {
       await handle.close()
@@ -200,8 +323,114 @@ export async function restoreOfflineBackup(input: {
     await fsyncDirectory(dirname(target))
   }
   await reader.assertEnd()
+  if (entries !== verification.entries || bytes !== verification.bytes) {
+    throw new Error('Backup inventory changed after verification')
+  }
+  // Verification and extraction intentionally use separate passes so no target inode exists for a
+  // corrupt input. Re-hashing the exact compressed bytes during the extraction pass closes the
+  // remaining host-side swap/in-place-mutation window: changed bytes may leave a partial target,
+  // but can never be reported as a committed restore.
+  if (archive.digest() !== verification.archiveSha256) {
+    throw new Error('Backup archive changed after verification')
+  }
+  await fsyncDirectory(dataDirectory)
+  for (const claimName of [RESTORE_RESET_CLAIM_FILE, RESTORE_RESET_PREPARING_FILE]) {
+    if (exists(await lstat(join(dataDirectory, claimName)).catch(missing))) {
+      throw new Error('Restore target was claimed for reset before commit')
+    }
+  }
+  // WHY: removing this marker is the restore transaction's only commit point. Startup refuses the
+  // destination regardless of how plausible its partial layout looks, and the launcher may delete
+  // the volume for retry only while this identity-bound proof of interruption still exists.
+  await unlink(restoreMarkerPath)
   await fsyncDirectory(dataDirectory)
   return verification
+}
+
+export async function claimInterruptedRestore(input: {
+  dataDirectory: string
+  identity: BackupIdentity
+}): Promise<void> {
+  validateIdentity(input.identity)
+  const root = resolve(input.dataDirectory)
+  const path = join(root, RESTORE_IN_PROGRESS_FILE)
+  const preparingPath = join(root, RESTORE_PREPARING_FILE)
+  const claimPath = join(root, RESTORE_RESET_CLAIM_FILE)
+  const claimPreparingPath = join(root, RESTORE_RESET_PREPARING_FILE)
+  const existingClaim = await lstat(claimPath).catch(missing)
+  if (existingClaim !== undefined) {
+    await assertResetClaim(claimPath, existingClaim, input.identity)
+    return
+  }
+  const info = await lstat(path).catch(async error => {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+      const preparing = await lstat(preparingPath).catch(missing)
+      if (preparing !== undefined && preparing.isFile() && !preparing.isSymbolicLink() && preparing.size <= MAX_HEADER_BYTES) {
+        return preparing
+      }
+      throw new Error('Restore target is not marked as an interrupted restore; refusing healthy-volume deletion')
+    }
+    throw error
+  })
+  const preparingOnly = info !== undefined && exists(await lstat(preparingPath).catch(missing)) && !exists(await lstat(path).catch(missing))
+  if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_HEADER_BYTES) {
+    throw new Error('Interrupted restore marker is invalid')
+  }
+  if (!preparingOnly) {
+    let value: unknown
+    try { value = JSON.parse(await readFile(path, 'utf8')) as unknown } catch {
+      throw new Error('Interrupted restore marker is unreadable')
+    }
+    if (
+      !isObject(value) ||
+      value.schemaVersion !== 1 ||
+      value.instanceId !== input.identity.instanceId ||
+      value.projectHash !== input.identity.projectHash ||
+      typeof value.archiveSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(value.archiveSha256)
+    ) throw new Error('Interrupted restore marker does not match this installation')
+  }
+  const stalePreparingClaim = await lstat(claimPreparingPath).catch(missing)
+  if (stalePreparingClaim !== undefined) {
+    if (!stalePreparingClaim.isFile() || stalePreparingClaim.isSymbolicLink()) {
+      throw new Error('Interrupted restore reset claim is invalid')
+    }
+    // A crash can leave only this uncommitted temporary. The original restore marker is still
+    // present and has just been revalidated under the owner lock, so replacing the private temp is
+    // safe and does not broaden deletion authority.
+    await unlink(claimPreparingPath)
+  }
+  const claim = await open(claimPreparingPath, 'wx', 0o600)
+  try {
+    await claim.writeFile(`${JSON.stringify({
+      schemaVersion: 1,
+      state: 'reset-claimed',
+      instanceId: input.identity.instanceId,
+      projectHash: input.identity.projectHash,
+    })}\n`, 'utf8')
+    await claim.sync()
+  } finally {
+    await claim.close()
+  }
+  // WHY: the checker and restore both hold the same non-blocking owner flock. Publishing this
+  // poison marker before releasing that flock closes the check/delete gap: a new restore cannot
+  // start against the claimed volume, while an active restore makes the claim fail at the lock.
+  await rename(claimPreparingPath, claimPath)
+  await fsyncDirectory(root)
+}
+
+async function assertResetClaim(path: string, info: Awaited<ReturnType<typeof lstat>>, identity: BackupIdentity): Promise<void> {
+  if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_HEADER_BYTES) {
+    throw new Error('Interrupted restore reset claim is invalid')
+  }
+  let value: unknown
+  try { value = JSON.parse(await readFile(path, 'utf8')) as unknown } catch {
+    throw new Error('Interrupted restore reset claim is unreadable')
+  }
+  if (
+    !isObject(value) || value.schemaVersion !== 1 || value.state !== 'reset-claimed' ||
+    value.instanceId !== identity.instanceId || value.projectHash !== identity.projectHash
+  ) throw new Error('Interrupted restore reset claim does not match this installation')
 }
 
 async function inventoryPayload(dataDirectory: string): Promise<ArchiveEntry[]> {
@@ -214,7 +443,12 @@ async function inventoryPayload(dataDirectory: string): Promise<ArchiveEntry[]> 
     await requirePrivateDirectory(rootPath)
     await walk(dataDirectory, root, entries)
   }
-  return entries.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+  const sorted = entries.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0)
+  const bytes = sorted.reduce((total, entry) => total + entry.size, 0)
+  if (bytes > MAX_BACKUP_PAYLOAD_BYTES) {
+    throw new Error(`Backup payload exceeds ${MAX_BACKUP_PAYLOAD_BYTES} bytes`)
+  }
+  return sorted
 }
 
 async function walk(dataDirectory: string, relativePath: string, entries: ArchiveEntry[]): Promise<void> {
@@ -234,7 +468,10 @@ async function inspectEntry(dataDirectory: string, relativePath: string): Promis
   const mode = info.mode & 0o777
   if (info.isDirectory() && !info.isSymbolicLink()) {
     if ((mode & 0o077) !== 0) throw new Error(`Backup payload entry is not private: ${relativePath}`)
-    return Object.freeze({ path: relativePath, kind: 'directory', mode, size: 0 })
+    // The archive is a private-state interchange format, not a permission-preserving tarball.
+    // Canonical modes make 0400 files and 0500 source directories restorable while never granting
+    // group/other authority in the destination.
+    return Object.freeze({ path: relativePath, kind: 'directory', mode: 0o700, size: 0 })
   }
   if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
     throw new Error(`Backup payload entry is not an ordinary single-link file: ${relativePath}`)
@@ -243,7 +480,7 @@ async function inspectEntry(dataDirectory: string, relativePath: string): Promis
   return Object.freeze({
     path: relativePath,
     kind: 'file',
-    mode,
+    mode: 0o600,
     size: info.size,
     sha256: await hashFile(join(dataDirectory, ...relativePath.split('/'))),
   })
@@ -307,16 +544,35 @@ async function assertRestoreTargetEmpty(dataDirectory: string): Promise<void> {
   }
 }
 
-async function verifyOuterChecksum(inputPath: string): Promise<string> {
+async function readOuterChecksum(inputPath: string): Promise<string> {
   const checksumPath = `${inputPath}.sha256`
   const info = await lstat(checksumPath)
   if (!info.isFile() || info.isSymbolicLink() || info.size > 1024) throw new Error('Backup checksum sidecar is invalid')
   const content = await readFile(checksumPath, 'utf8')
   const match = /^([a-f0-9]{64})  ([^/\\\r\n]+)\n$/.exec(content)
   if (match === null || match[2] !== basename(inputPath)) throw new Error('Backup checksum sidecar is malformed')
-  const actual = await hashFile(inputPath)
-  if (actual !== match[1]) throw new Error('Backup archive checksum failed')
-  return actual
+  return match[1]!
+}
+
+function openHashedArchive(inputPath: string): { reader: ArchiveReader; digest: () => string } {
+  const compressed = createReadStream(inputPath)
+  const hash = createHash('sha256')
+  const gunzip = createGunzip()
+  compressed.on('data', chunk => hash.update(chunk))
+  // `Readable.pipe()` does not forward a source error to the destination. Destroying gunzip makes
+  // ArchiveReader's async iterator reject instead of leaving verification hung on a vanished host
+  // file, while the digest remains callable only after the reader has observed a clean end.
+  compressed.once('error', error => gunzip.destroy(error))
+  compressed.pipe(gunzip)
+  let digested = false
+  return {
+    reader: new ArchiveReader(gunzip),
+    digest: () => {
+      if (digested) throw new Error('Backup archive digest was already consumed')
+      digested = true
+      return hash.digest('hex')
+    },
+  }
 }
 
 class ArchiveReader {
@@ -388,8 +644,14 @@ async function writeHeader(stream: NodeJS.WritableStream, value: object): Promis
 function writeChunk(stream: NodeJS.WritableStream, chunk: Buffer): Promise<void> {
   if (stream.write(chunk)) return Promise.resolve()
   return new Promise((resolveDrain, rejectDrain) => {
-    stream.once('drain', resolveDrain)
-    stream.once('error', rejectDrain)
+    const cleanup = (): void => {
+      stream.removeListener('drain', onDrain)
+      stream.removeListener('error', onError)
+    }
+    const onDrain = (): void => { cleanup(); resolveDrain() }
+    const onError = (error: Error): void => { cleanup(); rejectDrain(error) }
+    stream.once('drain', onDrain)
+    stream.once('error', onError)
   })
 }
 
@@ -411,7 +673,8 @@ function parseEntry(value: unknown): ArchiveEntry {
   if (
     !isObject(value) || typeof value.path !== 'string' ||
     (value.kind !== 'directory' && value.kind !== 'file') ||
-    typeof value.mode !== 'number' || !Number.isInteger(value.mode) || value.mode < 0o600 || value.mode > 0o700 || (value.mode & 0o077) !== 0 ||
+    typeof value.mode !== 'number' || !Number.isInteger(value.mode) ||
+    (value.kind === 'directory' ? value.mode !== 0o700 : value.mode !== 0o600) ||
     typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0 ||
     (value.kind === 'directory' && (value.size !== 0 || value.sha256 !== undefined)) ||
     (value.kind === 'file' && (typeof value.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.sha256)))
@@ -428,7 +691,11 @@ function parseEntry(value: unknown): ArchiveEntry {
 
 function validateArchivePath(path: string): void {
   if (path === 'layout.json') return
-  if (path.length === 0 || path.startsWith('/') || path.includes('\\') || path.includes('\0')) {
+  // WHY: paths are later included in operator-facing errors as well as joined to the restore root.
+  // Reject terminal and bidi controls at the archive boundary so a malicious archive cannot hide
+  // which inode failed validation or visually reorder the path an operator is reviewing.
+  const containsControl = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\p{Cf}/u.test(path)
+  if (path.length === 0 || path.startsWith('/') || path.includes('\\') || containsControl) {
     throw new Error(`Backup entry path is forbidden: ${JSON.stringify(path)}`)
   }
   const components = path.split('/')

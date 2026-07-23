@@ -71,7 +71,10 @@ export class StandaloneAdminClient {
             if (frame.type === 'output' && (frame.stream === 'stdout' || frame.stream === 'stderr') && typeof frame.text === 'string') {
               onOutput(frame.stream, frame.text)
             } else if (frame.type === 'error') {
-              rejectOnce(new Error(typeof frame.message === 'string' ? frame.message : 'Authentication failed'))
+              rejectOnce(Object.assign(
+                new Error(typeof frame.message === 'string' ? frame.message : 'Authentication failed'),
+                { code: typeof frame.code === 'string' ? frame.code : 'authentication-failed' },
+              ))
             } else if (frame.type === 'complete' && !settled) {
               settled = true
               resolveLogin()
@@ -125,7 +128,10 @@ export class StandaloneAdminClient {
             const detail = isObject(value) && isObject(value.error) && typeof value.error.message === 'string'
               ? value.error.message
               : `HTTP ${response.statusCode ?? 500}`
-            rejectCall(new Error(detail))
+            const code = isObject(value) && isObject(value.error) && typeof value.error.code === 'string'
+              ? value.error.code
+              : 'admin-http-error'
+            rejectCall(Object.assign(new Error(detail), { code }))
             return
           }
           resolveCall(value as T)

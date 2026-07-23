@@ -221,6 +221,26 @@ describe('WorkflowService', () => {
     })
   })
 
+  it('closes workflow mutation admission for an exclusive administrative operation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-exclusive-administrative-mutation-'))
+    const service = new WorkflowService({
+      store: new FileWorkflowStore(join(cwd, 'state')),
+      provider: new FakeAgentProvider([]),
+    })
+    await service.initialize()
+    let release!: () => void
+    const held = new Promise<void>(resolveHeld => { release = resolveHeld })
+    const exclusive = service.runExclusiveAdministrativeMutation(async () => held)
+    await expect(service.start({ cwd }, {
+      script: `export const meta = { name: 'blocked', description: 'Must not cross credential rotation' }\nreturn null`,
+    })).rejects.toMatchObject({ code: 'invalid-request' })
+    await expect(service.runExclusiveAdministrativeMutation(async () => undefined))
+      .rejects.toMatchObject({ code: 'invalid-request' })
+    release()
+    await exclusive
+    await service.stop()
+  })
+
   it('returns immediately, persists events, closes phases honestly, and enforces cwd scope', async () => {
     const fixture = await project(twoPhaseSource)
     const provider = new FakeAgentProvider([

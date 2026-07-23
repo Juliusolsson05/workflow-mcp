@@ -1,0 +1,11 @@
+# WHY: CVE-2026-32631 is a Git for Windows issue: checkout can follow a repository symlink to a
+# Windows network drive and disclose an NTLMv2 hash. Grype's Alpine feed currently applies that
+# Windows-only advisory to the Linux `git` APK. Keep the suppression pinned to the exact reviewed
+# ecosystem, package, and version so any Git upgrade—or any similarly named package elsewhere—must
+# pass the HIGH gate on its own evidence. All other HIGH and CRITICAL matches remain fatal.
+ignore:
+  - vulnerability: CVE-2026-32631
+    package:
+      type: apk
+      name: git
+      version: 2.52.0-r0

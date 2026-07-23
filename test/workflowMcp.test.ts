@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -18,6 +19,7 @@ describe('workflow MCP facade', () => {
     expect(workflowMcpInstructions(false)).toContain('Inline script authoring is disabled')
     expect(workflowMcpInstructions(false)).not.toContain('To author one')
     expect(workflowMcpInstructions(true)).toContain('To author one')
+    expect(workflowMcpInstructions(false, 1)).toContain('shared provider capacity of 1')
   })
 
   it('registers the complete stable thirteen-tool surface', async () => {
@@ -49,6 +51,35 @@ describe('workflow MCP facade', () => {
       'workflow_run_status',
       'workflow_validate',
     ])
+    expect(tools.tools.find(tool => tool.name === 'workflow_resume')?.inputSchema.properties).toMatchObject({
+      runId: expect.any(Object),
+      claudeRunPath: expect.any(Object),
+      workflowPath: expect.any(Object),
+      idempotencyKey: expect.any(Object),
+      abandonUnconfirmedProvider: expect.any(Object),
+    })
+    const catalogTools = JSON.parse(await readFile(fileURLToPath(new URL(
+      '../standalone/distribution/docker-catalog/tools.json',
+      import.meta.url,
+    )), 'utf8')) as Array<{
+      name: string
+      arguments: Array<{ name: string; optional?: boolean }>
+      annotations: { readOnlyHint: boolean; destructiveHint: boolean; openWorldHint: boolean }
+    }>
+    for (const live of tools.tools) {
+      const catalog = catalogTools.find(tool => tool.name === live.name)
+      expect(catalog, `Catalog inventory is missing ${live.name}`).toBeDefined()
+      const properties = live.inputSchema.properties ?? {}
+      expect(catalog!.arguments.map(argument => argument.name).sort()).toEqual(Object.keys(properties).sort())
+      const required = new Set(live.inputSchema.required ?? [])
+      expect(catalog!.arguments.filter(argument => argument.optional !== true).map(argument => argument.name).sort())
+        .toEqual([...required].sort())
+      expect(catalog!.annotations).toEqual({
+        readOnlyHint: live.annotations?.readOnlyHint ?? false,
+        destructiveHint: live.annotations?.destructiveHint ?? false,
+        openWorldHint: live.annotations?.openWorldHint ?? true,
+      })
+    }
     const listed = await client.callTool({ name: 'workflow_list', arguments: {} })
     expect(listed.structuredContent).toMatchObject({ ok: true })
     expect((listed.structuredContent as { workflows: unknown[] }).workflows).toEqual(expect.any(Array))

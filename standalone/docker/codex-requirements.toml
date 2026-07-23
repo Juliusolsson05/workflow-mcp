@@ -20,12 +20,19 @@ extends = ":read-only"
 "/proc" = "deny"
 
 [permissions.workflow_mcp_authoring]
-description = "Write only where the host mount is writable; service state remains denied."
-extends = ":workspace"
+description = "Read the project and write only .claude/workflows; service state remains denied."
+# WHY: the built-in :workspace profile also provisions Codex-owned writable roots such as .agents.
+# The product intentionally mounts only .claude/workflows writable, so extending :workspace both
+# exceeds the authoring contract and fails against the read-only parent bind. Start read-only and
+# reopen exactly the reviewed subtree instead.
+extends = ":read-only"
 
 [permissions.workflow_mcp_authoring.filesystem]
 "/data" = "deny"
 "/proc" = "deny"
+
+[permissions.workflow_mcp_authoring.filesystem.":workspace_roots"]
+".claude/workflows" = "write"
 
 [permissions.filesystem]
 # The daemon and Codex CLI need these paths, but model-generated commands do

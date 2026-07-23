@@ -29,8 +29,9 @@ describe('durable source approvals', () => {
       adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',
       webEnabled: false,
+      concurrency: 1,
     })
-    const application = await createStandaloneApplication(config, {
+    let application = await createStandaloneApplication(config, {
       provider: new FakeAgentProvider([]),
     })
     const sourcePath = join(workflowDirectory, 'later.js')
@@ -39,6 +40,14 @@ describe('durable source approvals', () => {
     }
     return 'approved result'`)
 
+    await expect(application.service.start({ cwd: workspace }, { name: 'later' }))
+      .rejects.toMatchObject({ code: 'source-approval-required' })
+    await application.quiesce('prove unapproved source survives no restart shortcut')
+    application = await createStandaloneApplication(config, {
+      provider: new FakeAgentProvider([]),
+    })
+    // Authoring can persist this file itself. Restart must never reinterpret mere visibility as
+    // operator review, or an untrusted workflow could authorize itself without the hash ceremony.
     await expect(application.service.start({ cwd: workspace }, { name: 'later' }))
       .rejects.toMatchObject({ code: 'source-approval-required' })
     const described = await application.service.describe({ cwd: workspace }, { name: 'later' })
@@ -71,6 +80,14 @@ describe('durable source approvals', () => {
       name: 'later', description: 'Same identity with edited bytes'
     }
     return 'edited result'`)
+    await expect(application.service.start({ cwd: workspace }, { name: 'later' }))
+      .rejects.toMatchObject({ code: 'source-approval-required' })
+    await application.quiesce('prove edited approval remains revoked after restart')
+    application = await createStandaloneApplication(config, {
+      provider: new FakeAgentProvider([]),
+    })
+    // Durable approval binds exact bytes. A process restart cannot turn an edited hash back into
+    // authority just because the changed file was present during startup discovery.
     await expect(application.service.start({ cwd: workspace }, { name: 'later' }))
       .rejects.toMatchObject({ code: 'source-approval-required' })
 

@@ -20,6 +20,7 @@ import type {
 
 const REQUIRED_LOCK_NAME = 'owner.lock'
 const DIAGNOSTIC_NAME = 'owner.json'
+const DEFAULT_IDENTITY_MONITOR_INTERVAL_MS = 1_000
 
 export class InheritedFlockLeaseError extends Error {
   readonly code: 'owner-conflict' | 'io-error' | 'invalid-lock'
@@ -47,14 +48,19 @@ export class InheritedFlockLeaseError extends Error {
 export class InheritedFlockLeaseBackend implements WorkflowStoreLeaseBackend {
   readonly #fd: number
   readonly #lockPath: string
+  readonly #monitorIntervalMs: number
   #adopted = false
 
-  constructor(options: { fd: number; lockPath: string }) {
+  constructor(options: { fd: number; lockPath: string; monitorIntervalMs?: number }) {
     if (!Number.isSafeInteger(options.fd) || options.fd <= 2) {
       throw new TypeError('Inherited flock descriptor must be an integer greater than stderr')
     }
     this.#fd = options.fd
     this.#lockPath = resolve(options.lockPath)
+    this.#monitorIntervalMs = options.monitorIntervalMs ?? DEFAULT_IDENTITY_MONITOR_INTERVAL_MS
+    if (!Number.isSafeInteger(this.#monitorIntervalMs) || this.#monitorIntervalMs <= 0) {
+      throw new TypeError('Inherited flock monitor interval must be a positive safe integer')
+    }
     if (this.#lockPath.split('/').at(-1) !== REQUIRED_LOCK_NAME) {
       throw new TypeError(`Inherited flock path must end with ${REQUIRED_LOCK_NAME}`)
     }
@@ -97,12 +103,29 @@ export class InheritedFlockLeaseBackend implements WorkflowStoreLeaseBackend {
     })
 
     let released = false
-    return {
-      generation,
-      assertOwned: () => {
-        if (released) {
-          throw new InheritedFlockLeaseError('owner-conflict', 'Inherited flock ownership was released')
-        }
+    let ownershipLoss: Error | undefined
+    let monitor: NodeJS.Timeout | undefined
+    const lossListeners = new Set<(error: Error) => void>()
+    const recordOwnershipLoss = (error: unknown): Error => {
+      const normalized = error instanceof Error
+        ? error
+        : new InheritedFlockLeaseError('owner-conflict', 'Inherited flock ownership was lost')
+      if (ownershipLoss !== undefined) return ownershipLoss
+      ownershipLoss = normalized
+      if (monitor !== undefined) clearInterval(monitor)
+      // WHY notification is synchronous: service admission is also synchronous. Scheduling the
+      // callbacks for a later turn would leave a real interval in which the orphaned owner still
+      // reports READY and accepts a mutation after the monitor has already proved split ownership.
+      for (const listener of lossListeners) listener(normalized)
+      lossListeners.clear()
+      return normalized
+    }
+    const verifyOwnership = (): void => {
+      if (ownershipLoss !== undefined) throw ownershipLoss
+      if (released) {
+        throw new InheritedFlockLeaseError('owner-conflict', 'Inherited flock ownership was released')
+      }
+      try {
         const current = inspectIdentity(this.#fd, this.#lockPath)
         if (current.dev !== identity.dev || current.ino !== identity.ino) {
           throw new InheritedFlockLeaseError(
@@ -110,28 +133,61 @@ export class InheritedFlockLeaseBackend implements WorkflowStoreLeaseBackend {
             'Workflow coordination path no longer names the flocked inode',
           )
         }
+      } catch (error) {
+        throw recordOwnershipLoss(error)
+      }
+    }
+    // The writer coordinator verifies at each durable boundary, but a quiet provider may hold the
+    // lease for hours without touching the store. This independent monitor is what makes pathname
+    // replacement a lifecycle failure rather than a problem noticed only by the next write.
+    monitor = setInterval(() => {
+      try {
+        verifyOwnership()
+      } catch {
+        // recordOwnershipLoss already delivered the authoritative error to every listener. Throwing
+        // from a timer would crash Node before the service can interrupt providers and drain writers.
+      }
+    }, this.#monitorIntervalMs)
+    monitor.unref()
+    return {
+      generation,
+      assertOwned: verifyOwnership,
+      onOwnershipLost: listener => {
+        if (ownershipLoss !== undefined) {
+          listener(ownershipLoss)
+          return () => undefined
+        }
+        lossListeners.add(listener)
+        return () => { lossListeners.delete(listener) }
       },
       release: async () => {
         if (released) return
+        if (monitor !== undefined) clearInterval(monitor)
         let diagnosticError: unknown
-        try {
-          writeDiagnostic(join(coordinationDirectory, DIAGNOSTIC_NAME), {
-            schemaVersion: 1,
-            ownerId: input.ownerId,
-            generation,
-            pid: process.pid,
-            acquiredAt,
-            releasedAt: new Date().toISOString(),
-            device: identity.dev,
-            inode: identity.ino,
-          })
-        } catch (error) {
-          diagnosticError = error
+        if (ownershipLoss === undefined) {
+          try {
+            writeDiagnostic(join(coordinationDirectory, DIAGNOSTIC_NAME), {
+              schemaVersion: 1,
+              ownerId: input.ownerId,
+              generation,
+              pid: process.pid,
+              acquiredAt,
+              releasedAt: new Date().toISOString(),
+              device: identity.dev,
+              inode: identity.ino,
+            })
+          } catch (error) {
+            diagnosticError = error
+          }
         }
+        // Once the pathname names another generation, writing owner.json through that pathname
+        // would overwrite the new owner's diagnostics. The old descriptor is still ours and must
+        // remain open until provider/writer drain, but close(2) is its only safe final mutation.
         // Closing this exact open-file description is the ownership transfer point. Diagnostic
         // metadata is deliberately never consulted for liveness and therefore cannot retain a lock.
         closeSync(this.#fd)
         released = true
+        lossListeners.clear()
         if (diagnosticError !== undefined) throw diagnosticError
       },
     }

@@ -5,12 +5,55 @@ umask 077
 fail() { printf 'workflow-mcp-docker: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*" >&2; }
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 if [ -f "$script_dir/compose.yaml" ]; then
   bundle_root=$script_dir
 else
-  bundle_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+  bundle_root=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 fi
+
+upgrade_names='LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env SHA256SUMS .gitignore instance.json'
+
+cleanup_upgrade_directories() {
+  [ ! -f "$1/.upgrade-transaction.preparing" ] || rm -- "$1/.upgrade-transaction.preparing"
+  for directory in "$1/.upgrade-stage" "$1/.upgrade-rollback"; do
+    [ ! -d "$directory" ] || {
+      for name in $upgrade_names; do [ ! -e "$directory/$name" ] || rm -- "$directory/$name"; done
+      rmdir "$directory" 2>/dev/null || true
+    }
+  done
+}
+
+recover_interrupted_upgrade() {
+  recovery_installation=$1
+  recovery_marker=$recovery_installation/.upgrade-transaction
+  if [ ! -f "$recovery_marker" ]; then
+    # A crash while merely preparing private copies cannot have changed a public file. Those exact
+    # fixed staging leaves are therefore garbage, not transaction authority.
+    cleanup_upgrade_directories "$recovery_installation"
+    return
+  fi
+  recovery_rollback=$recovery_installation/.upgrade-rollback
+  [ -d "$recovery_rollback" ] || fail "upgrade rollback marker exists without rollback bytes"
+  for name in $upgrade_names; do
+    [ -f "$recovery_rollback/$name" ] || fail "upgrade rollback is incomplete: $name"
+  done
+  # Copy rather than move so recovery itself is retryable after interruption. Every public target
+  # is replaced by rename, while the marker remains until the entire old bundle is coherent again.
+  for name in $upgrade_names; do
+    recovery_temporary=$recovery_installation/.recover-$name-$$
+    cp "$recovery_rollback/$name" "$recovery_temporary"
+    mv "$recovery_temporary" "$recovery_installation/$name"
+  done
+  chmod 755 "$recovery_installation/workflow-mcp-docker"
+  rm -- "$recovery_marker"
+  cleanup_upgrade_directories "$recovery_installation"
+  note "Recovered the complete previous Workflow MCP bundle after an interrupted upgrade."
+}
+
+# An installed launcher may itself be either side of a torn per-file switch. Both versions run this
+# recovery before sourcing version/image authority, so no mixed bundle can reach Docker commands.
+[ ! -f "$script_dir/instance.json" ] || recover_interrupted_upgrade "$script_dir"
 version_file=$bundle_root/version.env
 if [ ! -f "$version_file" ] && [ -f "$bundle_root/install/version.env" ]; then
   version_file=$bundle_root/install/version.env
@@ -38,15 +81,74 @@ verify_bundle
 . "$version_file"
 : "${WORKFLOW_MCP_IMAGE:?version.env has no WORKFLOW_MCP_IMAGE}"
 
+write_installed_checksums() {
+  target=$1
+  [ ! -f "$bundle_root/SHA256SUMS" ] || {
+    # launcher-smoke.sh belongs to the release archive but is intentionally not installed into a
+    # project. Preserve every other authenticated digest so installed commands re-check the exact
+    # immutable launcher/Compose/version bytes before they trust image or Compose authority.
+    grep -v '  launcher-smoke\.sh$' "$bundle_root/SHA256SUMS" > "$target/SHA256SUMS"
+    chmod 600 "$target/SHA256SUMS"
+  }
+}
+
+terminal_safe_path() {
+  # WHY: paths are printed in operator diagnostics after they cross this boundary. A checkout may
+  # legally contain ESC, C1, bidi, or other Unicode format controls; quoting those bytes does not
+  # stop a terminal from interpreting them. Decode UTF-8 with POSIX od/awk so non-ASCII project
+  # names remain supported while control-bearing or malformed names fail before they are echoed.
+  LC_ALL=C printf '%s' "$1" | LC_ALL=C od -An -tu1 | LC_ALL=C awk '
+    { for (field = 1; field <= NF; field++) byte[++count] = $field + 0 }
+    END {
+      for (position = 1; position <= count;) {
+        first = byte[position]
+        if (first < 128) { codepoint = first; position += 1 }
+        else if (first >= 194 && first <= 223 && position + 1 <= count && byte[position + 1] >= 128 && byte[position + 1] <= 191) {
+          codepoint = (first - 192) * 64 + byte[position + 1] - 128; position += 2
+        } else if (first >= 224 && first <= 239 && position + 2 <= count && byte[position + 1] >= 128 && byte[position + 1] <= 191 && byte[position + 2] >= 128 && byte[position + 2] <= 191) {
+          codepoint = (first - 224) * 4096 + (byte[position + 1] - 128) * 64 + byte[position + 2] - 128
+          if (codepoint < 2048 || (codepoint >= 55296 && codepoint <= 57343)) exit 1
+          position += 3
+        } else if (first >= 240 && first <= 244 && position + 3 <= count && byte[position + 1] >= 128 && byte[position + 1] <= 191 && byte[position + 2] >= 128 && byte[position + 2] <= 191 && byte[position + 3] >= 128 && byte[position + 3] <= 191) {
+          codepoint = (first - 240) * 262144 + (byte[position + 1] - 128) * 4096 + (byte[position + 2] - 128) * 64 + byte[position + 3] - 128
+          if (codepoint < 65536 || codepoint > 1114111) exit 1
+          position += 4
+        } else exit 1
+        if (codepoint <= 31 || (codepoint >= 127 && codepoint <= 159) ||
+          codepoint == 173 || (codepoint >= 1536 && codepoint <= 1541) || codepoint == 1564 ||
+          codepoint == 1757 || codepoint == 1807 || (codepoint >= 2192 && codepoint <= 2193) ||
+          codepoint == 2274 || (codepoint >= 6158 && codepoint <= 6159) || codepoint == 6158 ||
+          (codepoint >= 8203 && codepoint <= 8207) || (codepoint >= 8234 && codepoint <= 8238) ||
+          (codepoint >= 8288 && codepoint <= 8303) || codepoint == 65279 ||
+          (codepoint >= 65529 && codepoint <= 65531) || codepoint == 69821 || codepoint == 69837 ||
+          (codepoint >= 78896 && codepoint <= 78911) || (codepoint >= 113824 && codepoint <= 113827) ||
+          (codepoint >= 119155 && codepoint <= 119162) || codepoint == 917505 ||
+          (codepoint >= 917536 && codepoint <= 917631)) exit 1
+      }
+    }
+  '
+}
+
+assert_terminal_safe_path() {
+  terminal_safe_path "$1" || fail 'path contains terminal control, bidi, format, or malformed UTF-8 bytes'
+}
+
 canonical_directory() {
-  [ -d "$1" ] || fail "directory does not exist: $1"
-  (CDPATH= cd -- "$1" && pwd -P)
+  assert_terminal_safe_path "$1"
+  [ -d "$1" ] || fail 'directory does not exist'
+  canonical_result=$(CDPATH='' cd -- "$1" && pwd -P)
+  assert_terminal_safe_path "$canonical_result"
+  printf '%s\n' "$canonical_result"
 }
 
 version_at_least() {
   actual=$1 minimum=$2
   old_ifs=$IFS; IFS=.
+  # The two values have already been reduced to digits and dots. This deliberate field split is
+  # the portable-POSIX replacement for arrays, and therefore cannot expand a pathname glob.
+  # shellcheck disable=SC2086
   set -- $actual; a1=${1:-0}; a2=${2:-0}; a3=${3:-0}
+  # shellcheck disable=SC2086
   set -- $minimum; m1=${1:-0}; m2=${2:-0}; m3=${3:-0}
   IFS=$old_ifs
   [ "$a1" -gt "$m1" ] || { [ "$a1" -eq "$m1" ] && [ "$a2" -gt "$m2" ]; } ||
@@ -58,17 +160,30 @@ host_doctor() {
   command -v docker >/dev/null 2>&1 || fail "Docker CLI is not installed"
   docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
   compose_version=$(docker compose version --short | sed 's/[^0-9.].*$//')
+  docker_client_version=$(docker version --format '{{.Client.Version}}' | sed 's/[^0-9.].*$//')
+  docker_server_version=$(docker version --format '{{.Server.Version}}' | sed 's/[^0-9.].*$//')
+  host_description=$(uname -s)-$(uname -m)
   version_at_least "$compose_version" 2.32.0 || fail "Docker Compose 2.32.0 or newer is required (found $compose_version)"
   docker_context=$(docker context show)
   docker_endpoint=$(docker context inspect "$docker_context" --format '{{.Endpoints.docker.Host}}')
+  docker_daemon_id=$(docker info --format '{{.ID}}')
+  [ -n "$docker_daemon_id" ] || fail "Docker daemon did not report a stable engine ID"
   case "$docker_endpoint" in
     unix://*) ;;
     *) fail "remote/non-local Docker context is unsupported: $docker_context ($docker_endpoint)" ;;
   esac
   if [ "$need_web" = true ]; then
-    engine_version=$(docker version --format '{{.Server.Version}}' | sed 's/[^0-9.].*$//')
+    engine_version=$docker_server_version
     version_at_least "$engine_version" 28.3.3 || fail "loopback web publication requires Docker Engine 28.3.3+ (found $engine_version)"
   fi
+}
+
+fingerprint_current_daemon() {
+  docker_daemon_fingerprint=$(docker run --rm --network none --read-only --user 0:0 \
+    "$WORKFLOW_MCP_IMAGE" instance daemon-fingerprint --daemon-id="$docker_daemon_id") ||
+    fail "could not derive Docker daemon identity"
+  printf '%s\n' "$docker_daemon_fingerprint" | grep -Eq '^[a-f0-9]{64}$' ||
+    fail "Docker daemon identity renderer returned an invalid fingerprint"
 }
 
 installation_for_project() { printf '%s/.workflow-mcp\n' "$1"; }
@@ -85,43 +200,94 @@ default_project() {
   fi
 }
 
-json_string_field() {
-  field=$1 file=$2
-  sed -n "s/.*\"$field\":\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
-}
-
-json_scalar_field() {
-  field=$1 file=$2
-  sed -n "s/.*\"$field\":\([^,}]*\).*/\1/p" "$file" | head -n 1 | tr -d '"'
-}
-
 load_instance() {
   project_directory=$(canonical_directory "${1:-.}")
   installation=$(installation_for_project "$project_directory")
   instance_file=$installation/instance.json
   [ -f "$instance_file" ] || fail "not installed for $project_directory; run install first"
-  instance_id=$(json_string_field instanceId "$instance_file")
-  compose_project=$(json_string_field composeProjectName "$instance_file")
-  project_hash=$(json_string_field projectHash "$instance_file")
-  recorded_context=$(json_string_field dockerContext "$instance_file")
-  recorded_endpoint=$(json_string_field dockerEndpoint "$instance_file")
-  recorded_image=$(json_string_field image "$instance_file")
-  web_port=$(json_scalar_field webPort "$instance_file")
-  authoring=$(json_scalar_field authoring "$instance_file")
+  host_doctor false
+  docker image inspect "$WORKFLOW_MCP_IMAGE" >/dev/null 2>&1 || docker pull "$WORKFLOW_MCP_IMAGE" >/dev/null
+  fingerprint_current_daemon
+  instance_environment=$(mktemp "$installation/.instance-environment.XXXXXX")
+  if ! docker run --rm --network none --read-only --user 0:0 \
+    -v "$installation:/bundle:ro" "$WORKFLOW_MCP_IMAGE" instance inspect \
+    --file=/bundle/instance.json --format=posix-shell > "$instance_environment"; then
+    rm -- "$instance_environment"
+    fail "instance.json is invalid or unsupported"
+  fi
+  # The pinned image has strictly parsed the JSON and emitted fixed-name, correctly single-quoted
+  # assignments. This preserves a Docker-only host while avoiding regex interpretation of JSON.
+  # shellcheck disable=SC1090
+  . "$instance_environment"
+  rm -- "$instance_environment"
+  # Instance metadata is the source of truth. Ambient values from a previous load/parent shell
+  # must not silently enable an overlay that the attested record does not name.
+  unset WORKFLOW_MCP_PORT WORKFLOW_MCP_WORKFLOW_DIR WORKFLOW_MCP_OPENAI_API_KEY_FILE
+  api_key_unavailable=false
+  # ShellCheck cannot infer the fixed variables emitted by `instance inspect`; the strict parser in
+  # the pinned image is the only producer and the validation immediately below still fails closed.
+  # shellcheck disable=SC2154
   case "$instance_id" in ????????-????-????-????-????????????) ;; *) fail "instance.json has an invalid instance ID" ;; esac
+  # shellcheck disable=SC2154
   case "$compose_project" in workflow-mcp-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;; *) fail "instance.json has an invalid Compose project" ;; esac
-  [ "$recorded_image" = "$WORKFLOW_MCP_IMAGE" ] || fail "bundle image and instance image differ; run the explicit upgrade flow"
-  host_doctor "$( [ -n "$web_port" ] && printf true || printf false )"
+  # shellcheck disable=SC2154
+  if [ "$recorded_image" != "$WORKFLOW_MCP_IMAGE" ] && [ "${allow_image_mismatch:-false}" != true ]; then
+    fail "bundle image and instance image differ; run the explicit upgrade flow"
+  fi
+  if [ "$bundle_root" != "$installation" ] && [ "${allow_external_policy_mismatch:-false}" != true ]; then
+    # Recovery runs from a separately verified bundle because the installed launcher may be lost.
+    # The project owns the installed directory, so compare its executable Compose policy against
+    # the immutable image instead of trusting a project-editable checksum beside those bytes.
+    docker run --rm --network none --read-only --user 0:0 \
+      -v "$installation:/bundle:ro" "$WORKFLOW_MCP_IMAGE" \
+      instance verify-policy --directory=/bundle >/dev/null ||
+      fail "installed Compose policy differs from the verified recovery bundle"
+  fi
+  [ -z "$web_port" ] || host_doctor true
   current_context=$(docker context show)
   current_endpoint=$(docker context inspect "$current_context" --format '{{.Endpoints.docker.Host}}')
-  [ "$current_context" = "$recorded_context" ] && [ "$current_endpoint" = "$recorded_endpoint" ] ||
-    fail "Docker context changed since install; use instance move/adopt after reviewing state"
+  # shellcheck disable=SC2154
+  if [ "$current_context" != "$recorded_context" ] || [ "$current_endpoint" != "$recorded_endpoint" ]; then
+    fail "Docker context changed since install; switch back to the recorded context (cross-context identity import is not supported in v1)"
+  fi
+  # Context names and socket endpoints can survive an engine reset. Compare the domain-separated
+  # /info.ID digest as well so copied state cannot be adopted through an identically named route.
+  # `recorded_daemon_fingerprint` is one of the fixed assignments emitted by the pinned image's
+  # strict record parser above; portable ShellCheck cannot infer that generated assignment.
+  # shellcheck disable=SC2154
+  [ "$docker_daemon_fingerprint" = "$recorded_daemon_fingerprint" ] ||
+    fail "Docker daemon changed since install; cross-daemon identity import is not supported in v1"
   actual_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
   [ "$actual_hash" = "$project_hash" ] || fail "instance.json belongs to a different canonical project path"
-  export WORKFLOW_MCP_IMAGE WORKFLOW_MCP_INSTANCE_ID=$instance_id
-  export WORKFLOW_MCP_PROJECT_HASH=$project_hash WORKFLOW_MCP_PROJECT_DIR=$project_directory
-  if [ -n "$web_port" ]; then export WORKFLOW_MCP_PORT=$web_port; fi
-  if [ "$authoring" = true ]; then export WORKFLOW_MCP_WORKFLOW_DIR=$project_directory/.claude/workflows; fi
+  export WORKFLOW_MCP_IMAGE WORKFLOW_MCP_INSTANCE_ID="$instance_id"
+  export WORKFLOW_MCP_PROJECT_HASH="$project_hash" WORKFLOW_MCP_PROJECT_DIR="$project_directory"
+  export WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT="$docker_daemon_fingerprint"
+  if [ -n "$web_port" ]; then export WORKFLOW_MCP_PORT="$web_port"; fi
+  # shellcheck disable=SC2154
+  if [ "$authoring" = true ]; then
+    validate_authoring_path
+    export WORKFLOW_MCP_WORKFLOW_DIR="$project_directory/.claude/workflows"
+  fi
+  if [ -n "$api_key_file" ]; then
+    if [ -f "$api_key_file" ] && [ ! -L "$api_key_file" ]; then
+      export WORKFLOW_MCP_OPENAI_API_KEY_FILE="$api_key_file"
+    else
+      api_key_unavailable=true
+    fi
+  fi
+}
+
+require_runtime_api_key() {
+  [ "${api_key_unavailable:-false}" != true ] ||
+    fail "recorded API key file is missing or redirected: $api_key_file"
+  [ -z "${api_key_file:-}" ] || {
+    # The credential is deliberately rotatable without rewriting instance.json. That also means an
+    # install-time probe cannot authorize the bytes or path topology seen by a later container. Walk
+    # the parent again and run the exact UID/shape probe before `up` or `upgrade` may mutate Compose.
+    validate_api_key_path "$api_key_file"
+    api_key_preflight "$validated_api_key_path"
+    export WORKFLOW_MCP_OPENAI_API_KEY_FILE="$validated_api_key_path"
+  }
 }
 
 compose() {
@@ -146,10 +312,45 @@ attest_volume() {
   options=$(docker volume inspect "$volume" --format '{{json .Options}}')
   label_instance=$(docker volume inspect "$volume" --format '{{index .Labels "io.workflow-mcp.instance-id"}}')
   label_project=$(docker volume inspect "$volume" --format '{{index .Labels "io.workflow-mcp.project-hash"}}')
+  label_daemon=$(docker volume inspect "$volume" --format '{{index .Labels "io.workflow-mcp.docker-daemon-fingerprint"}}')
   [ "$driver" = local ] || fail "unsupported volume driver $driver for $volume"
   [ "$options" = null ] || [ "$options" = '{}' ] || fail "optioned local volumes are unsupported: $options"
-  [ "$label_instance" = "$instance_id" ] && [ "$label_project" = "$project_hash" ] ||
+  if [ "$label_instance" != "$instance_id" ] || [ "$label_project" != "$project_hash" ] ||
+    [ "$label_daemon" != "$docker_daemon_fingerprint" ]; then
     fail "volume labels do not match this installation; refusing adoption"
+  fi
+}
+
+render_doctor_envelope() {
+  doctor_temporary=$(mktemp "$installation/.doctor-container.XXXXXX")
+  container_doctor_status=0
+  compose exec -T workflow-mcp workflow-mcp doctor --json > "$doctor_temporary" ||
+    container_doctor_status=$?
+  if [ "$container_doctor_status" -ne 0 ] && [ "$container_doctor_status" -ne 3 ]; then
+    # WHY: doctor is most valuable when the daemon is stopped or unhealthy. Emit the same valid
+    # two-phase schema when Compose could not execute it. Exit 3 is different: the container doctor
+    # completed and intentionally returned a valid `ok:false` report whose individual failed checks
+    # are the evidence the operator needs, so preserve those bytes for pinned-image validation below.
+    printf '%s\n' '{"schemaVersion":1,"ok":false,"version":"unavailable","revision":"unavailable","dependencies":{},"checks":[{"id":"container-availability","status":"fail","message":"daemon unavailable; container phase was not executed"}]}' > "$doctor_temporary"
+  fi
+  doctor_name=$(basename -- "$doctor_temporary")
+  # The pinned image validates both JSON inputs and emits the shared schema. Keeping composition
+  # out of shell avoids optional jq/Python dependencies and makes escaping identical on Windows.
+  doctor_status=0
+  docker run --rm --network none --read-only --user 0:0 \
+    -v "$installation:/bundle:ro" "$WORKFLOW_MCP_IMAGE" instance doctor-envelope \
+    --file=/bundle/instance.json --container-report="/bundle/$doctor_name" \
+    --platform=posix --host-description="$host_description" \
+    --docker-client-version="$docker_client_version" --docker-server-version="$docker_server_version" \
+    --compose-version="$compose_version" --docker-context="$docker_context" \
+    --docker-endpoint="$docker_endpoint" --docker-daemon-fingerprint="$docker_daemon_fingerprint" \
+    --volume-driver="$driver" --volume-options="$options" \
+    --volume-instance-label="$label_instance" --volume-project-label="$label_project" \
+    --volume-daemon-label="$label_daemon" || doctor_status=$?
+  rm -- "$doctor_temporary"
+  [ "$doctor_status" -eq 0 ] || [ "$doctor_status" -eq 3 ] ||
+    fail "host/container doctor envelope validation failed"
+  [ "$doctor_status" -ne 3 ] || return 3
 }
 
 install_codex_stanza() {
@@ -157,6 +358,7 @@ install_codex_stanza() {
   [ ! -L "$config_directory" ] || fail "refusing symlinked Codex config directory"
   mkdir -p "$config_directory"
   config_file=$config_directory/config.toml
+  [ ! -L "$config_file" ] || fail "refusing symlinked Codex config file"
   if [ -f "$config_file" ] && grep -q '^\[mcp_servers\.workflow_mcp\]$' "$config_file"; then
     fail "Codex already has mcp_servers.workflow_mcp; leaving it unchanged"
   fi
@@ -169,7 +371,88 @@ install_codex_stanza() {
   note "Installed project-scoped Codex MCP stanza in $config_file"
 }
 
-authoring_preflight() {
+preflight_codex_stanza() {
+  config_directory=$project_directory/.codex
+  [ ! -L "$config_directory" ] || fail "refusing symlinked Codex config directory"
+  config_file=$config_directory/config.toml
+  [ ! -L "$config_file" ] || fail "refusing symlinked Codex config file"
+  if [ -f "$config_file" ] && grep -q '^\[mcp_servers\.workflow_mcp\]$' "$config_file"; then
+    fail "Codex already has mcp_servers.workflow_mcp; leaving it unchanged"
+  fi
+}
+
+preflight_adoption() {
+  case "$adopt_instance" in
+    [a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]-[a-f0-9][a-f0-9][a-f0-9][a-f0-9]-4[a-f0-9][a-f0-9][a-f0-9]-[89ab][a-f0-9][a-f0-9][a-f0-9]-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
+    *) fail "--adopt-instance must be the lowercase UUIDv4 printed by uninstall" ;;
+  esac
+  compact_id=$(printf '%s' "$adopt_instance" | tr -d '-')
+  adopt_compose=workflow-mcp-$(printf '%.16s' "$compact_id")
+  adopt_volume=${adopt_compose}_workflow-mcp-data
+  project_hash=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance hash --project="$project_directory")
+  driver=$(docker volume inspect "$adopt_volume" --format '{{.Driver}}' 2>/dev/null) ||
+    fail "preserved instance volume is missing: $adopt_volume"
+  options=$(docker volume inspect "$adopt_volume" --format '{{json .Options}}')
+  label_instance=$(docker volume inspect "$adopt_volume" --format '{{index .Labels "io.workflow-mcp.instance-id"}}')
+  label_project=$(docker volume inspect "$adopt_volume" --format '{{index .Labels "io.workflow-mcp.project-hash"}}')
+  label_daemon=$(docker volume inspect "$adopt_volume" --format '{{index .Labels "io.workflow-mcp.docker-daemon-fingerprint"}}')
+  if [ "$driver" != local ] || { [ "$options" != null ] && [ "$options" != '{}' ]; }; then
+    fail "preserved instance volume uses unsupported driver/options"
+  fi
+  if [ "$label_instance" != "$adopt_instance" ] || [ "$label_project" != "$project_hash" ] ||
+    [ "$label_daemon" != "$docker_daemon_fingerprint" ]; then
+    fail "preserved volume labels do not match this instance, project, and Docker daemon"
+  fi
+}
+
+api_key_preflight() {
+  api_key_path=$1
+  case "$api_key_path" in *,*) fail "API key file paths containing ',' are unsupported by Docker --mount" ;; esac
+  # Compose secrets are bind-backed, so checking as the host user would bless a 0600 file that the
+  # fixed runtime UID cannot read on native Linux. The probe executes as the exact image principal,
+  # validates only shape/size, zeros its private buffer, and never places credential bytes in argv,
+  # env, stdout, or an image layer.
+  if ! docker run --rm --network none --read-only --user 10001:10001 \
+    --entrypoint /usr/local/bin/node \
+    --mount "type=bind,src=$api_key_path,dst=/credential,readonly" \
+    "$WORKFLOW_MCP_IMAGE" -e '
+const fs = require("node:fs");
+try {
+  const value = fs.readFileSync("/credential");
+  const valid = value.length > 0 && value.length <= 16 * 1024 &&
+    !value.includes(0) && /^\S+\n?$/.test(value.toString("utf8"));
+  value.fill(0);
+  if (!valid) process.exit(2);
+} catch { process.exit(3); }
+' >/dev/null 2>&1; then
+    fail "UID 10001 cannot read a single-line API key from $api_key_path; grant that exact UID a narrow read ACL (for example: setfacl -m u:10001:r FILE) or use interactive login"
+  fi
+}
+
+validate_api_key_path() {
+  requested_api_key_path=$1
+  api_key_path_mode=${2:-strict}
+  assert_terminal_safe_path "$requested_api_key_path"
+  case "$requested_api_key_path" in /*) ;; *) fail "API key file path must be absolute" ;; esac
+  case "$requested_api_key_path" in *,*) fail "API key file paths containing ',' are unsupported by Docker --mount" ;; esac
+  api_key_name=$(basename -- "$requested_api_key_path")
+  api_key_directory=$(canonical_directory "$(dirname -- "$requested_api_key_path")")
+  if [ "$api_key_directory" = / ]; then
+    validated_api_key_path=/$api_key_name
+  else
+    validated_api_key_path=$api_key_directory/$api_key_name
+  fi
+  # `-L` checks only the leaf. Comparing the physical parent catches a directory replaced by a
+  # symlink after install, before Docker follows it and silently changes credential authority.
+  if [ "$validated_api_key_path" != "$requested_api_key_path" ] && [ "$api_key_path_mode" != normalize ]; then
+    fail "API key file path is redirected: $requested_api_key_path"
+  fi
+  if [ ! -f "$validated_api_key_path" ] || [ -L "$validated_api_key_path" ]; then
+    fail "API key file must be an ordinary non-symlink file"
+  fi
+}
+
+validate_authoring_path() {
   workflow_directory=$project_directory/.claude/workflows
   [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
   [ ! -L "$workflow_directory" ] || fail "refusing symlinked workflow directory"
@@ -177,6 +460,10 @@ authoring_preflight() {
   [ "$canonical_workflows" = "$workflow_directory" ] ||
     fail "workflow authoring path redirects outside the canonical project: $workflow_directory"
   case "$workflow_directory" in *:*) fail "authoring paths containing ':' are unsupported by the Docker bind probe" ;; esac
+}
+
+authoring_preflight() {
+  validate_authoring_path
   # Fixed UID 10001 is the runtime principal, so a host-user write test is meaningless on native
   # Linux. Exercise create, file fsync, rename, directory fsync, and delete through the exact image
   # UID and bind implementation. We fail with an ACL/ownership action instead of silently running
@@ -204,11 +491,17 @@ try {
 
 install_command() {
   project_arg=${1:-.}; shift || true
-  web_arg= authoring_arg=false no_codex=false
+  web_arg=''
+  api_key_arg=''
+  adopt_instance=''
+  authoring_arg=false
+  no_codex=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --web-port=*) web_arg=${1#*=} ;;
       --authoring) authoring_arg=true ;;
+      --api-key-file=*) api_key_arg=${1#*=} ;;
+      --adopt-instance=*) adopt_instance=${1#*=} ;;
       --no-codex) no_codex=true ;;
       *) fail "unknown install option: $1" ;;
     esac
@@ -216,18 +509,40 @@ install_command() {
   done
   project_directory=$(canonical_directory "$project_arg")
   installation=$(installation_for_project "$project_directory")
-  [ ! -e "$installation/instance.json" ] || fail "an installation already exists at $installation"
+  # The checkout is untrusted input. Reusing an existing directory would let a committed leaf
+  # symlink turn the following copies into arbitrary writes with the installer user's authority.
+  # Requiring the whole ownership root to be absent also gives mkdir an atomic race check: it fails
+  # if any file, directory, symlink (including dangling), or concurrent creator wins this name.
+  if [ -e "$installation" ] || [ -L "$installation" ]; then
+    fail "installation path already exists; inspect and remove it explicitly before install: $installation"
+  fi
   host_doctor "$( [ -n "$web_arg" ] && printf true || printf false )"
   docker image inspect "$WORKFLOW_MCP_IMAGE" >/dev/null 2>&1 || docker pull "$WORKFLOW_MCP_IMAGE"
+  fingerprint_current_daemon
+  # These checks precede every project mutation. A conflicting Codex owner or mismatched preserved
+  # volume must leave no half-copied installation that a later command could mistake for authority.
+  [ "$no_codex" = true ] || preflight_codex_stanza
+  [ -z "$adopt_instance" ] || preflight_adoption
+  if [ -n "$api_key_arg" ]; then
+    # Installation resolves benign host aliases (for example macOS `/var`) once and records the
+    # physical spelling. Later starts use strict mode above, so replacing any recorded ancestor is
+    # still a refusal rather than a silent credential retarget.
+    validate_api_key_path "$api_key_arg" normalize
+    api_key_arg=$validated_api_key_path
+    api_key_preflight "$api_key_arg"
+  fi
+  # Credential refusal must leave no authoring tree behind. This order also matches the Windows
+  # launcher and makes the documented all-preflight-before-project-mutation contract executable.
   if [ "$authoring_arg" = true ]; then
     [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
     mkdir -p "$project_directory/.claude/workflows"
     authoring_preflight
   fi
-  mkdir -p "$installation"
+  mkdir -m 700 "$installation"
   for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
     cp "$bundle_root/$name" "$installation/$name"
   done
+  cp "$bundle_root/LICENSE" "$installation/LICENSE"
   cp "$bundle_root/install/workflow-mcp-docker" "$installation/workflow-mcp-docker" 2>/dev/null || cp "$bundle_root/workflow-mcp-docker" "$installation/workflow-mcp-docker"
   cp "$bundle_root/install/workflow-mcp-docker.ps1" "$installation/workflow-mcp-docker.ps1" 2>/dev/null || cp "$bundle_root/workflow-mcp-docker.ps1" "$installation/workflow-mcp-docker.ps1"
   cp "$version_file" "$installation/version.env"
@@ -236,28 +551,49 @@ install_command() {
   else
     cp "$bundle_root/.gitignore" "$installation/.gitignore"
   fi
+  write_installed_checksums "$installation"
   chmod 755 "$installation/workflow-mcp-docker"
-  create_args=""
-  [ -z "$web_arg" ] || create_args="--web-port=$web_arg"
-  [ "$authoring_arg" = false ] || create_args="$create_args --authoring"
-  instance_json=$(docker run --rm "$WORKFLOW_MCP_IMAGE" instance create \
+  instance_action=create
+  [ -z "$adopt_instance" ] || instance_action=adopt
+  set -- docker run --rm "$WORKFLOW_MCP_IMAGE" instance "$instance_action" \
     --project="$project_directory" --docker-context="$docker_context" \
-    --docker-endpoint="$docker_endpoint" --image="$WORKFLOW_MCP_IMAGE" $create_args)
+    --docker-endpoint="$docker_endpoint" \
+    --docker-daemon-fingerprint="$docker_daemon_fingerprint" --image="$WORKFLOW_MCP_IMAGE"
+  [ -z "$adopt_instance" ] || set -- "$@" "--instance-id=$adopt_instance"
+  [ -z "$web_arg" ] || set -- "$@" "--web-port=$web_arg"
+  [ "$authoring_arg" = false ] || set -- "$@" --authoring
+  [ -z "$api_key_arg" ] || set -- "$@" "--api-key-file=$api_key_arg"
+  instance_json=$("$@")
   temporary=$(mktemp "$installation/instance.json.XXXXXX")
   printf '%s\n' "$instance_json" > "$temporary"
   chmod 600 "$temporary"
   mv "$temporary" "$installation/instance.json"
   load_instance "$project_directory"
+  [ -z "$adopt_instance" ] || attest_volume
   [ "$no_codex" = true ] || install_codex_stanza
   note "Installed Workflow MCP instance $instance_id at $installation"
+  [ -z "$adopt_instance" ] || note "Adopted preserved durable volume ${compose_project}_workflow-mcp-data."
   note "Start it with: $installation/workflow-mcp-docker up"
 }
 
+validate_codex_removal_path() {
+  config_directory=$project_directory/.codex
+  [ ! -L "$config_directory" ] || fail "refusing redirected Codex config directory during uninstall"
+  config_file=$config_directory/config.toml
+  [ ! -L "$config_file" ] || fail "refusing redirected Codex config file during uninstall"
+}
+
 remove_codex_stanza() {
-  config_file=$project_directory/.codex/config.toml
+  # Recheck immediately before the file operation even though uninstall preflights this path. The
+  # first check keeps a malicious retarget from stopping the service; this second check narrows the
+  # remaining checkout-controlled race without pretending portable shell has openat-style handles.
+  validate_codex_removal_path
   [ -f "$config_file" ] || return 0
   begin="# BEGIN WORKFLOW MCP $instance_id" end="# END WORKFLOW MCP $instance_id"
   grep -qFx "$begin" "$config_file" || return 0
+  # A missing end marker means the user file is not in the exact shape installation wrote. Treat it
+  # as user-owned corruption and preserve every byte; otherwise awk would erase the rest of config.
+  grep -qFx "$end" "$config_file" || fail "Codex stanza has no closing marker; refusing a partial edit"
   temporary=$(mktemp "$project_directory/.codex/config.toml.workflow-mcp.XXXXXX")
   awk -v begin="$begin" -v end="$end" '$0 == begin { skip=1; next } $0 == end { skip=0; next } !skip { print }' "$config_file" > "$temporary"
   chmod 600 "$temporary"; mv "$temporary" "$config_file"
@@ -271,28 +607,148 @@ uninstall_command() {
     shift
   done
   load_instance "$project_arg"
+  if [ "$delete_data" = true ]; then
+    # WHY: a typo in a destructive confirmation must not stop a healthy service or edit Codex
+    # configuration. Validate both human intent and current volume identity before any mutation.
+    [ "$confirmation" = "$instance_id" ] || fail "data deletion requires --confirm=$instance_id"
+  fi
+  # Even non-destructive uninstall prints an adoption receipt and then destroys the only local
+  # instance record. Prove that the promised volume actually exists and belongs here before either
+  # the Codex stanza or public ownership metadata changes.
+  attest_volume
+  # A checkout may replace `.codex` after installation. Reject that before `compose down`, because
+  # an uninstall that cannot safely edit its own stanza must be a true no-op from the operator's
+  # perspective, not a stopped service followed by an error.
+  validate_codex_removal_path
   compose down --remove-orphans
   remove_codex_stanza
   if [ "$delete_data" = true ]; then
-    [ "$confirmation" = "$instance_id" ] || fail "data deletion requires --confirm=$instance_id"
-    attest_volume
     docker volume rm "${compose_project}_workflow-mcp-data"
   fi
   # Every target is an exact file below the already-validated installation; the named volume is
   # preserved unless separately confirmed above.
-  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml version.env instance.json .gitignore workflow-mcp-docker.ps1; do
+  for name in LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml version.env SHA256SUMS instance.json .gitignore workflow-mcp-docker.ps1; do
     [ ! -e "$installation/$name" ] || rm "$installation/$name"
   done
   note "Uninstalled public bundle; durable data was $( [ "$delete_data" = true ] && printf deleted || printf preserved )."
-  [ "$script_dir" != "$installation" ] || note "Remove $installation/workflow-mcp-docker after this command returns."
+  if [ "$delete_data" = false ]; then
+    note "Preserved instance ID: $instance_id"
+    note "Reattach only from this canonical project with: workflow-mcp-docker install $project_directory --adopt-instance=$instance_id"
+  fi
+  [ "$script_dir" != "$installation" ] || note "Remove the remaining launcher and its empty $installation directory after this command returns."
+}
+
+upgrade_command() {
+  project_arg=${1:-.}; shift || true
+  [ "$#" -eq 0 ] || fail "upgrade accepts a project path only; create an offline backup first if required"
+  new_image=$WORKFLOW_MCP_IMAGE
+  new_version=${WORKFLOW_MCP_BUNDLE_VERSION:-}
+  printf '%s\n' "$new_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || fail "new bundle has an invalid stable version"
+  allow_image_mismatch=true
+  allow_external_policy_mismatch=true
+  load_instance "$project_arg"
+  allow_external_policy_mismatch=false
+  allow_image_mismatch=false
+  require_runtime_api_key
+  # Both host inputs are mutable by design. Refuse an unreadable rotated credential or a lost
+  # authoring ACL while the old daemon and bundle are still untouched; rollback cannot repair either
+  # host condition after a quiesce.
+  [ "${authoring:-false}" != true ] || authoring_preflight
+  old_image=$recorded_image
+  old_version=$(sed -n 's/^WORKFLOW_MCP_BUNDLE_VERSION=//p' "$installation/version.env" | head -n 1)
+  printf '%s\n' "$old_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || fail "installed bundle version is invalid or pre-release"
+  [ "$old_image" != "$new_image" ] || fail "instance already uses $new_image"
+  version_at_least "$new_version" "$old_version" || fail "refusing downgrade from $old_version to $new_version"
+  docker image inspect "$new_image" >/dev/null 2>&1 || docker pull "$new_image"
+  docker image inspect "$old_image" >/dev/null 2>&1 || docker pull "$old_image"
+  # Upgrade legitimately uses a newer external bundle, so same-version comparison would reject it.
+  # Ask the strictly parsed old image to attest the old Compose bytes before they are used for the
+  # quiescing `down`; only then may the new transaction replace public policy.
+  docker run --rm --network none --read-only --user 0:0 \
+    -v "$installation:/bundle:ro" "$old_image" instance verify-policy --directory=/bundle >/dev/null ||
+    fail "installed pre-upgrade Compose policy differs from its recorded image"
+
+  upgrade_stage=$installation/.upgrade-stage
+  rollback_stage=$installation/.upgrade-rollback
+  upgrade_marker=$installation/.upgrade-transaction
+  [ ! -e "$upgrade_marker" ] || fail "an interrupted upgrade must be recovered by the installed launcher first"
+  cleanup_upgrade_directories "$installation"
+  mkdir -m 700 "$upgrade_stage" "$rollback_stage"
+  upgrade_cleanup() {
+    [ -f "${upgrade_marker:-/workflow-mcp-never}" ] || cleanup_upgrade_directories "$installation"
+  }
+  trap upgrade_cleanup EXIT HUP INT TERM
+  for name in $upgrade_names; do
+    [ -f "$installation/$name" ] || fail "installed bundle is incomplete: $name"
+    cp "$installation/$name" "$rollback_stage/$name"
+  done
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
+    cp "$bundle_root/$name" "$upgrade_stage/$name"
+  done
+  cp "$bundle_root/LICENSE" "$upgrade_stage/LICENSE"
+  cp "$bundle_root/install/workflow-mcp-docker" "$upgrade_stage/workflow-mcp-docker" 2>/dev/null || cp "$bundle_root/workflow-mcp-docker" "$upgrade_stage/workflow-mcp-docker"
+  cp "$bundle_root/install/workflow-mcp-docker.ps1" "$upgrade_stage/workflow-mcp-docker.ps1" 2>/dev/null || cp "$bundle_root/workflow-mcp-docker.ps1" "$upgrade_stage/workflow-mcp-docker.ps1"
+  cp "$version_file" "$upgrade_stage/version.env"
+  if [ -f "$bundle_root/install/bundle.gitignore" ]; then cp "$bundle_root/install/bundle.gitignore" "$upgrade_stage/.gitignore"; else cp "$bundle_root/.gitignore" "$upgrade_stage/.gitignore"; fi
+  write_installed_checksums "$upgrade_stage"
+  docker run --rm --user 0:0 -v "$installation:/bundle:ro" "$new_image" instance replace-image \
+    --file=/bundle/instance.json --image="$new_image" > "$upgrade_stage/instance.json"
+  chmod 600 "$upgrade_stage"/* "$upgrade_stage/.gitignore"
+  chmod 755 "$upgrade_stage/workflow-mcp-docker"
+
+  # The old daemon is quiesced before any public bundle selector changes. Each file replacement is
+  # atomic on the project filesystem; rollback bytes stay private until the new image is healthy.
+  compose down --remove-orphans
+  attest_volume
+  marker_temporary=$installation/.upgrade-transaction.preparing
+  printf 'workflow-mcp-upgrade-v1\n' > "$marker_temporary"
+  chmod 600 "$marker_temporary"
+  mv "$marker_temporary" "$upgrade_marker"
+  for name in $upgrade_names; do
+    mv "$upgrade_stage/$name" "$installation/$name"
+  done
+  chmod 755 "$installation/workflow-mcp-docker"
+  if ! compose up --detach --wait; then
+    note "New image did not become ready; restoring the previous layout-compatible bundle."
+    recover_interrupted_upgrade "$installation"
+    WORKFLOW_MCP_IMAGE=$old_image
+    allow_image_mismatch=false
+    load_instance "$project_directory"
+    [ "${authoring:-false}" != true ] || authoring_preflight
+    compose up --detach --wait || fail "both upgraded and rollback images failed readiness; instance remains stopped"
+    fail "upgrade failed and was rolled back to $old_version"
+  fi
+  # Removing the marker is the transaction's only commit point. A crash before it rolls back on the
+  # next command; a crash after it leaves a complete healthy new bundle plus disposable copies.
+  rm -- "$upgrade_marker"
+  cleanup_upgrade_directories "$installation"
+  trap - EXIT HUP INT TERM
+  note "Upgraded Workflow MCP from $old_version to $new_version at the same instance and volume identity."
 }
 
 maintenance_bind_path() {
   requested=$1 mode=$2
   case "$requested" in /*) ;; *) fail "$mode path must be absolute" ;; esac
   maintenance_name=$(basename -- "$requested")
-  [ "$maintenance_name" != . ] && [ "$maintenance_name" != .. ] && [ -n "$maintenance_name" ] || fail "invalid $mode filename"
+  if [ -z "$maintenance_name" ] || [ "$maintenance_name" = . ] || [ "$maintenance_name" = .. ]; then
+    fail "invalid $mode filename"
+  fi
+  assert_terminal_safe_path "$maintenance_name"
+  # The archive is not the longest leaf we create. Output staging appends
+  # `.sha256.workflow-mcp-copy-` plus a 32-hex GUID on PowerShell (58 bytes total), while input needs
+  # only the seven-byte `.sha256` sidecar. Keep both launchers inside portable NAME_MAX=255 before a
+  # backup is allowed to stop the daemon.
+  if [ "$mode" = output ]; then
+    printf '%s\n' "$maintenance_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,196}$' ||
+      fail "$mode filename must be a safe leaf of at most 197 bytes"
+  else
+    printf '%s\n' "$maintenance_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,247}$' ||
+      fail "$mode filename must be a safe leaf of at most 248 bytes"
+  fi
   maintenance_directory=$(canonical_directory "$(dirname -- "$requested")")
+  if [ "$mode" = output ]; then
+    case "$maintenance_directory" in *,*) fail "backup output directories containing ',' are unsupported by Docker --mount" ;; esac
+  fi
   maintenance_host_path=$maintenance_directory/$maintenance_name
 }
 
@@ -301,6 +757,49 @@ run_offline_maintenance() {
   docker run --rm --network none --read-only --user 10001:10001 \
     -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
     --mount "type=volume,src=$volume,dst=/data,volume-nocopy" "$@"
+}
+
+archive_input_cleanup() {
+  docker rm -f "${archive_input_container:-workflow-mcp-no-container}" >/dev/null 2>&1 || true
+  docker volume rm "${archive_input_volume:-workflow-mcp-no-volume}" >/dev/null 2>&1 || true
+}
+
+stage_archive_input() {
+  archive_input_volume=${compose_project}_backup_input_$$
+  archive_input_container=${compose_project}-backup-input-$$
+  docker volume inspect "$archive_input_volume" >/dev/null 2>&1 &&
+    fail "temporary backup input volume already exists: $archive_input_volume"
+  docker inspect "$archive_input_container" >/dev/null 2>&1 &&
+    fail "temporary backup input container already exists: $archive_input_container"
+  docker volume create \
+    --label "io.workflow-mcp.instance-id=$instance_id" \
+    --label io.workflow-mcp.temporary-purpose=backup-input \
+    "$archive_input_volume" >/dev/null
+  docker create --name "$archive_input_container" --network none --read-only \
+    --entrypoint /bin/true \
+    --mount "type=volume,src=$archive_input_volume,dst=/backup-input" \
+    "$WORKFLOW_MCP_IMAGE" >/dev/null
+  # A host bind would make the fixed runtime UID depend on host ownership and ACL behavior. Copying
+  # both committed files into one private volume creates a stable snapshot, then this exact root
+  # helper narrows ownership before the rootless verifier ever sees it. Restore consumes this same
+  # snapshot, closing the host-file replacement window between a successful verify and extraction.
+  docker cp "$maintenance_host_path" "$archive_input_container:/backup-input/$maintenance_name"
+  docker cp "$maintenance_host_path.sha256" "$archive_input_container:/backup-input/$maintenance_name.sha256"
+  docker run --rm --network none --read-only --user 0:0 \
+    --entrypoint /bin/chown \
+    --mount "type=volume,src=$archive_input_volume,dst=/backup-input,volume-nocopy" \
+    "$WORKFLOW_MCP_IMAGE" 10001:10001 "/backup-input/$maintenance_name" "/backup-input/$maintenance_name.sha256"
+  docker run --rm --network none --read-only --user 0:0 \
+    --entrypoint /bin/chmod \
+    --mount "type=volume,src=$archive_input_volume,dst=/backup-input,volume-nocopy" \
+    "$WORKFLOW_MCP_IMAGE" 0400 "/backup-input/$maintenance_name" "/backup-input/$maintenance_name.sha256"
+}
+
+verify_staged_archive() {
+  docker run --rm --network none --read-only --user 10001:10001 \
+    -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
+    --mount "type=volume,src=$archive_input_volume,dst=/backup-input,readonly,volume-nocopy" \
+    "$WORKFLOW_MCP_IMAGE" maintenance backup-verify --input="/backup-input/$maintenance_name"
 }
 
 backup_command() {
@@ -313,14 +812,51 @@ backup_command() {
       [ -n "$output" ] || fail "backup create requires --output=/absolute/file"
       load_instance "$project_arg"
       maintenance_bind_path "$output" output
-      [ ! -e "$maintenance_host_path" ] && [ ! -e "$maintenance_host_path.sha256" ] || fail "backup output already exists"
+      if [ -e "$maintenance_host_path" ] || [ -e "$maintenance_host_path.sha256" ]; then
+        fail "backup output already exists"
+      fi
       compose down --remove-orphans
       attest_volume
       note "Workflow MCP is offline; creating a credential-free backup."
-      run_offline_maintenance \
-        --mount "type=bind,src=$maintenance_directory,dst=/backup-output" \
-        "$WORKFLOW_MCP_IMAGE" maintenance backup-create --output="/backup-output/$maintenance_name"
+      backup_export_volume=${compose_project}_backup_export_$$
+      backup_container=${compose_project}-backup-export-$$
+      backup_archive_temporary=$maintenance_host_path.workflow-mcp-copy-$$
+      backup_checksum_temporary=$maintenance_host_path.sha256.workflow-mcp-copy-$$
+      docker volume inspect "$backup_export_volume" >/dev/null 2>&1 && fail "temporary backup volume already exists: $backup_export_volume"
+      docker inspect "$backup_container" >/dev/null 2>&1 && fail "temporary backup container already exists: $backup_container"
+      backup_cleanup() {
+        [ ! -e "${backup_archive_temporary:-}" ] || rm -- "$backup_archive_temporary"
+        [ ! -e "${backup_checksum_temporary:-}" ] || rm -- "$backup_checksum_temporary"
+        docker rm -f "${backup_container:-workflow-mcp-no-container}" >/dev/null 2>&1 || true
+        docker volume rm "${backup_export_volume:-workflow-mcp-no-volume}" >/dev/null 2>&1 || true
+      }
+      trap backup_cleanup EXIT HUP INT TERM
+      docker volume create \
+        --label "io.workflow-mcp.instance-id=$instance_id" \
+        --label io.workflow-mcp.temporary-purpose=backup-export \
+        "$backup_export_volume" >/dev/null
+      # UID 10001 commits into a private Docker volume, then `docker cp` materializes the two files
+      # as the invoking host user. This avoids granting the runtime UID write authority over an
+      # arbitrary host directory; Docker documents destination ownership as the invoking user's.
+      docker create --name "$backup_container" --network none --read-only --user 10001:10001 \
+        -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
+        --mount "type=volume,src=${compose_project}_workflow-mcp-data,dst=/data,volume-nocopy" \
+        --mount "type=volume,src=$backup_export_volume,dst=/backup-output" \
+        "$WORKFLOW_MCP_IMAGE" maintenance backup-create --output="/backup-output/$maintenance_name" >/dev/null
+      docker start --attach "$backup_container" >/dev/null
+      docker cp "$backup_container:/backup-output/$maintenance_name" "$backup_archive_temporary"
+      docker cp "$backup_container:/backup-output/$maintenance_name.sha256" "$backup_checksum_temporary"
+      docker run --rm --network none --read-only --user 0:0 \
+        --mount "type=bind,src=$maintenance_directory,dst=/host-output" \
+        "$WORKFLOW_MCP_IMAGE" maintenance host-backup-commit --directory=/host-output \
+        --archive-temporary="${backup_archive_temporary##*/}" \
+        --checksum-temporary="${backup_checksum_temporary##*/}" \
+        --archive="$maintenance_name" --checksum="$maintenance_name.sha256" >/dev/null
+      docker rm "$backup_container" >/dev/null
+      docker volume rm "$backup_export_volume" >/dev/null
+      trap - EXIT HUP INT TERM
       note "Backup committed at $maintenance_host_path (checksum: $maintenance_host_path.sha256)."
+      note "Workflow MCP remains offline after backup; run $installation/workflow-mcp-docker up to resume it."
       ;;
     verify)
       input=
@@ -328,11 +864,14 @@ backup_command() {
       [ -n "$input" ] || fail "backup verify requires --input=/absolute/file"
       load_instance "$project_arg"
       maintenance_bind_path "$input" input
-      [ -f "$maintenance_host_path" ] && [ -f "$maintenance_host_path.sha256" ] || fail "backup archive or checksum sidecar is missing"
-      docker run --rm --network none --read-only --user "$(id -u):$(id -g)" \
-        -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
-        --mount "type=bind,src=$maintenance_directory,dst=/backup-input,readonly" \
-        "$WORKFLOW_MCP_IMAGE" maintenance backup-verify --input="/backup-input/$maintenance_name"
+      if [ ! -f "$maintenance_host_path" ] || [ ! -f "$maintenance_host_path.sha256" ]; then
+        fail "backup archive or checksum sidecar is missing"
+      fi
+      trap archive_input_cleanup EXIT HUP INT TERM
+      stage_archive_input
+      verify_staged_archive
+      archive_input_cleanup
+      trap - EXIT HUP INT TERM
       ;;
     *) fail "backup requires create or verify" ;;
   esac
@@ -340,32 +879,60 @@ backup_command() {
 
 restore_command() {
   project_arg=$1; shift
+  if [ "${1:-}" = reset-target ]; then
+    shift
+    confirmation=
+    while [ "$#" -gt 0 ]; do case "$1" in --confirm=*) confirmation=${1#*=} ;; *) fail "unknown restore reset-target option: $1" ;; esac; shift; done
+    load_instance "$project_arg"
+    [ "$confirmation" = "$instance_id" ] || fail "restore target reset requires --confirm=$instance_id"
+    # A failed extraction intentionally poisons the destination against retry. This explicit,
+    # identity-attested escape hatch deletes only that volume; instance.json and its project hash
+    # survive so the exact same archive can pass its identity check on the next restore attempt.
+    attest_volume
+    docker run --rm --network none --read-only --user 10001:10001 \
+      -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
+      --mount "type=volume,src=${compose_project}_workflow-mcp-data,dst=/data,volume-nocopy" \
+      "$WORKFLOW_MCP_IMAGE" maintenance restore-reset-check >/dev/null ||
+      fail "restore target is busy or is not an identity-matched interrupted restore; refusing volume deletion"
+    compose down --remove-orphans
+    docker volume rm "${compose_project}_workflow-mcp-data" >/dev/null
+    note "Removed the attested restore target volume; instance metadata was preserved. Retry restore with the same project and archive."
+    return
+  fi
   input=
   while [ "$#" -gt 0 ]; do case "$1" in --input=*) input=${1#*=} ;; *) fail "unknown restore option: $1" ;; esac; shift; done
   [ -n "$input" ] || fail "restore requires --input=/absolute/file"
   load_instance "$project_arg"
   maintenance_bind_path "$input" input
-  [ -f "$maintenance_host_path" ] && [ -f "$maintenance_host_path.sha256" ] || fail "backup archive or checksum sidecar is missing"
+  if [ ! -f "$maintenance_host_path" ] || [ ! -f "$maintenance_host_path.sha256" ]; then
+    fail "backup archive or checksum sidecar is missing"
+  fi
   # Verify before creating or opening the destination volume. A corrupt/wrong-identity archive
   # therefore cannot turn a fresh install into a partially restored, non-retryable target.
-  docker run --rm --network none --read-only --user "$(id -u):$(id -g)" \
-    -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
-    --mount "type=bind,src=$maintenance_directory,dst=/backup-input,readonly" \
-    "$WORKFLOW_MCP_IMAGE" maintenance backup-verify --input="/backup-input/$maintenance_name" >/dev/null
+  trap archive_input_cleanup EXIT HUP INT TERM
+  stage_archive_input
+  verify_staged_archive >/dev/null
   compose down --remove-orphans
   compose create
   attest_volume
   compose down --remove-orphans
+  # Docker creates an empty named-volume root as UID 0. A no-op mount without volume-nocopy copies
+  # only the image's reviewed empty 10001-owned skeleton so the rootless lock/restore process can
+  # enter it; restore still rejects any layout or payload byte.
+  docker run --rm --network none --read-only -v "${compose_project}_workflow-mcp-data:/data" \
+    "$WORKFLOW_MCP_IMAGE" help >/dev/null
   run_offline_maintenance \
-    --mount "type=bind,src=$maintenance_directory,dst=/backup-input,readonly" \
+    --mount "type=volume,src=$archive_input_volume,dst=/backup-input,readonly,volume-nocopy" \
     "$WORKFLOW_MCP_IMAGE" maintenance restore --input="/backup-input/$maintenance_name"
+  archive_input_cleanup
+  trap - EXIT HUP INT TERM
   note "Restore committed offline. Run $installation/workflow-mcp-docker up when ready; Codex login and local tokens must be recreated."
 }
 
 usage() {
   cat <<'EOF'
 Usage:
-  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--authoring] [--no-codex]
+  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
   workflow-mcp-docker up [PROJECT]
   workflow-mcp-docker down|status|logs|doctor|ui|mcp-proxy [PROJECT]
   workflow-mcp-docker source [PROJECT] approvals|approve [options]
@@ -373,6 +940,9 @@ Usage:
   workflow-mcp-docker backup [PROJECT] create --output=/absolute/file
   workflow-mcp-docker backup [PROJECT] verify --input=/absolute/file
   workflow-mcp-docker restore [PROJECT] --input=/absolute/file
+  workflow-mcp-docker restore [PROJECT] reset-target --confirm=INSTANCE_ID
+  workflow-mcp-docker migrate [PROJECT] inspect [--json]
+  workflow-mcp-docker upgrade [PROJECT]
   workflow-mcp-docker token [PROJECT] --purpose=mcp|web
   workflow-mcp-docker uninstall [PROJECT] [--delete-data --confirm=INSTANCE_ID]
 EOF
@@ -380,7 +950,16 @@ EOF
 
 command=${1:-help}; shift || true
 case "$command" in
-  install) install_command "$@" ;;
+  install)
+    project_arg=.
+    if [ "$#" -gt 0 ]; then case "$1" in --*) ;; *) project_arg=$1; shift ;; esac; fi
+    install_command "$project_arg" "$@"
+    ;;
+  upgrade)
+    project_arg=$(default_project)
+    if [ "$#" -gt 0 ]; then case "$1" in --*) ;; *) project_arg=$1; shift ;; esac; fi
+    upgrade_command "$project_arg" "$@"
+    ;;
   help|-h|--help) usage ;;
   backup)
     project_arg=$(default_project)
@@ -389,27 +968,56 @@ case "$command" in
     ;;
   restore)
     project_arg=$(default_project)
-    if [ "$#" -gt 0 ]; then case "$1" in --*) ;; *) project_arg=$1; shift ;; esac; fi
+    if [ "$#" -gt 0 ]; then case "$1" in reset-target|--*) ;; *) project_arg=$1; shift ;; esac; fi
     restore_command "$project_arg" "$@"
     ;;
-  up|down|status|logs|doctor|ui|mcp-proxy|token|source|auth|uninstall)
+  up|down|status|logs|doctor|ui|mcp-proxy|token|source|auth|migrate|uninstall)
     project_arg=$(default_project)
     # Options belong to the selected command, while a non-option first argument
     # remains an explicit project override for source-tree and fleet workflows.
     if [ "$#" -gt 0 ]; then
-      case "$1" in --*) ;; *) project_arg=$1; shift ;; esac
+      case "$command:$1" in
+        auth:login|auth:status|auth:logout|source:approvals|source:approve|migrate:inspect) ;;
+        *:--*) ;;
+        *) project_arg=$1; shift ;;
+      esac
     fi
     case "$command" in
-      up) load_instance "$project_arg"; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
-      down) load_instance "$project_arg"; compose down --remove-orphans ;;
-      status) load_instance "$project_arg"; compose ps; compose exec -T workflow-mcp workflow-mcp status "$@" ;;
+      up) [ "$#" -eq 0 ] || fail "up accepts a project path only"; load_instance "$project_arg"; require_runtime_api_key; [ "${authoring:-false}" != true ] || authoring_preflight; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
+      down) [ "$#" -eq 0 ] || fail "down accepts a project path only"; load_instance "$project_arg"; compose down --remove-orphans ;;
+      status)
+        [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = --json ]; } || fail "status accepts only --json"
+        load_instance "$project_arg"
+        [ "${1:-}" = --json ] || compose ps
+        compose exec -T workflow-mcp workflow-mcp status "$@"
+        ;;
       logs) load_instance "$project_arg"; compose logs --follow workflow-mcp "$@" ;;
-      doctor) load_instance "$project_arg"; attest_volume; compose config --quiet; compose exec -T workflow-mcp workflow-mcp doctor --json ;;
-      ui) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp ui ;;
-      mcp-proxy) load_instance "$project_arg"; exec docker compose -p "$compose_project" --project-directory "$installation" -f "$installation/compose.yaml" exec -T workflow-mcp workflow-mcp mcp-proxy ;;
-      token) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp token show "$@" ;;
+      doctor) [ "$#" -eq 0 ] || fail "doctor accepts a project path only"; load_instance "$project_arg"; attest_volume; compose config --quiet; render_doctor_envelope ;;
+      ui)
+        [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = --snapshot ]; } || fail "ui accepts only --snapshot"
+        load_instance "$project_arg"
+        # WHY: an interactive TUI needs Compose to allocate a terminal, while the advertised
+        # snapshot is specifically for pipes, logs, and accessibility tooling. Giving both paths
+        # one unconditional TTY mode makes either automation fail or keyboard input disappear.
+        if [ "${1:-}" = --snapshot ]; then
+          compose exec -T workflow-mcp workflow-mcp ui --snapshot
+        else
+          compose exec workflow-mcp workflow-mcp ui
+        fi
+        ;;
+      mcp-proxy) [ "$#" -eq 0 ] || fail "mcp-proxy accepts a project path only"; load_instance "$project_arg"; compose exec -T workflow-mcp workflow-mcp mcp-proxy ;;
+      token)
+        load_instance "$project_arg"
+        # Compose allocates a container TTY by default even when the host caller redirected stdout.
+        # Preserve the inner CLI's no-secret-to-pipe safeguard by mirroring the real host terminal;
+        # an explicit --force still works through the non-TTY path for deliberate automation.
+        if [ -t 1 ]; then compose exec workflow-mcp workflow-mcp token show "$@"
+        else compose exec -T workflow-mcp workflow-mcp token show "$@"
+        fi
+        ;;
       source) load_instance "$project_arg"; compose exec -T workflow-mcp workflow-mcp source "$@" ;;
       auth) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp auth "$@" ;;
+      migrate) load_instance "$project_arg"; compose exec -T workflow-mcp workflow-mcp migrate "$@" ;;
       uninstall) uninstall_command "$project_arg" "$@" ;;
     esac
     ;;

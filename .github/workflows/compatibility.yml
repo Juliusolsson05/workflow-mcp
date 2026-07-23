@@ -1,0 +1,75 @@
+name: Current ecosystem compatibility
+
+on:
+  schedule:
+    - cron: "23 5 * * 2"
+  workflow_dispatch:
+
+# WHY: this job deliberately follows current Docker MCP upstream rather than pinning it. It has no
+# credentials or write permission, so ecosystem drift can be detected without putting release
+# authority in mutable third-party code. The release workflow remains fully pinned and separate.
+permissions:
+  contents: read
+
+jobs:
+  current-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - name: Test source and build the native image
+        run: |
+          npm ci --include=dev
+          npm --prefix standalone ci --include=dev
+          npm run check
+          docker build -f standalone/docker/Dockerfile -t workflow-mcp:compatibility .
+          standalone/scripts/container-smoke.sh workflow-mcp:compatibility
+          # WHY: The generic developer bundle deliberately points at
+          # `workflow-mcp:development`. A clean runner has no such image, so this
+          # gate must bind the generated launcher to the exact image it just built.
+          node standalone/scripts/build-install-bundle.mjs \
+            --output=standalone/release-bundle \
+            --version=0.1.0-dev \
+            --revision="$(git rev-parse HEAD)" \
+            --image=workflow-mcp:compatibility
+          standalone/scripts/launcher-smoke.sh standalone/release-bundle
+      - name: Validate against current Docker Catalog source
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(git rev-parse HEAD)
+          digest=sha256:$(printf '0%.0s' {1..64})
+          node standalone/scripts/render-release-metadata.mjs \
+            --output=metadata --version=0.1.0 --revision="$revision" --digest="$digest"
+          git clone --depth 1 https://github.com/docker/mcp-registry.git docker-mcp-registry
+          # Once our contribution lands, validate upstream's owned copy first and then move it out
+          # of the fresh clone before validating current local metadata. A foreign source.project
+          # remains a hard name-collision failure; existence alone is no longer treated as drift.
+          if test -e docker-mcp-registry/servers/workflow-mcp; then
+            grep -Fqx '  project: https://github.com/Juliusolsson05/workflow-mcp' \
+              docker-mcp-registry/servers/workflow-mcp/server.yaml
+            (cd docker-mcp-registry && go run ./cmd/validate --name workflow-mcp)
+            mv docker-mcp-registry/servers/workflow-mcp "$RUNNER_TEMP/workflow-mcp-upstream-entry"
+          fi
+          cp -R metadata/docker-catalog/workflow-mcp docker-mcp-registry/servers/workflow-mcp
+          (cd docker-mcp-registry && go run ./cmd/validate --name workflow-mcp)
+          echo "Docker Catalog validator commit: $(git -C docker-mcp-registry rev-parse HEAD)"
+      - name: Compile the current Docker MCP Gateway CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/docker/mcp-gateway.git docker-mcp-gateway
+          mkdir -p "$RUNNER_TEMP/docker-mcp-cli"
+          # WHY: upstream's target also installs into ~/.docker/cli-plugins and assumes the parent
+          # exists. This no-secret compatibility job needs only the compiled CLI, so redirect that
+          # side effect into a disposable runner-owned path rather than mutating Docker user state.
+          (cd docker-mcp-gateway && \
+            make DOCKER_MCP_CLI_PLUGIN_DST="$RUNNER_TEMP/docker-mcp-cli/docker-mcp" docker-mcp)
+          docker-mcp-gateway/dist/docker-mcp --help >/dev/null
+          echo "Docker MCP Gateway commit: $(git -C docker-mcp-gateway rev-parse HEAD)"

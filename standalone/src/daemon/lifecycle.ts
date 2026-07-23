@@ -27,12 +27,19 @@ export async function startStandaloneDaemon(
   config: StandaloneConfig,
   options: { provider?: AgentProvider; environment?: NodeJS.ProcessEnv } = {},
 ): Promise<StandaloneDaemon> {
+  const startedAt = new Date().toISOString()
+  const environment = options.environment ?? process.env
+  const apiKeySecret = (
+    environment.WORKFLOW_MCP_OPENAI_API_KEY_FILE !== undefined ||
+    environment.OPENAI_API_KEY !== undefined
+  )
   let ready = false
   let application: StandaloneApplication | undefined
   let tokens: StandaloneTokens | undefined
   let mcp: WorkflowMcpHttpHandler | undefined
   let web: StaticWebRouter | undefined
   let admin: StandaloneAdminServer | undefined
+  const isReady = (): boolean => ready && application?.service.lifecycleState() === 'READY'
   const http = createServer((request, response) => {
     void (async () => {
       applySecurityHeaders(response)
@@ -46,10 +53,10 @@ export async function startStandaloneDaemon(
         return
       }
       if (path === '/readyz') {
-        sendJson(response, ready ? 200 : 503, { status: ready ? 'ready' : 'not-ready' })
+        sendJson(response, isReady() ? 200 : 503, { status: isReady() ? 'ready' : 'not-ready' })
         return
       }
-      if (!ready || application === undefined || tokens === undefined || mcp === undefined || web === undefined) {
+      if (!isReady() || application === undefined || tokens === undefined || mcp === undefined || web === undefined) {
         sendJson(response, 503, { status: 'not-ready' })
         return
       }
@@ -58,6 +65,8 @@ export async function startStandaloneDaemon(
         service: application.service,
         config,
         webToken: tokens.web,
+        startedAt,
+        authenticationMode: apiKeySecret ? 'api-key-secret' : 'interactive',
       })) return
       if (web.handle(request, response)) return
       sendJson(response, 404, { schemaVersion: 1, error: { code: 'not-found' } })
@@ -65,7 +74,10 @@ export async function startStandaloneDaemon(
       if (!response.headersSent) {
         sendJson(response, 500, {
           schemaVersion: 1,
-          error: { code: 'internal-error', message: error instanceof Error ? error.message : String(error) },
+          // WHY: this is the last HTTP boundary and may catch provider/store exceptions containing
+          // stderr, credential fragments, or private container paths. Detailed diagnostics stay in
+          // the process error channel; clients receive a stable non-oracular response.
+          error: { code: 'internal-error', message: 'Workflow MCP could not complete the request.' },
         })
       } else if (!response.writableEnded) response.end()
     })
@@ -90,15 +102,17 @@ export async function startStandaloneDaemon(
       application.service,
       { cwd: config.workspace },
       tokens.mcp,
-      { inlineAuthoring: config.sourceMode === 'authoring' },
+      {
+        inlineAuthoring: config.sourceMode === 'authoring',
+        providerCapacity: config.concurrency,
+      },
     )
     web = await loadStaticWebRouter(config.webEnabled)
     const auth = new CodexCredentialBroker({
       service: application.service,
       codexExecutable: config.codexExecutable,
       dataDirectory: config.dataDirectory,
-      apiKeySecret: options.environment?.WORKFLOW_MCP_OPENAI_API_KEY_FILE !== undefined ||
-        (options.environment === undefined && process.env.WORKFLOW_MCP_OPENAI_API_KEY_FILE !== undefined),
+      apiKeySecret,
     })
     admin = await startStandaloneAdminServer({
       config,
@@ -122,7 +136,7 @@ export async function startStandaloneDaemon(
     port,
     application,
     tokens,
-    ready: () => ready,
+    ready: isReady,
     close(reason = 'Standalone daemon is stopping'): Promise<void> {
       if (closePromise !== undefined) return closePromise
       ready = false

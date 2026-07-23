@@ -1,5 +1,5 @@
 variable "VERSION" {
-  default = "0.0.0"
+  default = "0.1.0-dev"
 }
 
 variable "REVISION" {

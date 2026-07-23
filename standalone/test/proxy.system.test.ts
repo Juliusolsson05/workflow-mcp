@@ -33,6 +33,7 @@ describe('stdio MCP proxy', () => {
       adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',
       webEnabled: false,
+      concurrency: 1,
     })
     const daemon = await startStandaloneDaemon(config, { provider: new FakeAgentProvider([]) })
     const environment = Object.fromEntries(

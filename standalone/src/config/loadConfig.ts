@@ -76,6 +76,12 @@ export function loadStandaloneConfig(
     stringFlag(flags, 'web') ?? environment.WORKFLOW_MCP_WEB_ENABLED ?? 'false',
     'web',
   )
+  const concurrency = integer(
+    stringFlag(flags, 'concurrency') ?? environment.WORKFLOW_MCP_CONCURRENCY ?? '1',
+    'concurrency',
+    1,
+    64,
+  )
 
   const config: StandaloneConfig = {
     workspace,
@@ -90,6 +96,7 @@ export function loadStandaloneConfig(
     adminSocketPath,
     codexExecutable,
     webEnabled,
+    concurrency,
   }
   return Object.freeze(config)
 }

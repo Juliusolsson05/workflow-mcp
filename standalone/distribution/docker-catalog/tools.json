@@ -1,0 +1,132 @@
+[
+  {
+    "name": "workflow_list",
+    "description": "List visible Claude-compatible workflow definitions.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": []
+  },
+  {
+    "name": "workflow_describe",
+    "description": "Describe one visible workflow without executing it.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "name", "type": "string", "desc": "Visible workflow meta.name." }
+    ]
+  },
+  {
+    "name": "workflow_validate",
+    "description": "Parse and validate one visible workflow.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "name", "type": "string", "desc": "Visible workflow meta.name." }
+    ]
+  },
+  {
+    "name": "workflow_run",
+    "description": "Start or resume a durable workflow run and return immediately.",
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "name", "type": "string", "desc": "Visible workflow name.", "optional": true },
+      { "name": "script", "type": "string", "desc": "Inline workflow JavaScript when authoring is enabled.", "optional": true },
+      { "name": "scriptPath", "type": "string", "desc": "Visible workflow definition path.", "optional": true },
+      { "name": "args", "type": "object", "desc": "JSON-compatible workflow arguments.", "optional": true },
+      { "name": "resumeFromRunId", "type": "string", "desc": "Native or imported run to continue.", "optional": true },
+      { "name": "title", "type": "string", "desc": "Accepted for Claude call-shape compatibility.", "optional": true },
+      { "name": "description", "type": "string", "desc": "Accepted for Claude call-shape compatibility.", "optional": true },
+      { "name": "idempotencyKey", "type": "string", "desc": "Caller-selected start deduplication key.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_run_status",
+    "description": "Read durable run, scheduler, agent, and recovery status.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." }
+    ]
+  },
+  {
+    "name": "workflow_run_events",
+    "description": "Read or long-poll a bounded page of durable run events.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." },
+      { "name": "after", "type": "integer", "desc": "Strict event cursor.", "optional": true },
+      { "name": "limit", "type": "integer", "desc": "Maximum events, 1 through 1000.", "optional": true },
+      { "name": "waitMs", "type": "integer", "desc": "Long-poll duration, 0 through 30000 ms.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_result_read",
+    "description": "Read a bounded page of a completed workflow result.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." },
+      { "name": "artifactId", "type": "string", "desc": "Result artifact identity from run status." },
+      { "name": "cursor", "type": "string", "desc": "Opaque result page cursor.", "optional": true },
+      { "name": "maxBytes", "type": "integer", "desc": "Maximum UTF-8 bytes in this page.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_run_cancel",
+    "description": "Request cooperative cancellation of an active run.",
+    "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." },
+      { "name": "reason", "type": "string", "desc": "Operator cancellation reason.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_resume",
+    "description": "Continue a native Agent Code or imported Claude workflow run.",
+    "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Native run identifier.", "optional": true },
+      { "name": "claudeRunPath", "type": "string", "desc": "Explicit Claude run metadata path.", "optional": true },
+      { "name": "workflowPath", "type": "string", "desc": "Workflow definition for explicit Claude import.", "optional": true },
+      { "name": "idempotencyKey", "type": "string", "desc": "Caller-selected resume deduplication key.", "optional": true },
+      { "name": "abandonUnconfirmedProvider", "type": "boolean", "desc": "Acknowledge an unconfirmed old provider descendant.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_agent_list",
+    "description": "List logical agents and attempt histories in a run.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." }
+    ]
+  },
+  {
+    "name": "workflow_agent_result_read",
+    "description": "Read a bounded page of one agent result.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." },
+      { "name": "agentId", "type": "string", "desc": "Logical agent identifier." },
+      { "name": "artifactId", "type": "string", "desc": "Optional artifact integrity fence.", "optional": true },
+      { "name": "cursor", "type": "string", "desc": "Opaque result page cursor.", "optional": true },
+      { "name": "maxBytes", "type": "integer", "desc": "Maximum UTF-8 bytes in this page.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_agent_results_read",
+    "description": "Read every available agent result in a paginated sweep.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." },
+      { "name": "phase", "type": "string", "desc": "Optional phase id or title filter.", "optional": true },
+      { "name": "cursor", "type": "string", "desc": "Opaque sweep cursor.", "optional": true },
+      { "name": "maxBytes", "type": "integer", "desc": "Maximum UTF-8 bytes in this page.", "optional": true }
+    ]
+  },
+  {
+    "name": "workflow_agent_transcript_read",
+    "description": "Read one agent slice of the canonical durable event stream.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": [
+      { "name": "runId", "type": "string", "desc": "Workflow run identifier." },
+      { "name": "agentId", "type": "string", "desc": "Logical agent identifier." },
+      { "name": "after", "type": "integer", "desc": "Strict event cursor.", "optional": true },
+      { "name": "limit", "type": "integer", "desc": "Maximum events, 1 through 1000.", "optional": true }
+    ]
+  }
+]

@@ -1,0 +1,42 @@
+# Submission template for docker/mcp-registry. Release automation replaces the explicit VERSION
+# and REVISION placeholders with the immutable release version/source commit before submission.
+name: workflow-mcp
+image: docker.io/juliusolsson05/workflow-mcp:${VERSION}
+type: server
+meta:
+  category: developer-tools
+  tags:
+    - workflows
+    - orchestration
+    - codex
+about:
+  # Docker's catalog validator rejects "MCP" and "Server" in titles because the catalog already
+  # supplies that context. Keep the product-qualified name in descriptions and registry metadata,
+  # but use the exact upstream title convention here so a release artifact is submission-ready.
+  title: Workflow
+  description: Run session-bound Claude-compatible JavaScript workflows through Codex.
+  icon: https://avatars.githubusercontent.com/u/134848912?s=200&v=4
+source:
+  project: https://github.com/Juliusolsson05/workflow-mcp
+  commit: ${REVISION}
+  directory: standalone
+run:
+  volumes:
+    - "{{workflow-mcp.project|volume-target}}:/workspace:ro"
+config:
+  description: Select the project containing .claude/workflows and provide an OpenAI API key.
+  secrets:
+    - name: workflow-mcp.openai_api_key
+      env: OPENAI_API_KEY
+      example: <OPENAI_API_KEY>
+  env:
+    - name: WORKFLOW_MCP_CONCURRENCY
+      value: "1"
+  parameters:
+    type: object
+    properties:
+      project:
+        type: string
+        description: Absolute host project directory exposed read-only to the session-bound server; Catalog mode refuses projects containing .codex configuration.
+    required:
+      - project

@@ -142,7 +142,12 @@ async function main(): Promise<void> {
     await service.initialize()
 
     if (argument === '--stdio') {
-      await serveWorkflowMcpStdio(service, { cwd, clientId: 'standalone-stdio' })
+      const server = await serveWorkflowMcpStdio(
+        service,
+        { cwd, clientId: 'standalone-stdio' },
+        { onInputClose: () => service.stop() },
+      )
+      await server.closed
       return
     }
 

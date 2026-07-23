@@ -58,6 +58,12 @@ export type WorkflowStoreLease = {
   ownerId: string
   /** Monotonic-enough local fencing generation; the random token remains the authority. */
   generation: number
+  /**
+   * Container ownership can fail asynchronously when the immutable lock pathname stops naming the
+   * descriptor's inode. Embedded backends omit this because their ownership test happens at every
+   * operation and has no independent kernel pathname monitor.
+   */
+  onOwnershipLost?(listener: (error: Error) => void): () => void
   release(): Promise<void>
 }
 
@@ -65,6 +71,8 @@ export type WorkflowStoreLeaseBackendLease = {
   generation: number
   /** Synchronous because persistent journals mutate through a synchronous execution contract. */
   assertOwned(): void
+  /** Register before recovery starts so an idle owner cannot remain READY after pathname drift. */
+  onOwnershipLost?(listener: (error: Error) => void): () => void
   release(): Promise<void>
 }
 
