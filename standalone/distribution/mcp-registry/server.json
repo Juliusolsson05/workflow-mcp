@@ -57,6 +57,11 @@
         },
         {
           "type": "named",
+          "name": "--security-opt",
+          "value": "seccomp=unconfined"
+        },
+        {
+          "type": "named",
           "name": "--pids-limit",
           "value": "256"
         },

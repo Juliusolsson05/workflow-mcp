@@ -38,6 +38,7 @@ for (const [name, value] of [
   ['--user', '10001:10001'],
   ['--cap-drop', 'ALL'],
   ['--security-opt', 'no-new-privileges:true'],
+  ['--security-opt', 'seccomp=unconfined'],
   ['--pids-limit', '256'],
   ['--memory', '2g'],
   ['--cpus', '1'],

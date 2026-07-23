@@ -365,8 +365,9 @@ jobs:
           clone_control=/proc/sys/kernel/unprivileged_userns_clone
           # WHY: Ubuntu 24.04's AppArmor control and the runner's generic clone control can each
           # block Bubblewrap before the candidate proves its no-capabilities/no-new-privileges
-          # sandbox. Release evidence must run that boundary, not relax the container; both changes
-          # last only for this no-secret VM and are verified before candidate execution.
+          # sandbox. Release evidence must run that boundary with the candidate's declared Docker
+          # seccomp exception; these host changes last only for this no-secret VM and are verified
+          # before candidate execution.
           if test -e "$apparmor_control"; then
             echo 0 | sudo tee "$apparmor_control" >/dev/null
             test "$(cat "$apparmor_control")" = 0

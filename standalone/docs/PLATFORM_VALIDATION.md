@@ -20,10 +20,13 @@ Those Ubuntu 24.04 platform-gate VMs explicitly set
 final-image probe. Ubuntu documents the AppArmor control as a one-boot way to permit unprivileged
 user namespaces; Bubblewrap also requires the generic clone control. This is test-host preparation,
 not a relaxation of the candidate container: the image
-still runs non-root with all capabilities dropped, `no-new-privileges`, the default seccomp profile,
-and a read-only root. Production Linux evidence must record either a narrow AppArmor policy that
+still runs non-root with all capabilities dropped, `no-new-privileges`, and a read-only root. The
+runtime deliberately uses `seccomp=unconfined` because Docker's default syscall allowlist blocks
+Bubblewrap's namespace/mount construction before the inner policy can exist. Production Linux
+evidence must record that exact per-container exception plus either a narrow AppArmor policy that
 permits the nested Bubblewrap namespace or the reviewed host setting; Docker Desktop evidence must
-record the Linux VM behavior. A privileged/unconfined container is never substitute evidence.
+record the Linux VM behavior. Privileged mode, added capabilities, AppArmor-wide bypasses, or a
+disabled Codex sandbox are never substitute evidence.
 
 ## Clean host matrix
 

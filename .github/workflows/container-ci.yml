@@ -71,7 +71,8 @@ jobs:
           # WHY: Ubuntu 24.04's AppArmor control and hosted-runner clone control can each block
           # Bubblewrap before the container's own no-capabilities/no-new-privileges policy is
           # tested. This ephemeral no-secret VM is the security fixture itself, so enable both
-          # kernel features for one boot and prove each write; never unconfine the sandbox.
+          # kernel features for one boot and prove each write. The container's explicit Docker
+          # seccomp exception then enables, rather than replaces, the nested Codex sandbox.
           if test -e "$apparmor_control"; then
             echo 0 | sudo tee "$apparmor_control" >/dev/null
             test "$(cat "$apparmor_control")" = 0
