@@ -33,7 +33,7 @@ jobs:
             -Bundle "$env:RUNNER_TEMP/workflow-mcp-windows-install"
 
   image-contract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       # Every third-party action is pinned to a reviewed full commit. The trailing version comment
@@ -62,6 +62,25 @@ jobs:
             REVISION=${{ github.sha }}
           cache-from: type=gha,scope=workflow-mcp-amd64
           cache-to: type=gha,scope=workflow-mcp-amd64,mode=max
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          # WHY: Ubuntu 24.04's AppArmor control and hosted-runner clone control can each block
+          # Bubblewrap before the container's own no-capabilities/no-new-privileges policy is
+          # tested. This ephemeral no-secret VM is the security fixture itself, so enable both
+          # kernel features for one boot and prove each write. The container's explicit Docker
+          # security-profile exceptions then enable, rather than replace, the nested Codex sandbox.
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
+          fi
       - name: Exercise final-image contracts
         run: standalone/scripts/container-smoke.sh workflow-mcp:ci
       - name: Exercise a clean documented launcher installation

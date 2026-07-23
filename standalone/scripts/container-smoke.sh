@@ -46,6 +46,21 @@ cat > "$temporary/output/openai_api_key" <<'EOF'
 workflow-mcp-nonsecret-container-probe
 EOF
 
+# WHY: bind mounts retain the host fixture's mode bits. Hosted runners are free to choose a
+# defensive umask, while the final image intentionally runs as unrelated uid 10001. If these
+# inputs inherit 0700/0600, the policy wrapper cannot stat `.codex` and the refusal probe appears
+# to accept the workspace merely because it was unreadable. Fix the public fixture modes so this
+# gate measures the image's isolation decision, not the runner account's ambient umask.
+chmod 0755 \
+  "$temporary/workspace" \
+  "$temporary/workspace/.claude" \
+  "$temporary/workspace/.claude/workflows" \
+  "$temporary/catalog-workspace" \
+  "$temporary/catalog-workspace/.codex"
+chmod 0644 \
+  "$temporary/workspace/.claude/workflows/smoke.js" \
+  "$temporary/catalog-workspace/.codex/config.toml"
+
 # WHY: the documented extension image is an operator-facing compatibility contract, not illustrative
 # prose. Building it from the exact candidate catches base-distribution/package-manager drift, and
 # executing the installed tool as the final non-root user proves the example did not merely parse.
@@ -117,7 +132,9 @@ docker run --rm --network none --read-only --user 10001:10001 \
 # allowlist can perform durable file primitives while sibling project paths, state, credentials,
 # process metadata, admin/daemon endpoints, external network, and detached descendants stay denied.
 docker run --rm --network "$network" --read-only=true --user=10001:10001 \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --mount=type=volume,target=/data \
   --mount="type=bind,source=$temporary/workspace,target=/workspace,readonly" \
   --tmpfs=/workspace/.claude/workflows:size=4m,mode=0700,uid=10001,gid=10001 \
@@ -132,6 +149,12 @@ docker run --rm --network "$network" --read-only=true --user=10001:10001 \
 
 user=$(docker image inspect "$image" --format '{{.Config.User}}')
 [ "$user" = 10001:10001 ] || { echo "unexpected image user: $user" >&2; exit 1; }
+# WHY: the managed requirements file is only useful if the actual non-root runtime can traverse
+# its root-owned parent and read it. File metadata alone missed a builder-dependent parent-mode
+# regression, while the later Codex sandbox error misleadingly named only the leaf file.
+docker run --rm --network none --read-only --user 10001:10001 \
+  --entrypoint /usr/local/bin/node "$image" \
+  -e 'require("node:fs").accessSync("/etc/codex/requirements.toml",require("node:fs").constants.R_OK)'
 healthcheck=$(docker image inspect "$image" --format '{{json .Config.Healthcheck}}')
 [ "$healthcheck" = null ] || { echo "image embeds a transport-specific healthcheck: $healthcheck" >&2; exit 1; }
 label=$(docker image inspect "$image" --format '{{index .Config.Labels "io.modelcontextprotocol.server.name"}}')
@@ -142,7 +165,9 @@ expected_version=$(docker image inspect "$image" --format '{{index .Config.Label
 # the client and owner in one container until the deterministic run is terminal; removing the
 # container then removes the anonymous volume, exactly matching the published lifecycle promise.
 docker run --rm --network none --read-only=true --user=10001:10001 \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --tmpfs=/tmp:size=256m,mode=1777,uid=10001,gid=10001 \
   --tmpfs=/run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001 \
   --mount=type=volume,target=/data \
@@ -160,7 +185,9 @@ cat > "$temporary/stdio-requests.jsonl" <<'EOF'
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workflow_run","arguments":{"name":"smoke","idempotencyKey":"container-stdio-terminal-smoke"}}}
 EOF
 (cat "$temporary/stdio-requests.jsonl"; sleep 1) | docker run --rm --network none --read-only --user 10001:10001 -i \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --tmpfs /tmp:size=256m,mode=1777,uid=10001,gid=10001 \
   --tmpfs /run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001 \
   --mount "type=volume,src=$stdio_volume,dst=/data" \
@@ -184,7 +211,9 @@ cat > "$temporary/stdio-status-requests.jsonl" <<EOF
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"workflow_run_status","arguments":{"runId":"$stdio_run_id"}}}
 EOF
 docker run --rm --network none --read-only --user 10001:10001 -i \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --tmpfs /tmp:size=256m,mode=1777,uid=10001,gid=10001 \
   --tmpfs /run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001 \
   --mount "type=volume,src=$stdio_volume,dst=/data,volume-nocopy" \
@@ -213,7 +242,9 @@ docker run --rm --network none --read-only --user 0:0 --entrypoint /bin/chown \
 docker rm "$staging_container" >/dev/null
 
 docker run -d --name "$container" --network "$network" --read-only --user 10001:10001 \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --tmpfs /tmp:size=256m,mode=1777,uid=10001,gid=10001 \
   --tmpfs /run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001 \
   -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
@@ -235,7 +266,9 @@ docker exec "$container" sh -c 'test "$(stat -c %a /run/workflow-mcp/admin.sock)
 
 # A second owner of the same volume must lose immediately at the kernel lock, not reach repair.
 if docker run --rm --network none --read-only --user 10001:10001 \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --tmpfs /tmp --tmpfs /run/workflow-mcp:mode=0700,uid=10001,gid=10001 \
   -v "$volume:/data" -v "$temporary/workspace:/workspace:ro" \
   -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
@@ -258,7 +291,9 @@ docker run --rm --network none --read-only --user 0:0 \
     chown 10001:10001 /data/.coordination/owner.lock
   '
 docker run -d --name "$replacement_container" --network "$network" --read-only --user 10001:10001 \
-  --cap-drop=ALL --security-opt=no-new-privileges:true --pids-limit=256 --memory=2g --cpus=1 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  --security-opt=seccomp=unconfined --security-opt=apparmor=unconfined \
+  --pids-limit=256 --memory=2g --cpus=1 \
   --tmpfs /tmp:size=256m,mode=1777,uid=10001,gid=10001 \
   --tmpfs /run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001 \
   -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \

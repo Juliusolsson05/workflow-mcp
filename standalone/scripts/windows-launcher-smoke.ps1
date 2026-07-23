@@ -12,9 +12,19 @@ $Stub = Join-Path $Temporary "bin"
 try {
   New-Item -ItemType Directory -Path $Project, $Stub | Out-Null
   $env:WORKFLOW_MCP_FAKE_PROJECT = $Project
+  $env:WORKFLOW_MCP_FAKE_DOCKER_LOG = Join-Path $Temporary "docker-invocations.jsonl"
   $FakeDocker = @'
 param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $DockerArguments)
 $ErrorActionPreference = "Stop"
+# WHY: PowerShell wraps native `.cmd` failures differently across runner releases, so the outer
+# contract cannot safely infer which Docker boundary ran from exception text. Record only this
+# non-secret fake argv as structured JSON; the smoke test can then prove a hostile instance reached
+# the strict image parser but never reached Compose command authority.
+[IO.File]::AppendAllText(
+  $env:WORKFLOW_MCP_FAKE_DOCKER_LOG,
+  (($DockerArguments | ConvertTo-Json -Compress) + [Environment]::NewLine),
+  [Text.UTF8Encoding]::new($false)
+)
 function ProjectHash() {
   $Identity = $env:WORKFLOW_MCP_FAKE_PROJECT.TrimEnd('\').ToLowerInvariant()
   $Bytes = [Text.Encoding]::UTF8.GetBytes("workflow-mcp-project-v1`0$Identity")
@@ -92,17 +102,36 @@ exit /b %ERRORLEVEL%
   $Record = Get-Content -Raw -LiteralPath $RecordPath | ConvertFrom-Json
   if ($null -ne $Record.PSObject.Properties["webPort"]) { throw "default installation unexpectedly persisted webPort" }
 
-  # The fake image parser models the production inspect boundary. Mutating command authority must
-  # be rejected before the launcher can reach any Compose invocation.
+  # Installation must prove the strict image parser accepts a clean generated record. The tamper
+  # phase then needs only prove rejection before Compose: an earlier host/checksum fence is at least
+  # as restrictive as image rejection and pwsh versions disagree about which native `.cmd` failure
+  # becomes the catchable ErrorRecord.
+  $CleanInvocations = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG)
+  $CleanSawStrictInspect = $false
+  foreach ($Line in $CleanInvocations) {
+    $Invocation = @($Line | ConvertFrom-Json)
+    if ($Invocation -contains "instance" -and $Invocation -contains "inspect") {
+      $CleanSawStrictInspect = $true
+    }
+  }
+  if (-not $CleanSawStrictInspect) { throw "clean installation did not exercise the strict image parser" }
+  $InvocationCount = $CleanInvocations.Count
   $Record.composeProjectName = "workflow-mcp-ffffffffffffffff"
   [IO.File]::WriteAllText($RecordPath, (($Record | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
-  $Rejected = $false
+  $Caught = $null
   try {
     & (Join-Path $Project ".workflow-mcp/workflow-mcp-docker.ps1") mcp-proxy $Project
   } catch {
-    $Rejected = $_.Exception.Message -match 'instance.json is invalid or unsupported'
+    $Caught = $_
   }
-  if (-not $Rejected) { throw "tampered Compose authority reached the installed launcher" }
+  if ($null -eq $Caught) { throw "tampered instance record was accepted" }
+  $SawCompose = $false
+  $Invocations = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG)
+  for ($Index = $InvocationCount; $Index -lt $Invocations.Count; $Index += 1) {
+    $Invocation = @($Invocations[$Index] | ConvertFrom-Json)
+    if ($Invocation.Count -gt 0 -and $Invocation[0] -eq "compose") { $SawCompose = $true }
+  }
+  if ($SawCompose) { throw "tampered Compose authority reached the installed launcher" }
   Write-Host "Windows default non-web launcher installation passed."
 } finally {
   # This exact GUID-named temporary leaf is the only cleanup target.

@@ -267,15 +267,17 @@ describe('workflow MCP facade', () => {
     })
     expect(resumed.structuredContent, JSON.stringify(resumed)).toBeDefined()
     const runId = (resumed.structuredContent as { run: { runId: string } }).run.runId
-    let terminalStatus: string | undefined
-    for (let index = 0; index < 100; index += 1) {
+    // WHY this is a wall-clock deadline instead of a fixed number of polls: each
+    // MCP status request crosses both halves of an in-memory transport and reads
+    // persisted run state. On a contended CI runner, 100 requests can be consumed
+    // in under the time the imported Claude continuation needs to finish, even
+    // though the same continuation completes normally moments later. The test is
+    // about eventual MCP-visible completion, so bound elapsed time and let Vitest
+    // preserve the last observed value in its failure output.
+    await expect.poll(async () => {
       const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      terminalStatus = (status.structuredContent as { run: { status: string } }).run.status
-      if (terminalStatus === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
-
-    expect(terminalStatus).toBe('completed')
+      return (status.structuredContent as { run: { status: string } }).run.status
+    }, { timeout: 5_000, interval: 25 }).toBe('completed')
     expect(resumed.structuredContent).toMatchObject({
       ok: true,
       run: {

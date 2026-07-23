@@ -73,6 +73,24 @@ const FAST_RETRY = {
   underutilizationWarningMs: 10,
 } as const
 
+// WHY completion waits are bounded by elapsed time instead of a fixed status-read count: V8
+// coverage instruments the worker/evaluator path much more heavily than these manifest reads, so
+// a 200x5ms polling loop can spend its entire budget observing a legitimate `running` state in
+// roughly two wall-clock seconds and then fail only in the instrumented Coverage CI job. The
+// invariant every caller actually holds is that the run reaches one expected terminal state
+// within the service deadline, so assert exactly that state under an explicit wall-clock budget.
+async function expectRunStatus(
+  service: WorkflowService,
+  cwd: string,
+  runId: string,
+  status: string,
+): Promise<void> {
+  await expect.poll(
+    async () => (await service.status({ cwd }, runId)).status,
+    { timeout: 5_000, interval: 25 },
+  ).toBe(status)
+}
+
 describe('unattended workflow reliability', () => {
   it('keeps nine provider slots full while already-admitted work exists', async () => {
     const source = workflow(`
@@ -1316,11 +1334,7 @@ describe('unattended workflow reliability', () => {
     expect(recovered).toBeDefined()
     if (!recovered) throw new Error('Automatic recovery run was not created')
 
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const status = await service.status({ cwd }, recovered.runId)
-      if (['completed', 'failed', 'cancelled', 'interrupted'].includes(status.status)) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(service, cwd, recovered.runId, 'completed')
     await expect(service.status({ cwd }, 'run_crashed')).resolves.toMatchObject({ status: 'interrupted' })
     await expect(service.status({ cwd }, recovered.runId)).resolves.toMatchObject({
       status: 'completed',
@@ -1360,10 +1374,7 @@ describe('unattended workflow reliability', () => {
     expect(recovered).toBeDefined()
     if (!recovered) throw new Error('Queued automatic recovery run was not created')
 
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await service.status({ cwd }, recovered.runId)).status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(service, cwd, recovered.runId, 'completed')
     await expect(service.status({ cwd }, recovered.runId)).resolves.toMatchObject({
       status: 'completed',
       recoveryMode: 'automatic',
@@ -1458,10 +1469,7 @@ describe('unattended workflow reliability', () => {
       .find((manifest) => manifest.resumedFromRunId === 'run_handoff_crash')
     expect(successor).toBeDefined()
     if (!successor) throw new Error('Interrupted handoff was not recovered')
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await first.status({ cwd }, successor.runId)).status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(first, cwd, successor.runId, 'completed')
     expect(contexts).toEqual([{ clientId: 'renderer-client-7' }])
     await first.stop()
 
@@ -1605,14 +1613,7 @@ describe('unattended workflow reliability', () => {
     expect(recovered).toBeDefined()
     if (!recovered) throw new Error('Sparse automatic recovery run was not created')
 
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const status = await service.status({ cwd }, recovered.runId)
-      if (['completed', 'failed', 'cancelled', 'interrupted'].includes(status.status)) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
-    await expect(service.status({ cwd }, recovered.runId)).resolves.toMatchObject({
-      status: 'completed',
-    })
+    await expectRunStatus(service, cwd, recovered.runId, 'completed')
     const completed = (await new FileWorkflowStore(storeRoot).readEvents(recovered.runId, 0, 1_000))
       .events.find((stored) => stored.event.type === 'run.completed')
     expect(completed?.event).toMatchObject({
@@ -1733,11 +1734,7 @@ describe('unattended workflow reliability', () => {
       .find((manifest) => manifest.resumedFromRunId === 'run_automatic_gap_crashed')
     expect(recovered).toBeDefined()
     if (!recovered) throw new Error('Automatic gap recovery run was not created')
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const status = await service.status({ cwd }, recovered.runId)
-      if (status.status === 'completed_with_errors') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(service, cwd, recovered.runId, 'completed_with_errors')
 
     await expect(service.status({ cwd }, recovered.runId)).resolves.toMatchObject({
       status: 'completed_with_errors',
@@ -1811,10 +1808,7 @@ describe('unattended workflow reliability', () => {
     })
     await service.initialize()
     const resumed = await service.resume({ cwd }, { runId: 'run_completed_with_gap' })
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await service.status({ cwd }, resumed.runId)).status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(service, cwd, resumed.runId, 'completed')
     const completed = (await new FileWorkflowStore(storeRoot).readEvents(resumed.runId, 0, 1_000))
       .events.find((stored) => stored.event.type === 'run.completed')
     expect(completed?.event).toMatchObject({
@@ -1873,10 +1867,7 @@ describe('unattended workflow reliability', () => {
     })
     await service.initialize()
     const resumed = await service.resume({ cwd }, { runId: 'run_sparse_manual' })
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await service.status({ cwd }, resumed.runId)).status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(service, cwd, resumed.runId, 'completed')
     const completed = (await new FileWorkflowStore(storeRoot).readEvents(resumed.runId, 0, 1_000))
       .events.find((stored) => stored.event.type === 'run.completed')
     expect(completed?.event).toMatchObject({
@@ -1927,15 +1918,12 @@ describe('unattended workflow reliability', () => {
     })
     await service.initialize()
     const first = await service.start({ cwd }, { name: 'scoped-circuit' })
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await service.status({ cwd }, first.runId)).status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    // The single provider-a attempt is exhausted immediately, so the first run settles as
+    // completed_with_errors carrying the coverage-gap placeholder that tripped its circuit; only
+    // the healthy provider-b run ever reaches plain completed.
+    await expectRunStatus(service, cwd, first.runId, 'completed_with_errors')
     const second = await service.start({ cwd }, { name: 'scoped-circuit' })
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if ((await service.status({ cwd }, second.runId)).status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await expectRunStatus(service, cwd, second.runId, 'completed')
 
     await expect(service.health({ cwd }, first.runId)).resolves.toMatchObject({
       providerCircuit: { state: 'open', recentFailures: 1 },

@@ -7,6 +7,23 @@ host runtime needs a local Docker Engine or Docker Desktop plus Compose. The ver
 bootstrap also needs GitHub CLI (`gh`), `tar`, `sha256sum` or `shasum`, and a POSIX shell; Windows
 uses PowerShell 7 plus the corresponding built-in archive/hash commands.
 
+Codex's Linux Bubblewrap boundary requires unprivileged user namespaces on the Docker host. Docker
+Desktop supplies that Linux-VM capability. Native Linux operators must allow the container runtime
+to create nested user namespaces; Ubuntu 24.04 enables an AppArmor restriction that can deny them
+unless the administrator supplies an appropriate AppArmor policy or changes the documented
+`kernel.apparmor_restrict_unprivileged_userns` host setting. Hosts that expose
+`kernel.unprivileged_userns_clone` must also enable it. Docker's default seccomp and AppArmor
+profiles separately block the namespace syscalls and mount propagation Bubblewrap needs, so the
+published Compose and OCI Registry profiles apply per-container `seccomp=unconfined` and
+`apparmor=unconfined` exceptions. Those exceptions enable the inner Codex sandbox; they do not
+disable it. The container remains non-root with every capability dropped, `no-new-privileges`,
+read-only mounts, and bounded resources. The launcher and doctor fail closed when the real sandbox
+probe cannot start. Do not replace this runtime shape with a privileged container, added
+capabilities, writable outer mounts, or a disabled Codex sandbox. See the
+[Docker runtime-security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt)
+and the
+[Ubuntu 24.04 security notes](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
+
 The normal installation is one long-lived daemon per project. Codex connects to a tiny STDIO proxy
 with `docker compose exec`; disconnecting one MCP client therefore does not cancel the daemon or its
 runs. A session-bound STDIO image mode also exists for generic OCI/MCP registries, but it has a
@@ -378,7 +395,7 @@ documented per-server profile is 1 CPU/2 GiB.
 
 | Environment | Base read-only mode | Web | Authoring | Evidence required before claiming support |
 |---|---:|---:|---:|---|
-| Linux Engine, local context, local named volume | Release target | Engine 28.3.3+ | UID-10001 probe/ACL required | native amd64/arm64 final-image release gates |
+| Linux Engine, local context, local named volume | Release target when nested user namespaces are permitted | Engine 28.3.3+ | UID-10001 probe/ACL required | native amd64/arm64 final-image release gates |
 | Rootless Linux Engine | Conditional target | Engine 28.3.3+ | UID mapping must pass | clean reset rootless runner |
 | Docker Desktop macOS, Intel/Apple Silicon | Release target | Engine 28.3.3+ | bind probe must pass | clean reset Desktop runner for each architecture |
 | Docker Desktop Windows + PowerShell, local drive only | Preview target (no UNC) | Engine 28.3.3+ | inherited current-user project ACL + bind probe | clean reset Windows/Desktop/PowerShell runner |
@@ -397,7 +414,9 @@ macOS refer to Linux containers under Docker Desktop, not a native Windows image
 ## Security model
 
 - The final image is non-root, drops every capability, enables `no-new-privileges`, has a read-only
-  root/project, bounded tmpfs, PID limit, and no Docker socket.
+  root/project, bounded tmpfs, PID limit, and no Docker socket. Its runtime disables Docker's stock
+  seccomp and AppArmor profiles only because they block Bubblewrap setup; the real hostile probe
+  must then prove the narrower Codex command sandbox starts and holds.
 - Managed Codex permission profiles deny `/data`, `/run/secrets`, `/run/workflow-mcp`, and `/proc`;
   tools have no network and start inside Codex's Bubblewrap PID namespace.
 - The image doctor runs a hostile final-image probe which tries to read the MCP token and launch a
