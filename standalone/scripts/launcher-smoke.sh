@@ -13,9 +13,31 @@ installed=$project/.workflow-mcp/workflow-mcp-docker
 reset_lock_holder=workflow-mcp-reset-race-$$
 bogus_adoption_volume=
 
+# WHY: `compose up --wait` reports only "container ... is unhealthy", and this gate then deletes
+# the failed container during cleanup, which made the 2026-07 native-runner workspace-permission
+# crash undiagnosable from CI logs alone. Before teardown, publish each installed instance's
+# container state, resolved security options, health-probe history, and daemon output. Every line
+# is an explicit field selection rather than raw `docker inspect`, so credential-bearing
+# environment values can never enter a CI transcript.
+dump_failure_diagnostics() {
+  for instance_file in "$temporary"/*/.workflow-mcp/instance.json; do
+    [ -f "$instance_file" ] || continue
+    diagnosed_project=$(sed -n 's/.*"composeProjectName":"\([^"]*\)".*/\1/p' "$instance_file" | head -n 1)
+    [ -n "$diagnosed_project" ] || continue
+    for container_id in $(docker ps --all --quiet --filter "label=com.docker.compose.project=$diagnosed_project"); do
+      docker inspect "$container_id" --format \
+        'launcher smoke diagnostic: name={{.Name}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}} restarts={{.RestartCount}} security={{json .HostConfig.SecurityOpt}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' >&2 || true
+      docker inspect "$container_id" --format \
+        '{{if .State.Health}}{{range .State.Health.Log}}launcher smoke diagnostic: probe exit={{.ExitCode}} output={{printf "%.400s" .Output}}{{end}}{{end}}' >&2 || true
+      docker logs --tail 100 "$container_id" >&2 2>&1 || true
+    done
+  done
+}
+
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
+  [ "$status" -eq 0 ] || dump_failure_diagnostics
   docker rm -f "$reset_lock_holder" >/dev/null 2>&1 || true
   [ -z "$bogus_adoption_volume" ] || docker volume rm "$bogus_adoption_volume" >/dev/null 2>&1 || true
   if [ -f "$project/.workflow-mcp/instance.json" ]; then
@@ -55,6 +77,15 @@ export const meta = {
 }
 return 'published launcher smoke complete'
 EOF
+# WHY: the Compose bind preserves the host fixture's real owner and mode bits on a native Linux
+# engine, while Docker Desktop's file sharing rewrites bind ownership and hides restrictive modes.
+# This script runs under `umask 077`, so without these explicit public modes the daemon's unrelated
+# UID 10001 cannot even traverse /workspace on the hosted Ubuntu runner: startup workspace
+# discovery fails with EACCES, the container exits, and `up --wait` reports only "unhealthy".
+# Publishing the documented readable-project precondition here measures the launcher contract
+# instead of the runner account's ambient umask, exactly like the container-smoke fixtures.
+chmod 0755 "$project" "$project/.claude" "$project/.claude/workflows"
+chmod 0644 "$project/.claude/workflows/release-smoke.js"
 
 # Credential validation is an install precondition, including when authoring was requested. A bad
 # secret must not leave behind either the writable workflow tree or a partial ownership directory.
