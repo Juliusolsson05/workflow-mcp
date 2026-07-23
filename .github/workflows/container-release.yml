@@ -170,7 +170,7 @@ jobs:
           ')
           repository=$(curl --fail --silent --show-error \
             --header "Authorization: Bearer $bearer" \
-            https://hub.docker.com/v2/namespaces/juliusolsson05/repositories/workflow-mcp)
+            https://hub.docker.com/v2/namespaces/juliusolsson/repositories/workflow-mcp)
           # WHY: proving that the SemVer regex is present is insufficient when a second rule can
           # also freeze candidate, compatible-minor, or latest tags. That drift can make the
           # qualification rerun or convenience-tag update fail only after public state exists.
