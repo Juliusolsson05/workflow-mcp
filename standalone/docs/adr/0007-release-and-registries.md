@@ -4,7 +4,7 @@ Status: accepted; administrative repository/registry controls remain prerequisit
 
 ## Decision
 
-Docker Hub `docker.io/juliusolsson05/workflow-mcp` is the canonical runtime. Stable semantic tags
+Docker Hub `docker.io/juliusolsson/workflow-mcp` is the canonical runtime. Stable semantic tags
 are immutable; compatible-minor and `latest` are convenience pointers. The release builds one
 run-attempt-unique amd64/arm64 staging index, attaches max provenance/SBOM, signs it, and runs native
 per-architecture final-image smoke and HIGH-threshold scans before committing the full-SemVer tag

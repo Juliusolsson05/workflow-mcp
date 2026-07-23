@@ -1,7 +1,7 @@
 # Submission template for docker/mcp-registry. Release automation replaces the explicit VERSION
 # and REVISION placeholders with the immutable release version/source commit before submission.
 name: workflow-mcp
-image: docker.io/juliusolsson05/workflow-mcp:${VERSION}
+image: docker.io/juliusolsson/workflow-mcp:${VERSION}
 type: server
 meta:
   category: developer-tools

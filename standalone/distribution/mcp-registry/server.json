@@ -14,7 +14,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "docker.io/juliusolsson05/workflow-mcp:0.1.0",
+      "identifier": "docker.io/juliusolsson/workflow-mcp:0.1.0",
       "transport": {
         "type": "stdio"
       },

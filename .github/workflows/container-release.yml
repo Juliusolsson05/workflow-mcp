@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: docker.io/juliusolsson05/workflow-mcp
+  IMAGE: docker.io/juliusolsson/workflow-mcp
 
 jobs:
   validate:
@@ -354,7 +354,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image="docker.io/juliusolsson05/workflow-mcp@${{ needs.build.outputs.digest }}"
+          image="docker.io/juliusolsson/workflow-mcp@${{ needs.build.outputs.digest }}"
           docker pull --platform "${{ matrix.platform }}" "$image"
           test "$(docker run --rm --entrypoint /bin/uname "$image" -m)" = "${{ matrix.uname }}"
       - name: Enable nested Codex sandbox namespaces on the disposable runner
@@ -762,7 +762,7 @@ jobs:
           tar -xzf "release/${{ needs.publish.outputs.bundle }}" -C bundle
           (cd bundle && sha256sum --check SHA256SUMS)
           bundle/workflow-mcp-docker help >/dev/null
-          image="docker.io/juliusolsson05/workflow-mcp@${{ needs.publish.outputs.digest }}"
+          image="docker.io/juliusolsson/workflow-mcp@${{ needs.publish.outputs.digest }}"
           cosign verify "$image" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GH_REPO/.github/workflows/container-release.yml@refs/tags/$tag"
