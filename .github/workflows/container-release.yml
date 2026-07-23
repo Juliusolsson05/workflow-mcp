@@ -357,6 +357,19 @@ jobs:
           image="docker.io/juliusolsson05/workflow-mcp@${{ needs.build.outputs.digest }}"
           docker pull --platform "${{ matrix.platform }}" "$image"
           test "$(docker run --rm --entrypoint /bin/uname "$image" -m)" = "${{ matrix.uname }}"
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          # WHY: Ubuntu 24.04's AppArmor host default blocks Bubblewrap user namespaces before the
+          # candidate can prove its own no-capabilities/no-new-privileges sandbox. Release evidence
+          # must run that boundary, not skip it or relax the container; this change lasts only for
+          # the no-secret platform-gate VM and is verified before candidate execution.
+          if test -e "$control"; then
+            echo 0 | sudo tee "$control" >/dev/null
+            test "$(cat "$control")" = 0
+          fi
       - name: Exercise native final-image contracts
         run: standalone/scripts/container-smoke.sh "$IMAGE@${{ needs.build.outputs.digest }}"
       - name: Install checksum-pinned Grype

@@ -14,13 +14,22 @@ second-owner exclusion, clean shutdown, and offline backup/verify/restore. Each 
 also scanned at the release threshold. The build job attaches max provenance and SBOM to the one
 index and signs that digest; promotion must copy that index rather than rebuild it.
 
+Those Ubuntu 24.04 platform-gate VMs explicitly set
+`kernel.apparmor_restrict_unprivileged_userns=0` for that one disposable, credential-free job before
+the final-image probe. Ubuntu documents this as a one-boot way to permit unprivileged user
+namespaces. This is test-host preparation, not a relaxation of the candidate container: the image
+still runs non-root with all capabilities dropped, `no-new-privileges`, the default seccomp profile,
+and a read-only root. Production Linux evidence must record either a narrow AppArmor policy that
+permits the nested Bubblewrap namespace or the reviewed host setting; Docker Desktop evidence must
+record the Linux VM behavior. A privileged/unconfined container is never substitute evidence.
+
 ## Clean host matrix
 
 Release-candidate evidence is recorded separately for:
 
 | Row | Minimum clean host |
 | --- | --- |
-| Linux rootful amd64/arm64 | local Engine, empty Docker state for the fixture, Compose 2.32+, ordinary local volume |
+| Linux rootful amd64/arm64 | local Engine, nested unprivileged user namespaces permitted, empty Docker state for the fixture, Compose 2.32+, ordinary local volume |
 | Linux rootless | rootless local context with recorded UID mapping and volume/bind behavior |
 | macOS Intel | current supported Docker Desktop, POSIX launcher, fresh project and named volume |
 | macOS Apple Silicon | current supported Docker Desktop, POSIX launcher, fresh project and named volume |

@@ -33,7 +33,7 @@ jobs:
             -Bundle "$env:RUNNER_TEMP/workflow-mcp-windows-install"
 
   image-contract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       # Every third-party action is pinned to a reviewed full commit. The trailing version comment
@@ -62,6 +62,19 @@ jobs:
             REVISION=${{ github.sha }}
           cache-from: type=gha,scope=workflow-mcp-amd64
           cache-to: type=gha,scope=workflow-mcp-amd64,mode=max
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          # WHY: Ubuntu 24.04's host AppArmor default blocks Bubblewrap before the container's own
+          # no-capabilities/no-new-privileges policy can be tested. This ephemeral no-secret VM is
+          # the security fixture itself, so enable the kernel feature Codex requires for one boot
+          # and prove the write took effect; never replace the sandbox with an unconfined mode.
+          if test -e "$control"; then
+            echo 0 | sudo tee "$control" >/dev/null
+            test "$(cat "$control")" = 0
+          fi
       - name: Exercise final-image contracts
         run: standalone/scripts/container-smoke.sh workflow-mcp:ci
       - name: Exercise a clean documented launcher installation

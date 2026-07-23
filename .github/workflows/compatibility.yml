@@ -23,6 +23,18 @@ jobs:
         with:
           node-version: 22.23.1
           cache: npm
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          # WHY: current-ecosystem qualification must execute the real Bubblewrap boundary. Ubuntu
+          # 24.04 otherwise denies nested unprivileged namespaces at the host AppArmor layer and
+          # would measure the runner image rather than Workflow MCP's hardened container contract.
+          if test -e "$control"; then
+            echo 0 | sudo tee "$control" >/dev/null
+            test "$(cat "$control")" = 0
+          fi
       - name: Test source and build the native image
         run: |
           npm ci --include=dev

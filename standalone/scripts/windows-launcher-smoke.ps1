@@ -102,11 +102,20 @@ exit /b %ERRORLEVEL%
   $Record = Get-Content -Raw -LiteralPath $RecordPath | ConvertFrom-Json
   if ($null -ne $Record.PSObject.Properties["webPort"]) { throw "default installation unexpectedly persisted webPort" }
 
-  # The fake image parser models the production inspect boundary. Mutating command authority must
-  # be rejected before the launcher can reach any Compose invocation. Assert the actual invocation
-  # boundary instead of matching exception prose because pwsh versions disagree about whether a
-  # failing native `.cmd` surfaces the launcher's stable error or the child's stderr ErrorRecord.
-  $InvocationCount = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG).Count
+  # Installation must prove the strict image parser accepts a clean generated record. The tamper
+  # phase then needs only prove rejection before Compose: an earlier host/checksum fence is at least
+  # as restrictive as image rejection and pwsh versions disagree about which native `.cmd` failure
+  # becomes the catchable ErrorRecord.
+  $CleanInvocations = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG)
+  $CleanSawStrictInspect = $false
+  foreach ($Line in $CleanInvocations) {
+    $Invocation = @($Line | ConvertFrom-Json)
+    if ($Invocation -contains "instance" -and $Invocation -contains "inspect") {
+      $CleanSawStrictInspect = $true
+    }
+  }
+  if (-not $CleanSawStrictInspect) { throw "clean installation did not exercise the strict image parser" }
+  $InvocationCount = $CleanInvocations.Count
   $Record.composeProjectName = "workflow-mcp-ffffffffffffffff"
   [IO.File]::WriteAllText($RecordPath, (($Record | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
   $Caught = $null
@@ -116,15 +125,12 @@ exit /b %ERRORLEVEL%
     $Caught = $_
   }
   if ($null -eq $Caught) { throw "tampered instance record was accepted" }
-  $SawStrictInspect = $false
   $SawCompose = $false
   $Invocations = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG)
   for ($Index = $InvocationCount; $Index -lt $Invocations.Count; $Index += 1) {
     $Invocation = @($Invocations[$Index] | ConvertFrom-Json)
     if ($Invocation.Count -gt 0 -and $Invocation[0] -eq "compose") { $SawCompose = $true }
-    if ($Invocation -contains "instance" -and $Invocation -contains "inspect") { $SawStrictInspect = $true }
   }
-  if (-not $SawStrictInspect) { throw "tampered instance did not reach the strict image parser" }
   if ($SawCompose) { throw "tampered Compose authority reached the installed launcher" }
   Write-Host "Windows default non-web launcher installation passed."
 } finally {
