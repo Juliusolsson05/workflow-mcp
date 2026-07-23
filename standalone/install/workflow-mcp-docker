@@ -613,6 +613,7 @@ install_command() {
   hardened_arg=false
   no_codex=false
   no_web=false
+  no_host_auth=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --web-port=*) web_arg=${1#*=} ;;
@@ -622,6 +623,7 @@ install_command() {
       --adopt-instance=*) adopt_instance=${1#*=} ;;
       --no-codex) no_codex=true ;;
       --no-web) no_web=true ;;
+      --no-host-auth) no_host_auth=true ;;
       *) fail "unknown install option: $1" ;;
     esac
     shift
@@ -653,8 +655,13 @@ install_command() {
   # already uses Codex on this machine needs no second login. An explicit API key still wins, and
   # hardened never inherits host credentials. Only the boolean is recorded — the path is resolved
   # again at every `up` from the live CODEX_HOME/HOME so host-side rotation keeps working.
+  # WHY --no-host-auth exists: inheritance is best-effort, and a host ChatGPT/subscription login
+  # can be detected yet still be unusable by the containerized Codex. Before this flag the only
+  # way to opt out was to hide ~/.codex/auth.json during install, which is not a thing a product
+  # should ask of anyone. Opting out selects the plain container credential path, where one
+  # `auth login` creates a real device login that always works.
   host_codex_auth_arg=false
-  if [ "$hardened_arg" = false ] && [ -z "$api_key_arg" ]; then
+  if [ "$hardened_arg" = false ] && [ "$no_host_auth" = false ] && [ -z "$api_key_arg" ]; then
     detected_codex_auth="${CODEX_HOME:-$HOME/.codex}/auth.json"
     if [ -f "$detected_codex_auth" ] && [ ! -L "$detected_codex_auth" ]; then
       host_codex_auth_arg=pending
@@ -747,7 +754,14 @@ install_command() {
   [ "$no_codex" = true ] || install_codex_stanza
   note "Installed Workflow MCP instance $instance_id at $installation"
   [ -z "$adopt_instance" ] || note "Adopted preserved durable volume ${compose_project}_workflow-mcp-data."
-  [ "$host_codex_auth_arg" = false ] || note "Codex credentials will be inherited from the host login (read-only seed)."
+  # Inheritance is attempted, not promised: a host ChatGPT/subscription login can seed cleanly and
+  # still be unusable inside the container. Say so at install time and name the one command that
+  # always works, so nobody has to discover it from agents dying with EPIPE.
+  if [ "$host_codex_auth_arg" = false ]; then
+    note "No inherited host credential. Run '$installation/workflow-mcp-docker auth login' once before running workflows."
+  else
+    note "Will try to inherit your host Codex login (read-only seed). If agents fail to start, run '$installation/workflow-mcp-docker auth login' once — a container login always wins."
+  fi
   note "Start it with: $installation/workflow-mcp-docker up"
 }
 
@@ -1110,7 +1124,7 @@ restore_command() {
 usage() {
   cat <<'EOF'
 Usage:
-  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--no-web] [--hardened] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
+  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--no-web] [--no-host-auth] [--hardened] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
   workflow-mcp-docker up [PROJECT]
   workflow-mcp-docker down|status|logs|doctor|ui|mcp-proxy [PROJECT]
   workflow-mcp-docker source [PROJECT] approvals|approve [options]

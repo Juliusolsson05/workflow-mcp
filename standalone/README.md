@@ -68,11 +68,25 @@ inside the image can render the exact stanza for recovery.
 
 ## Authentication
 
-By default the daemon inherits the host's existing Codex login: install detects
+Run this once per installation and everything works:
+
+```bash
+workflow-mcp auth login
+```
+
+That is a Codex device login owned by the container: it prints a URL and code, and writes a real
+credential into the container's own Codex home. It always works, and a container login always
+wins over anything inherited.
+
+Host-login inheritance is a **best-effort convenience, not a promise**. Install detects
 `~/.codex/auth.json` (honoring `CODEX_HOME`) and mounts it read-only as a seed for the container's
-own writable Codex home. Token rotation happens container-side; the host file is never written,
-and host logout removes the seed at the next container start. No second login exists in the happy
-path. `--hardened` disables inheritance and keeps credentials container-isolated.
+writable Codex home; when that seed is usable you never need to log in at all. But a host
+ChatGPT/subscription login carries account and configuration state beyond that one file, so the
+seed can copy cleanly and still leave the containerized Codex unable to authenticate. The daemon
+therefore **verifies** the inherited credential by asking Codex itself rather than assuming a
+readable file means "configured" — `auth status` reports it honestly, and if it cannot
+authenticate, the fix is the one `auth login` above. Use `--no-host-auth` at install to skip
+detection entirely; `--hardened` also disables inheritance.
 
 For the explicit non-interactive path, put only the key in an ordinary non-symlink file and bind
 its absolute path at installation (an explicit API key always wins over host inheritance):

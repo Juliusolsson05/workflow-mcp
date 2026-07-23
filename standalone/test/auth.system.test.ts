@@ -115,6 +115,59 @@ esac
     await application.quiesce('api key auth test complete')
   })
 
+  it('never blocks container login behind an inherited host credential', async () => {
+    // REGRESSION: inheritance used to refuse `auth login` with auth-mode-conflict. Combined with a
+    // status that called a merely-readable seed "configured", an operator whose host ChatGPT login
+    // could not drive the containerized Codex was left with a READY daemon, agents dying on EPIPE,
+    // and the one command that fixes it rejected. Login must always be reachable, and an inherited
+    // credential must never be reported authenticated without Codex actually accepting it.
+    const root = await mkdtemp(join(tmpdir(), 'workflow-host-auth-override-'))
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace)
+    const seed = join(root, 'host-auth.json')
+    await writeFile(seed, '{"tokens":{"access_token":"seed"}}\n')
+    // A Codex that rejects everything models the real defect: the inherited seed is present and
+    // readable, yet the containerized Codex cannot authenticate with it.
+    const executable = join(root, 'fake-codex')
+    await writeFile(executable, `#!/bin/sh
+printf 'not logged in\\n' >&2
+exit 1
+`)
+    await chmod(executable, 0o700)
+    const config: StandaloneConfig = Object.freeze({
+      workspace,
+      projectHash: hashProjectIdentity(workspace),
+      dataDirectory: join(root, 'data'),
+      host: '127.0.0.1',
+      port: 0,
+      profile: 'default',
+      sourceMode: 'authoring',
+      approvalMode: 'none',
+      webAuthMode: 'none',
+      hostCodexAuthFile: seed,
+      leaseMode: 'embedded',
+      adminSocketPath: join(root, 'run', 'admin.sock'),
+      codexExecutable: executable,
+      webEnabled: false,
+      concurrency: 1,
+    })
+    const application = await createStandaloneApplication(config, { provider: new FakeAgentProvider([]) })
+    const broker = new CodexCredentialBroker({
+      service: application.service,
+      codexExecutable: config.codexExecutable,
+      dataDirectory: config.dataDirectory,
+      apiKeySecret: false,
+      hostCodexAuthFile: seed,
+    })
+    // The seed exists and is readable, but Codex cannot authenticate with it: status must report
+    // host-codex mode as UNauthenticated rather than trusting file presence.
+    expect(await broker.status()).toMatchObject({ mode: 'host-codex', authenticated: false })
+    // And login must be ATTEMPTED rather than refused as a mode conflict. It fails here only
+    // because the fake Codex rejects it; the point is that it is never blocked.
+    await expect(broker.login(() => {})).rejects.toMatchObject({ code: 'authentication-failed' })
+    await application.quiesce('host auth override test complete')
+  })
+
   it('excludes concurrent auth commands and workflow starts for the whole credential process', async () => {
     const root = await mkdtemp(join(tmpdir(), 'workflow-auth-exclusive-'))
     const workspace = join(root, 'workspace')
