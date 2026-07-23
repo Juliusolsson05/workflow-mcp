@@ -1,0 +1,46 @@
+# This system layer is immutable image policy, not a user preference. Codex 0.138+
+# makes managed permission profiles authoritative even when a higher-precedence
+# config layer requests a legacy sandbox, which lets the container fail closed if
+# an SDK invocation ever bypasses the argument-normalizing launcher.
+allowed_approval_policies = ["never"]
+default_permissions = "workflow_mcp_read_only"
+allow_managed_hooks_only = true
+allow_remote_control = false
+
+[allowed_permission_profiles]
+workflow_mcp_read_only = true
+workflow_mcp_authoring = true
+
+[permissions.workflow_mcp_read_only]
+description = "Read the mounted project while denying all service state and credentials."
+extends = ":read-only"
+
+[permissions.workflow_mcp_read_only.filesystem]
+"/data" = "deny"
+"/proc" = "deny"
+
+[permissions.workflow_mcp_authoring]
+description = "Write only where the host mount is writable; service state remains denied."
+extends = ":workspace"
+
+[permissions.workflow_mcp_authoring.filesystem]
+"/data" = "deny"
+"/proc" = "deny"
+
+[permissions.filesystem]
+# The daemon and Codex CLI need these paths, but model-generated commands do
+# not. OS modes cannot separate same-UID descendants, so deny-read enforcement
+# is the actual confidentiality boundary. /proc exclusions prevent harvesting
+# secrets or inherited control descriptors from the daemon/provider processes.
+deny_read = [
+  "/run/secrets",
+  "/run/workflow-mcp",
+]
+
+[features]
+apps = false
+plugins = false
+image_generation = false
+multi_agent = false
+multi_agent_v2 = false
+network_proxy = false

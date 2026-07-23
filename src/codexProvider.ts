@@ -75,6 +75,12 @@ export type CodexExternalCapabilityEffect = 'read-only' | 'idempotent' | 'mutati
 
 export type CodexExecutionCapabilities = {
   inheritedMcpServers: 'disabled' | 'unknown'
+  /**
+   * Exact creation-time containment proven by the embedding host. Process groups alone are not
+   * enough because setsid() can escape; this attestation means every model command is born inside
+   * Codex's Bubblewrap PID namespace under an immutable managed permission profile.
+   */
+  attemptContainment?: 'codex-bwrap-pid-v1'
   mcpServers?: readonly {
     name: string
     effect: CodexExternalCapabilityEffect
@@ -147,6 +153,9 @@ export class CodexAgentProvider implements AgentProvider {
     this.#modelAliases = { ...modelAliases }
     this.#capabilities = {
       inheritedMcpServers: capabilities.inheritedMcpServers,
+      ...(capabilities.attemptContainment === undefined
+        ? {}
+        : { attemptContainment: capabilities.attemptContainment }),
       ...(capabilities.mcpServers === undefined
         ? {}
         : { mcpServers: capabilities.mcpServers.map((server) => ({ ...server })) }),
@@ -184,6 +193,18 @@ export class CodexAgentProvider implements AgentProvider {
           { code: 'codex-capability-attestation-invalid' },
         )
       }
+      if (
+        capabilities.attemptContainment !== undefined &&
+        (
+          executableEvidence === undefined ||
+          configurationIsolation?.effectiveConfigurationFingerprint === undefined
+        )
+      ) {
+        throw new AgentProviderFailure(
+          'Codex attempt containment requires executable and effective-policy evidence',
+          { code: 'codex-containment-attestation-invalid' },
+        )
+      }
       this.#client = undefined
       this.#host = new ProcessOwnedCodexHost({
         ...(providerHostFilePath === undefined ? {} : { hostFilePath: providerHostFilePath }),
@@ -208,13 +229,15 @@ export class CodexAgentProvider implements AgentProvider {
     // Production turns always use the process owner. Injected clients deliberately retain the
     // weaker settlement boundary because no OS process exists for workflow-mcp to reap.
     //
-    // WHY POSIX is also unconfirmed: a process group is an escalation mechanism, not a containment
-    // boundary. Real Codex shell tools call setsid(), and therefore leave the provider host's group
-    // before this adapter can signal `-hostPid`. Windows taskkill has the equivalent creation-time
-    // race without a Job Object. Returning `process-tree` on either platform would let the runtime
-    // overlap a successor with a command which the OS boundary never owned.
+    // WHY POSIX is unconfirmed by default: a process group is an escalation mechanism, not a
+    // containment boundary. The one stronger value is an embedding-host attestation that every
+    // model command is created inside Codex's Bubblewrap PID namespace; when its PID 1 exits the
+    // kernel kills even setsid descendants. Without that exact tested policy, returning
+    // `process-tree` would let a successor overlap a command the OS boundary never owned.
     if (this.#host === undefined) return 'settlement'
-    return 'unconfirmed-descendants'
+    return this.#capabilities.attemptContainment === 'codex-bwrap-pid-v1'
+      ? 'process-tree'
+      : 'unconfirmed-descendants'
   }
 
   assessReplaySafety(request: AgentRequest): AgentReplaySafetyAssessment {
@@ -330,6 +353,9 @@ export function buildCodexRecoveryFingerprint(
       input.configurationIsolation.effectiveConfigurationFingerprint,
     capabilities: {
       inheritedMcpServers: 'disabled',
+      ...(input.capabilities.attemptContainment === undefined
+        ? {}
+        : { attemptContainment: input.capabilities.attemptContainment }),
       mcpServers: [...(input.capabilities.mcpServers ?? [])]
         .map(server => ({ name: server.name, effect: server.effect }))
         .sort((left, right) => (

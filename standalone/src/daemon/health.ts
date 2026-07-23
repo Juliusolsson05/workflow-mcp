@@ -1,5 +1,8 @@
 import { access, lstat, statfs } from 'node:fs/promises'
 import { constants } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { basename } from 'node:path'
+import { promisify } from 'node:util'
 
 import {
   CODEX_SDK_VERSION,
@@ -10,6 +13,8 @@ import {
 
 import type { StandaloneConfig } from '../config/schema.js'
 import { inspectWorkflowDataLayout } from './dataLayout.js'
+
+const execute = promisify(execFile)
 
 export type DoctorCheck = {
   id: string
@@ -38,6 +43,32 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
   await pathCheck(checks, 'workspace-readable', config.workspace, constants.R_OK | constants.X_OK)
   await pathCheck(checks, 'data-writable', config.dataDirectory, constants.R_OK | constants.W_OK | constants.X_OK)
   await pathCheck(checks, 'codex-executable', config.codexExecutable, constants.R_OK | constants.X_OK)
+  if (process.platform === 'linux' && basename(config.codexExecutable) === 'codex-isolated') {
+    try {
+      const { stdout } = await execute(config.codexExecutable, ['policy-probe'], {
+        timeout: 15_000,
+        maxBuffer: 64 * 1_024,
+      })
+      if (stdout.trim() !== 'codex-policy-ok') throw new Error('policy probe returned an unexpected response')
+      checks.push({
+        id: 'codex-policy',
+        status: 'pass',
+        message: 'credential deny-read and PID-namespace descendant probes passed',
+      })
+    } catch (error) {
+      checks.push({
+        id: 'codex-policy',
+        status: 'fail',
+        message: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+      })
+    }
+  } else {
+    checks.push({
+      id: 'codex-policy',
+      status: 'warn',
+      message: 'final image policy probe is unavailable in embedded development mode',
+    })
+  }
   if (config.leaseMode === 'inherited-flock') {
     if (config.lockFileDescriptor === undefined) {
       checks.push({

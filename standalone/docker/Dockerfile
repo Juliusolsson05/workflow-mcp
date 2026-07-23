@@ -61,7 +61,7 @@ LABEL org.opencontainers.image.title="Workflow MCP" \
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-      bubblewrap ca-certificates git ripgrep tini \
+      ca-certificates git ripgrep tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 workflow \
     && useradd --uid 10001 --gid 10001 --home-dir /data/codex-home --no-create-home \
@@ -78,6 +78,8 @@ COPY --from=build /build/standalone/dist ./standalone/dist
 COPY --from=native-build /native/workflow-mcp-lock /native/libworkflow_mcp_cloexec.so ./native/
 COPY --chmod=0755 standalone/docker/entrypoint.sh /usr/local/bin/workflow-mcp
 COPY --chmod=0755 standalone/docker/codex-isolated.sh ./bin/codex-isolated
+COPY --chmod=0644 standalone/docker/codex-policy-launcher.mjs ./bin/codex-policy-launcher.mjs
+COPY --chmod=0644 standalone/docker/codex-requirements.toml /etc/codex/requirements.toml
 
 # Fresh named volumes use Docker copy-up from this tree. Normal startup never runs as root and must
 # therefore begin with every durable domain privately owned by the fixed runtime identity.
@@ -93,7 +95,6 @@ ENV NODE_ENV=production \
     WORKFLOW_MCP_DATA_DIR=/data \
     WORKFLOW_MCP_WORKSPACE=/workspace \
     WORKFLOW_MCP_CODEX_PATH=/opt/workflow-mcp/bin/codex-isolated \
-    WORKFLOW_MCP_CODEX_CONFIG_FINGERPRINT=86961f614605863487ba92a70f608cd6f0002a64aaeff44e3c05aa7c1eda0e3a \
     WORKFLOW_MCP_PORT=7331
 USER 10001:10001
 EXPOSE 7331

@@ -2,6 +2,7 @@
 set -eu
 
 codex=/opt/workflow-mcp/node_modules/@openai/codex/bin/codex.js
+policy_launcher=/opt/workflow-mcp/bin/codex-policy-launcher.mjs
 
 # Docker cannot create a nested tmpfs mountpoint under a read-only bind when `.codex` does not
 # already exist. The launcher therefore selects the mask overlay only for an existing directory;
@@ -27,13 +28,14 @@ fi
 
 if [ "${1:-}" = exec ]; then
   shift
-  # The SDK invokes `codex exec`. Injecting at that exact boundary preserves login/doctor commands
-  # while ensuring provider attempts cannot inherit mutable user config or user/project exec rules.
-  # The optional Compose overlay separately masks project .codex as defense in depth; AGENTS.md
-  # remains visible in both paths.
-  exec node "$codex" exec --ignore-user-config --ignore-rules \
-    -c 'shell_environment_policy.exclude=["OPENAI_API_KEY","WORKFLOW_MCP_MCP_TOKEN","WORKFLOW_MCP_WEB_TOKEN"]' \
-    "$@"
+  # The SDK still emits legacy --sandbox flags. The policy launcher replaces
+  # those with managed permission profiles so same-UID tool commands cannot
+  # read daemon/Codex credentials and every shell lives in a PID namespace.
+  exec node "$policy_launcher" "$@"
+fi
+
+if [ "${1:-}" = policy-probe ]; then
+  exec node "$policy_launcher" --self-test
 fi
 
 exec node "$codex" "$@"
