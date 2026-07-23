@@ -567,6 +567,26 @@ jobs:
           echo 'ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac  publisher/mcp-publisher_linux_amd64.tar.gz' | sha256sum --check
           tar -xzf "publisher/$publisher_asset" -C publisher mcp-publisher
           publisher/mcp-publisher validate metadata/server.json
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # WHY this repeats the build job's setup: publish is a SEPARATE fresh runner, and the
+          # pre-publication launcher smoke runs `doctor`, whose codex-policy check launches the same
+          # nested Bubblewrap probe. Ubuntu 24.04 restricts unprivileged user namespaces by default,
+          # so without this the probe fails, doctor returns exit 3, and publication is blocked even
+          # though the candidate is sound — the exact latent failure the first real v0.1.0 release
+          # surfaced. These host changes last only for this no-secret VM.
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
+          fi
       - name: Reproduce the bundle from the candidate image and smoke it before publication
         shell: bash
         run: |
@@ -753,6 +773,23 @@ jobs:
           # Cosign release. Post-publication verification must use the same reviewed binary as the
           # pre-publication signature gate, or a default bump can make recovery nondeterministic.
           cosign-release: v3.0.6
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The post-publication release smoke is a third fresh runner that also runs the launcher
+          # smoke's doctor codex-policy Bubblewrap probe; it needs the same Ubuntu-24.04 userns
+          # relaxation as the build and publish jobs. Host changes last only for this no-secret VM.
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
+          fi
       - name: Verify immutable release and published assets
         env:
           GH_TOKEN: ${{ github.token }}
