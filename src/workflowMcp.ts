@@ -28,12 +28,17 @@ export function workflowMcpInstructions(inlineAuthoring = true, providerCapacity
   if (!Number.isSafeInteger(providerCapacity) || providerCapacity < 1) {
     throw new TypeError('providerCapacity must be a positive integer')
   }
+  // WHY the read-only text still teaches the full authoring format: a constrained instance that
+  // says only "authoring disabled" strands the client with no way to learn the DSL — observed
+  // live on 2026-07-23, when a Codex session fell back to reverse-engineering example files and
+  // web-searching the format. The capability is disabled here, not the knowledge: the client (or
+  // its human) must still be able to author the file on the host and know exactly what to write.
   const sourceInstructions = inlineAuthoring ? WORKFLOW_MCP_INSTRUCTIONS : WORKFLOW_MCP_INSTRUCTIONS.replace(
     /To author one, call workflow_run with inline JavaScript in script\.[\s\S]*?Pass args as real JSON, never a JSON-encoded string\./,
     'This instance is read-only: run only already-visible workflows by name or scriptPath. Inline script authoring is disabled and returns authoring-disabled. Pass args as real JSON, never a JSON-encoded string.',
   ).replace(
     /Inline source is saved under the current Git project's \.claude\/workflows and the run result returns scriptPath\.[\s\S]*?existing definitions are never overwritten implicitly\./,
-    'Workflow definitions are mounted read-only. Edit them on the host, then restart the daemon so the new source hash crosses the startup approval boundary.',
+    'Workflow definitions are mounted read-only. To add one, create <project>/.claude/workflows/<name>.js on the host with this exact shape: the first statement must be a pure literal export const meta = { name: \'...\', description: \'...\' } (optional title, whenToUse, phases); the remaining top-level script can await agent(), pipeline(), parallel(), workflow(), call phase()/log(), read args, and return a result. Then restart the daemon so the new source hash crosses the startup approval boundary.',
   )
   return sourceInstructions.replace(
     /The service has a shared provider capacity of nine by default\.[\s\S]*?Do not invent run IDs or source paths\./,

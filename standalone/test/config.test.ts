@@ -35,4 +35,38 @@ describe('standalone configuration', () => {
       host: '192.0.2.1',
     }, { WORKFLOW_MCP_LEASE_MODE: 'embedded' })).toThrow(/127\.0\.0\.1 or 0\.0\.0\.0/)
   })
+
+  it('derives the posture from one profile bit while keeping per-subsystem overrides', () => {
+    // The whole consumer-simplification contract in miniature: `default` must mean authoring,
+    // no approvals, tokenless web; `hardened` must restore the original shipped posture from the
+    // same single input; and an explicit env override must still beat either derivation.
+    const consumer = loadStandaloneConfig({}, { WORKFLOW_MCP_LEASE_MODE: 'embedded' })
+    expect(consumer).toMatchObject({
+      profile: 'default',
+      sourceMode: 'authoring',
+      approvalMode: 'none',
+      webAuthMode: 'none',
+    })
+    const hardened = loadStandaloneConfig({}, {
+      WORKFLOW_MCP_LEASE_MODE: 'embedded',
+      WORKFLOW_MCP_PROFILE: 'hardened',
+    })
+    expect(hardened).toMatchObject({
+      profile: 'hardened',
+      sourceMode: 'read-only',
+      approvalMode: 'required',
+      webAuthMode: 'token',
+    })
+    const overridden = loadStandaloneConfig({}, {
+      WORKFLOW_MCP_LEASE_MODE: 'embedded',
+      WORKFLOW_MCP_PROFILE: 'hardened',
+      WORKFLOW_MCP_SOURCE_MODE: 'authoring',
+    })
+    expect(overridden.sourceMode).toBe('authoring')
+    expect(overridden.approvalMode).toBe('required')
+    expect(() => loadStandaloneConfig({}, {
+      WORKFLOW_MCP_LEASE_MODE: 'embedded',
+      WORKFLOW_MCP_CODEX_AUTH_FILE: 'relative/auth.json',
+    })).toThrow(/absolute/)
+  })
 })

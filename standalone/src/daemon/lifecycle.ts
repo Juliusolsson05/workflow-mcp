@@ -33,6 +33,11 @@ export async function startStandaloneDaemon(
     environment.WORKFLOW_MCP_OPENAI_API_KEY_FILE !== undefined ||
     environment.OPENAI_API_KEY !== undefined
   )
+  // Auth-source precedence: an explicit API-key secret wins (it is a deliberate operator choice),
+  // then a mounted host Codex credential, then container-interactive login as the last resort.
+  const authenticationMode: 'api-key-secret' | 'host-codex' | 'interactive' = apiKeySecret
+    ? 'api-key-secret'
+    : config.hostCodexAuthFile !== undefined ? 'host-codex' : 'interactive'
   let ready = false
   let application: StandaloneApplication | undefined
   let tokens: StandaloneTokens | undefined
@@ -66,7 +71,7 @@ export async function startStandaloneDaemon(
         config,
         webToken: tokens.web,
         startedAt,
-        authenticationMode: apiKeySecret ? 'api-key-secret' : 'interactive',
+        authenticationMode,
       })) return
       if (web.handle(request, response)) return
       sendJson(response, 404, { schemaVersion: 1, error: { code: 'not-found' } })
@@ -113,6 +118,7 @@ export async function startStandaloneDaemon(
       codexExecutable: config.codexExecutable,
       dataDirectory: config.dataDirectory,
       apiKeySecret,
+      ...(config.hostCodexAuthFile === undefined ? {} : { hostCodexAuthFile: config.hostCodexAuthFile }),
     })
     admin = await startStandaloneAdminServer({
       config,

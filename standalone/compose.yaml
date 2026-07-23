@@ -11,7 +11,12 @@ services:
     environment:
       WORKFLOW_MCP_INSTANCE_ID: ${WORKFLOW_MCP_INSTANCE_ID:?stable instance ID required}
       WORKFLOW_MCP_PROJECT_HASH: ${WORKFLOW_MCP_PROJECT_HASH:?canonical project hash required}
-      WORKFLOW_MCP_SOURCE_MODE: read-only
+      # WHY a profile instead of per-feature envs: the daemon derives sourceMode, approval mode,
+      # and web auth from this one value (standalone/src/config/loadConfig.ts), so the recorded
+      # installation bit cannot drift out of sync with individual subsystems. `default` is the
+      # single-user consumer posture (authoring, no approval gate, tokenless localhost web);
+      # `hardened` restores the original shipped posture via compose.hardened.yaml.
+      WORKFLOW_MCP_PROFILE: ${WORKFLOW_MCP_PROFILE:-default}
       WORKFLOW_MCP_WEB_ENABLED: "false"
       # The published constrained profile fits Docker Gateway/Desktop's common one-CPU/two-GiB
       # allocation. Raise concurrency only together with the CPU and memory limits below.
@@ -25,7 +30,12 @@ services:
       - type: bind
         source: ${WORKFLOW_MCP_PROJECT_DIR:?absolute project path required}
         target: /workspace
-        read_only: true
+        # WHY writable: the product's core use is agents editing the user's own project — the
+        # same authority the user grants any host-side coding agent. The container root fs stays
+        # read-only, /data and /run/secrets stay deny-read to agents, and the project .codex mask
+        # still blocks config injection AND writes to project Codex config. The hardened overlay
+        # restores the read-only bind plus the narrow .claude/workflows authoring window.
+        read_only: false
         bind:
           create_host_path: false
     read_only: true

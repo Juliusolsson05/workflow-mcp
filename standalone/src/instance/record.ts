@@ -17,6 +17,19 @@ export type StandaloneInstanceRecord = Readonly<{
   createdAt: string
   webPort?: number
   authoring: boolean
+  // WHY one recorded bit: `hardened` selects the whole original shipped posture (read-only
+  // sources, durable approvals, token web, isolated auth). Recording the profile — instead of a
+  // pile of per-feature booleans — means an upgrade or recovery reconstructs exactly the posture
+  // the operator installed, and one subsystem can never drift from the others.
+  //
+  // ENCODING CONTRACT: every record written by this release carries BOTH booleans explicitly. A
+  // record where `hardened` is ABSENT is therefore, by construction, from a release that predates
+  // profiles — an install whose only shipped posture WAS the hardened one — and the POSIX/PS
+  // render maps that absence to hardened=true so an upgrade can never silently relax an existing
+  // installation. Making absence mean false instead would have made a legacy record and a fresh
+  // relaxed-default record byte-identical, which is exactly the silent-flip the plan forbids.
+  hardened?: boolean
+  hostCodexAuth?: boolean
   apiKeyFile?: string
 }>
 
@@ -28,6 +41,8 @@ export function createInstanceRecord(input: {
   image: string
   webPort?: number
   authoring?: boolean
+  hardened?: boolean
+  hostCodexAuth?: boolean
   apiKeyFile?: string
 }): StandaloneInstanceRecord {
   return buildInstanceRecord({ ...input, instanceId: randomUUID() })
@@ -42,6 +57,8 @@ export function adoptInstanceRecord(input: {
   image: string
   webPort?: number
   authoring?: boolean
+  hardened?: boolean
+  hostCodexAuth?: boolean
   apiKeyFile?: string
 }): StandaloneInstanceRecord {
   if (!LOWERCASE_UUID_V4.test(input.instanceId)) {
@@ -62,6 +79,8 @@ function buildInstanceRecord(input: {
   image: string
   webPort?: number
   authoring?: boolean
+  hardened?: boolean
+  hostCodexAuth?: boolean
   apiKeyFile?: string
 }): StandaloneInstanceRecord {
   const projectDirectory = absolute(input.projectDirectory, 'project directory')
@@ -85,6 +104,8 @@ function buildInstanceRecord(input: {
     createdAt: new Date().toISOString(),
     ...(input.webPort === undefined ? {} : { webPort: input.webPort }),
     authoring: input.authoring ?? false,
+    hardened: input.hardened ?? false,
+    hostCodexAuth: input.hostCodexAuth ?? false,
     ...(input.apiKeyFile === undefined ? {} : { apiKeyFile: absolute(input.apiKeyFile, 'API key file') }),
   })
 }
@@ -108,6 +129,8 @@ export function parseInstanceRecord(value: unknown): StandaloneInstanceRecord {
     typeof value.image !== 'string' || value.image.length === 0 ||
     typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) ||
     typeof value.authoring !== 'boolean' ||
+    (value.hardened !== undefined && typeof value.hardened !== 'boolean') ||
+    (value.hostCodexAuth !== undefined && typeof value.hostCodexAuth !== 'boolean') ||
     (value.webPort !== undefined && (!Number.isSafeInteger(value.webPort) || (value.webPort as number) < 1 || (value.webPort as number) > 65_535)) ||
     (value.apiKeyFile !== undefined && (typeof value.apiKeyFile !== 'string' || !isHostAbsolute(value.apiKeyFile)))
   ) throw new Error('Workflow MCP instance record is invalid or unsupported')
@@ -165,6 +188,10 @@ export function renderPosixInstanceEnvironment(record: StandaloneInstanceRecord)
     recorded_image: record.image,
     web_port: record.webPort === undefined ? '' : String(record.webPort),
     authoring: String(record.authoring),
+    // Absent = legacy record = the install's only shipped posture was the hardened one. See the
+    // encoding-contract comment on StandaloneInstanceRecord.
+    hardened: String(record.hardened ?? true),
+    host_codex_auth: String(record.hostCodexAuth ?? false),
     api_key_file: record.apiKeyFile ?? '',
   }
   // The POSIX launcher intentionally has no host Node/Python dependency. These assignments are

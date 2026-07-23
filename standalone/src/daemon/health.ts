@@ -67,6 +67,12 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
   await pathCheck(checks, 'workspace-readable', config.workspace, constants.R_OK | constants.X_OK)
   await pathCheck(checks, 'data-writable', config.dataDirectory, constants.R_OK | constants.W_OK | constants.X_OK)
   await pathCheck(checks, 'codex-executable', config.codexExecutable, constants.R_OK | constants.X_OK)
+  // The host-seeded credential is startup-validated, but doctor runs long after startup and the
+  // mount can go stale (host file rotated away, secret bind broken by an engine restart). Report
+  // it as its own named check so a failed agent spawn has a diagnosis instead of an EPIPE.
+  if (config.hostCodexAuthFile !== undefined) {
+    await pathCheck(checks, 'codex-auth-readable', config.hostCodexAuthFile, constants.R_OK)
+  }
   let layoutReady = false
   try {
     const inspection = inspectWorkflowDataLayout(config.dataDirectory)

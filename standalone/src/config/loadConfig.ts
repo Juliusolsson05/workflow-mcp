@@ -2,9 +2,12 @@ import { isAbsolute, join, resolve } from 'node:path'
 
 import {
   StandaloneConfigurationError,
+  type StandaloneApprovalMode,
   type StandaloneConfig,
   type StandaloneLeaseMode,
+  type StandaloneProfile,
   type StandaloneSourceMode,
+  type StandaloneWebAuthMode,
 } from './schema.js'
 import { hashProjectIdentity } from '../instance/record.js'
 
@@ -34,11 +37,39 @@ export function loadStandaloneConfig(
     1,
     65_535,
   )
+  // WHY the profile exists: the 2026-07 consumer simplification (see
+  // docs/CONSUMER_SIMPLIFICATION_PLAN.md) made single-user convenience the default posture and
+  // collapsed the original shipped posture into one opt-in `hardened` bit. Per-subsystem
+  // environment overrides stay available (tests, expert setups), but their DEFAULTS derive from
+  // the profile so that flipping one recorded bit cannot leave subsystems disagreeing about which
+  // product they are.
+  const profile = enumValue<StandaloneProfile>(
+    stringFlag(flags, 'profile') ?? environment.WORKFLOW_MCP_PROFILE ?? 'default',
+    'profile',
+    ['default', 'hardened'],
+  )
   const sourceMode = enumValue<StandaloneSourceMode>(
-    stringFlag(flags, 'source-mode') ?? environment.WORKFLOW_MCP_SOURCE_MODE ?? 'read-only',
+    stringFlag(flags, 'source-mode') ?? environment.WORKFLOW_MCP_SOURCE_MODE ??
+      (profile === 'hardened' ? 'read-only' : 'authoring'),
     'source-mode',
     ['read-only', 'authoring'],
   )
+  const approvalMode = enumValue<StandaloneApprovalMode>(
+    environment.WORKFLOW_MCP_APPROVAL_MODE ?? (profile === 'hardened' ? 'required' : 'none'),
+    'WORKFLOW_MCP_APPROVAL_MODE',
+    ['none', 'required'],
+  )
+  const webAuthMode = enumValue<StandaloneWebAuthMode>(
+    environment.WORKFLOW_MCP_WEB_AUTH ?? (profile === 'hardened' ? 'token' : 'none'),
+    'WORKFLOW_MCP_WEB_AUTH',
+    ['none', 'token'],
+  )
+  // The host-auth seed is optional in every profile: presence of the mounted file selects it, and
+  // the daemon composition validates readability. An explicit relative path is a configuration
+  // mistake worth failing loudly on rather than silently ignoring.
+  const hostCodexAuthFile = environment.WORKFLOW_MCP_CODEX_AUTH_FILE !== undefined
+    ? absolutePath(environment.WORKFLOW_MCP_CODEX_AUTH_FILE, 'WORKFLOW_MCP_CODEX_AUTH_FILE')
+    : undefined
   const defaultLease = process.platform === 'linux' ? 'inherited-flock' : 'embedded'
   const leaseMode = enumValue<StandaloneLeaseMode>(
     stringFlag(flags, 'lease') ?? environment.WORKFLOW_MCP_LEASE_MODE ?? defaultLease,
@@ -89,7 +120,11 @@ export function loadStandaloneConfig(
     dataDirectory,
     host: hostValue,
     port,
+    profile,
     sourceMode,
+    approvalMode,
+    webAuthMode,
+    ...(hostCodexAuthFile === undefined ? {} : { hostCodexAuthFile }),
     leaseMode,
     ...(lockFileDescriptor === undefined ? {} : { lockFileDescriptor }),
     ...(lockPath === undefined ? {} : { lockPath }),

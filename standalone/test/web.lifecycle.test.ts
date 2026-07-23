@@ -105,8 +105,13 @@ describe('browser detail lifecycle', () => {
     document.body.innerHTML = '<main id="app"></main>'
     let snapshots = 0
     let agentListings = 0
-    const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = String(input)
+      // The page now probes the API once with an empty bearer to detect the tokenless default
+      // profile. These suites exercise the hardened token flow, so answer that probe like a
+      // hardened daemon would: 401, which routes the page to the login form the tests drive.
+      const bearer = ((init?.headers ?? {}) as Record<string, string>).authorization ?? ""
+      if (bearer.trim() === "Bearer") return json({ schemaVersion: 1, error: { code: "unauthorized" } }, 401)
       if (url === '/api/v1/instance') return json({
         schemaVersion: 1,
         version: '1.0.0',
@@ -204,8 +209,13 @@ describe('browser detail lifecycle', () => {
     vi.useFakeTimers()
     document.body.innerHTML = '<main id="app"></main>'
     let instanceCalls = 0
-    const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = String(input)
+      // The page now probes the API once with an empty bearer to detect the tokenless default
+      // profile. These suites exercise the hardened token flow, so answer that probe like a
+      // hardened daemon would: 401, which routes the page to the login form the tests drive.
+      const bearer = ((init?.headers ?? {}) as Record<string, string>).authorization ?? ""
+      if (bearer.trim() === "Bearer") return json({ schemaVersion: 1, error: { code: "unauthorized" } }, 401)
       if (url === '/api/v1/instance') {
         instanceCalls += 1
         if (instanceCalls === 2) throw new TypeError('daemon restarting')
@@ -251,8 +261,13 @@ describe('browser detail lifecycle', () => {
   it('marks the header disconnected when the initial inventory request fails after authentication', async () => {
     vi.useFakeTimers()
     document.body.innerHTML = '<main id="app"></main>'
-    const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = String(input)
+      // The page now probes the API once with an empty bearer to detect the tokenless default
+      // profile. These suites exercise the hardened token flow, so answer that probe like a
+      // hardened daemon would: 401, which routes the page to the login form the tests drive.
+      const bearer = ((init?.headers ?? {}) as Record<string, string>).authorization ?? ""
+      if (bearer.trim() === "Bearer") return json({ schemaVersion: 1, error: { code: "unauthorized" } }, 401)
       if (url === '/api/v1/instance') return json({
         schemaVersion: 1,
         version: '1.0.0',
@@ -280,7 +295,10 @@ describe('browser detail lifecycle', () => {
 
     expect(document.querySelector('[data-role="connection-status"]')?.textContent).toContain('RETRYING')
     expect(document.querySelector('.run-list')?.textContent).toContain('temporarily unavailable')
-    expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/v1/instance')).toHaveLength(1)
+    // Two instance requests are correct now: the page-load tokenless probe (answered 401 by this
+    // hardened mock) plus the authenticated login. The invariant under test is unchanged — the
+    // failing INVENTORY path must not retrigger instance re-authentication loops.
+    expect(fetchMock.mock.calls.filter(([url]) => String(url) === '/api/v1/instance')).toHaveLength(2)
   })
 })
 

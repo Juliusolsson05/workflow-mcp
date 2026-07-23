@@ -11,6 +11,7 @@ const protectedEnvironmentNames = Object.freeze([
   'CODEX_API_KEY',
   'CODEX_ACCESS_TOKEN',
   'WORKFLOW_MCP_OPENAI_API_KEY_FILE',
+  'WORKFLOW_MCP_CODEX_AUTH_FILE',
   'WORKFLOW_MCP_ATTEMPT_PROFILE',
   'WORKFLOW_MCP_MCP_TOKEN',
   'WORKFLOW_MCP_WEB_TOKEN',
@@ -228,13 +229,20 @@ async function selfTest(profile) {
   const deniedReads = [
     '/data/secrets/mcp.token',
     '/run/secrets/openai_api_key',
+    '/run/secrets/host_codex_auth',
     '/proc/1/environ',
   ]
-  const configuredCredential = process.env.WORKFLOW_MCP_OPENAI_API_KEY_FILE
-  if (configuredCredential !== undefined && !deniedReads.includes(configuredCredential)) {
-    // WHY: the configured path is the real credential boundary. A safe hard-coded alias would let
-    // a mount/overlay drift expose the actual secret while the release probe still reported pass.
-    deniedReads.push(configuredCredential)
+  // WHY: the configured paths are the real credential boundary. A safe hard-coded alias would let
+  // a mount/overlay drift expose the actual secret while the release probe still reported pass.
+  // The host-seeded Codex credential joins the same probe: its bytes are exactly as sensitive as
+  // an API key, and its /run/secrets mount is only the default location, not a guarantee.
+  for (const configuredCredential of [
+    process.env.WORKFLOW_MCP_OPENAI_API_KEY_FILE,
+    process.env.WORKFLOW_MCP_CODEX_AUTH_FILE,
+  ]) {
+    if (configuredCredential !== undefined && !deniedReads.includes(configuredCredential)) {
+      deniedReads.push(configuredCredential)
+    }
   }
   for (const path of deniedReads) {
     let denied = false

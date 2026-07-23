@@ -90,6 +90,103 @@ CVE-2026-32631 describes a Git for Windows NTLM/network-drive behavior which is 
 Linux/musl image. A Git package revision change stops matching that rule and must be reviewed again;
 unfixed, low-risk, or inconvenient findings are not blanket-suppressed.
 
+### Hardened bootstrap (manual verification)
+
+The consumer `install.sh` performs these steps implicitly against a digest-pinned image. The
+commands below are the explicit, verify-every-byte-first path for operators who refuse to pipe a
+download into a shell:
+
+The commands below apply after the matching release is published. Set `VERSION` to an exact stable
+release such as `0.1.0`; do not use `latest` as an installation identity.
+
+```bash
+set -eu
+umask 077
+VERSION=0.1.0
+TAG="v$VERSION"
+ASSET="workflow-mcp-install-$VERSION.tar.gz"
+
+[ ! -e workflow-mcp-release ] || { echo "workflow-mcp-release already exists" >&2; exit 1; }
+[ ! -e workflow-mcp-bundle ] || { echo "workflow-mcp-bundle already exists" >&2; exit 1; }
+mkdir workflow-mcp-release
+gh release download "$TAG" \
+  --repo Juliusolsson05/workflow-mcp \
+  --dir workflow-mcp-release
+gh release verify "$TAG" --repo Juliusolsson05/workflow-mcp
+for FILE in workflow-mcp-release/*; do
+  gh release verify-asset "$TAG" "$FILE" --repo Juliusolsson05/workflow-mcp
+  gh attestation verify "$FILE" --repo Juliusolsson05/workflow-mcp
+done
+(cd workflow-mcp-release && {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum --check SHA256SUMS
+  else shasum -a 256 --check SHA256SUMS
+  fi
+})
+
+mkdir workflow-mcp-bundle
+tar -xzf "workflow-mcp-release/$ASSET" -C workflow-mcp-bundle
+(cd workflow-mcp-bundle && {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum --check SHA256SUMS
+  else shasum -a 256 --check SHA256SUMS
+  fi
+})
+./workflow-mcp-bundle/workflow-mcp-docker install /absolute/path/to/project
+/absolute/path/to/project/.workflow-mcp/workflow-mcp-docker up
+```
+
+The release is deliberately not installed by piping a mutable URL to a shell. GitHub's immutable
+release attestation establishes publisher/tag/asset identity; the release checksum covers the
+download; the bundle's second checksum covers every file after extraction.
+
+On Windows, use PowerShell 7 and Docker Desktop in Linux-container mode. The equivalent clean
+install verifies every downloaded asset before executing the PowerShell launcher:
+
+```powershell
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$Version = "0.1.0"
+$Tag = "v$Version"
+$Release = Join-Path $PWD "workflow-mcp-release"
+$Bundle = Join-Path $PWD "workflow-mcp-bundle"
+function Assert-Native([string] $Operation) { if ($LASTEXITCODE -ne 0) { throw "$Operation failed" } }
+function New-VerifiedDirectory([string] $Path) {
+  if ($Path -match '[\p{Cc}\p{Cf}]') { throw "Extraction path contains terminal control, bidi, or format characters" }
+  $Full = [IO.Path]::GetFullPath($Path)
+  if ($Full -match '[\p{Cc}\p{Cf}]') { throw "Extraction path contains terminal control, bidi, or format characters" }
+  if ($Full -notmatch '^[A-Za-z]:[\\/]' -or $Full -match '^\\\\[?.]\\') { throw "Only local drive-qualified extraction paths are supported" }
+  if ($null -ne (Get-Item -Force -LiteralPath $Full -ErrorAction SilentlyContinue)) { throw "Extraction path already exists: $Full" }
+  $Parent = Get-Item -Force -LiteralPath ([IO.Path]::GetDirectoryName($Full))
+  if ($Parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Extraction parent may not be redirected: $($Parent.FullName)" }
+  New-Item -ItemType Directory -Path $Full | Out-Null
+}
+New-VerifiedDirectory $Release
+New-VerifiedDirectory $Bundle
+gh release download $Tag --repo Juliusolsson05/workflow-mcp --dir $Release
+Assert-Native "release download"
+gh release verify $Tag --repo Juliusolsson05/workflow-mcp
+Assert-Native "immutable release verification"
+Get-ChildItem -File $Release | ForEach-Object {
+  gh release verify-asset $Tag $_.FullName --repo Juliusolsson05/workflow-mcp
+  Assert-Native "release asset verification"
+  gh attestation verify $_.FullName --repo Juliusolsson05/workflow-mcp
+  Assert-Native "release asset attestation verification"
+}
+Get-Content (Join-Path $Release "SHA256SUMS") | ForEach-Object {
+  if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Malformed release checksum" }
+  if ((Get-FileHash -Algorithm SHA256 (Join-Path $Release $Matches[2])).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "Release checksum mismatch" }
+}
+tar -xzf (Join-Path $Release "workflow-mcp-install-$Version.tar.gz") -C $Bundle
+Assert-Native "bundle extraction"
+Get-Content (Join-Path $Bundle "SHA256SUMS") | ForEach-Object {
+  if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Malformed bundle checksum" }
+  if ((Get-FileHash -Algorithm SHA256 (Join-Path $Bundle $Matches[2])).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "Bundle checksum mismatch" }
+}
+pwsh -NoProfile -File (Join-Path $Bundle "workflow-mcp-docker.ps1") install C:\absolute\project
+Assert-Native "Workflow MCP installation"
+pwsh -NoProfile -File C:\absolute\project\.workflow-mcp\workflow-mcp-docker.ps1 up
+Assert-Native "Workflow MCP startup"
+```
+
 ## Out of scope and unsupported configurations
 
 Reports that also reproduce in a supported configuration are welcome. The following configurations

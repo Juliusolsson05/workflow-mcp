@@ -99,9 +99,15 @@ jobs:
           WORKFLOW_MCP_WORKFLOW_DIR: ${{ github.workspace }}/.claude/workflows
           WORKFLOW_MCP_PORT: "7331"
           WORKFLOW_MCP_OPENAI_API_KEY_FILE: ${{ runner.temp }}/unused-api-key
+          WORKFLOW_MCP_HOST_CODEX_AUTH: ${{ runner.temp }}/unused-codex-auth
         run: |
-          touch "$WORKFLOW_MCP_OPENAI_API_KEY_FILE"
+          touch "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" "$WORKFLOW_MCP_HOST_CODEX_AUTH"
           docker compose -f standalone/compose.yaml config --quiet
           docker compose -f standalone/compose.yaml -f standalone/compose.web.yaml config --quiet
           docker compose -f standalone/compose.yaml -f standalone/compose.authoring.yaml config --quiet
           docker compose -f standalone/compose.yaml -f standalone/compose.auth-api-key.yaml config --quiet
+          docker compose -f standalone/compose.yaml -f standalone/compose.auth-host-codex.yaml config --quiet
+          docker compose -f standalone/compose.yaml -f standalone/compose.hardened.yaml config --quiet
+          # The hardened overlay must re-narrow the project bind, not merely add an env var.
+          docker compose -f standalone/compose.yaml -f standalone/compose.hardened.yaml config |
+            grep -A6 'target: /workspace' | grep -q 'read_only: true'

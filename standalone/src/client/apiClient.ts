@@ -143,7 +143,7 @@ export type InstanceSummary = {
     workspace: '/workspace'
     mountMode: 'project-read-only' | 'workflow-authoring'
     authentication: {
-      mode: 'api-key-secret' | 'interactive'
+      mode: 'api-key-secret' | 'host-codex' | 'interactive'
       status: 'configured' | 'operator-check-required'
     }
     startedAt: string
