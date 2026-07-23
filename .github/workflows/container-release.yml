@@ -295,7 +295,7 @@ jobs:
               const labels=JSON.parse(process.argv[1]);
               if(labels["org.opencontainers.image.revision"]!==process.env.GITHUB_SHA) process.exit(1);
               if(labels["org.opencontainers.image.version"]!==process.argv[2]) process.exit(1);
-              if(labels["io.modelcontextprotocol.server.name"]!=="io.github.juliusolsson05/workflow-mcp") process.exit(1);
+              if(labels["io.modelcontextprotocol.server.name"]!=="io.github.Juliusolsson05/workflow-mcp") process.exit(1);
             ' "$raw" "${{ needs.validate.outputs.version }}"
             raw=$(docker buildx imagetools inspect --raw "$IMAGE@$attestation")
             node -e '

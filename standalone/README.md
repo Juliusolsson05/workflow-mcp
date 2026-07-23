@@ -29,7 +29,7 @@ with `docker compose exec`; disconnecting one MCP client therefore does not canc
 runs. A session-bound STDIO image mode also exists for generic OCI/MCP registries, but it has a
 narrower lifecycle contract.
 
-<!-- mcp-name: io.github.juliusolsson05/workflow-mcp -->
+<!-- mcp-name: io.github.Juliusolsson05/workflow-mcp -->
 
 ## Install
 

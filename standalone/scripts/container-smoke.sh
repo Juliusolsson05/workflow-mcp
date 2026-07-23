@@ -158,7 +158,7 @@ docker run --rm --network none --read-only --user 10001:10001 \
 healthcheck=$(docker image inspect "$image" --format '{{json .Config.Healthcheck}}')
 [ "$healthcheck" = null ] || { echo "image embeds a transport-specific healthcheck: $healthcheck" >&2; exit 1; }
 label=$(docker image inspect "$image" --format '{{index .Config.Labels "io.modelcontextprotocol.server.name"}}')
-[ "$label" = io.github.juliusolsson05/workflow-mcp ] || { echo "MCP ownership label drifted" >&2; exit 1; }
+[ "$label" = io.github.Juliusolsson05/workflow-mcp ] || { echo "MCP ownership label drifted" >&2; exit 1; }
 expected_version=$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
 
 # This is the MCP Registry runtimeArguments profile, including its anonymous `/data` volume. Keep
