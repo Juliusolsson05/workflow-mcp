@@ -249,8 +249,12 @@ export type {
 
 export { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
 export type { WorkflowMcpRegistrationHooks } from './workflowMcp.js'
-export { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
-export type { WorkflowMcpHttpServer } from './standaloneServer.js'
+export {
+  createWorkflowMcpHttpHandler,
+  serveWorkflowMcpHttp,
+  serveWorkflowMcpStdio,
+} from './standaloneServer.js'
+export type { WorkflowMcpHttpHandler, WorkflowMcpHttpServer } from './standaloneServer.js'
 export type {
   JournalAgentOptions,
   JournalCall,

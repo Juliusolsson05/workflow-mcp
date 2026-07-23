@@ -1,0 +1,32 @@
+{
+  "name": "@workflow-mcp/standalone",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Docker-first daemon, MCP proxy, and local interfaces for Workflow MCP.",
+  "type": "module",
+  "bin": {
+    "workflow-mcp": "./dist/cli/main.js"
+  },
+  "scripts": {
+    "clean": "node ./scripts/clean.mjs",
+    "build": "npm run clean && tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && vitest run",
+    "check:imports": "node ./scripts/check-imports.mjs",
+    "check": "npm run typecheck && npm run test && npm run check:imports"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "workflow-mcp": "file:..",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "license": "MIT"
+}
