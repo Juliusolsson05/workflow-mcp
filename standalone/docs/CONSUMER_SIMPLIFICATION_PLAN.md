@@ -389,10 +389,14 @@ either order; everything else is sequential.
 
 ## 10. Risks and their answers
 
-- **Existing installs flip behavior on upgrade.** Upgrade path already quiesces and
-  re-records (`workflow-mcp-docker:641-727`); PR4 makes `upgrade` preserve the recorded
-  profile (an un-flagged old install upgrades into `hardened: false` defaults only on
-  explicit `upgrade --profile=default`, otherwise keeps behaving as installed).
+- **Existing installs flip behavior on upgrade.** Solved through the record encoding rather
+  than an upgrade flag: every record written by this release carries an explicit
+  `hardened: true|false`, so a record where the field is ABSENT is by construction from a
+  pre-profile release — and the launchers map that absence to hardened, preserving the
+  installed posture across upgrades forever. Adopting the relaxed defaults is an explicit
+  `uninstall` (data preserved) + `install --adopt-instance=<id>`. Upgrade staging/rollback
+  also treats the two new overlay files as optional-when-absent so a pre-profile bundle can
+  actually reach this release.
 - **Writable workspace + agent mistakes.** That is agent-code parity and the accepted
   product trade; the `.codex` mask and `/data` denials still stand, and every run's diffs
   are ordinary project-file edits the user reviews in git like any agent edit.

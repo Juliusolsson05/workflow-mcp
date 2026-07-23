@@ -69,6 +69,9 @@ if (Test-Path -LiteralPath (Join-Path $ScriptDirectory "compose.yaml")) {
   $BundleRoot = Split-Path -Parent $ScriptDirectory
 }
 $UpgradeNames = @("LICENSE", "compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.auth-host-codex.yaml", "compose.hardened.yaml", "compose.project-codex-mask.yaml", "workflow-mcp-docker", "workflow-mcp-docker.ps1", "version.env", "SHA256SUMS", ".gitignore", "instance.json")
+# Overlays introduced by the consumer-defaults release: absent from older installed bundles by
+# definition, so upgrade staging/recovery treats their absence as "older bundle", not corruption.
+$OptionalUpgradeNames = @("compose.auth-host-codex.yaml", "compose.hardened.yaml")
 
 function Write-InstalledChecksumManifest([string] $TargetDirectory) {
   $Source = Join-Path $BundleRoot "SHA256SUMS"
@@ -103,13 +106,21 @@ function Restore-InterruptedUpgrade([string] $Installation) {
   $Rollback = Join-Path $Installation ".upgrade-rollback"
   foreach ($Name in $UpgradeNames) {
     if (-not (Test-Path -LiteralPath (Join-Path $Rollback $Name) -PathType Leaf)) {
+      if ($OptionalUpgradeNames -contains $Name) { continue }
       Fail "upgrade rollback is incomplete: $Name"
     }
   }
   # Rollback bytes are copied and atomically moved one at a time while the marker remains. If the
   # host stops during recovery, the next invocation safely repeats the whole restoration before it
-  # reads version/image authority from what might otherwise be a mixed public bundle.
+  # reads version/image authority from what might otherwise be a mixed public bundle. An optional
+  # overlay absent from the rollback means the OLD bundle predates it: restoring means removing
+  # any half-switched new copy, not failing on the missing old one.
   foreach ($Name in $UpgradeNames) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Rollback $Name) -PathType Leaf)) {
+      $Stale = Join-Path $Installation $Name
+      if (Test-Path -LiteralPath $Stale) { Remove-Item -Force -LiteralPath $Stale }
+      continue
+    }
     $Temporary = Join-Path $Installation ".recover-$Name-$([Guid]::NewGuid().ToString('N'))"
     Copy-Item -LiteralPath (Join-Path $Rollback $Name) -Destination $Temporary
     Move-Item -Force -LiteralPath $Temporary -Destination (Join-Path $Installation $Name)
@@ -265,8 +276,10 @@ function Load-Instance([string] $ProjectPath) {
     Test-AuthoringPath $false
     $env:WORKFLOW_MCP_WORKFLOW_DIR = Join-Path $script:ProjectDirectory ".claude/workflows"
   }
+  # Absent = legacy pre-profile record whose only shipped posture WAS hardened; an upgrade must
+  # never silently relax it. See the encoding contract in standalone/src/instance/record.ts.
   $HardenedProperty = $script:Instance.PSObject.Properties["hardened"]
-  $script:InstanceHardened = ($null -ne $HardenedProperty -and $HardenedProperty.Value -eq $true)
+  $script:InstanceHardened = ($null -eq $HardenedProperty) -or ($HardenedProperty.Value -eq $true)
   if ($script:InstanceHardened) { $env:WORKFLOW_MCP_PROFILE = "hardened" }
   # Only the boolean is recorded; the path is re-resolved from the live Codex home each command so
   # host-side rotation keeps working. A missing file downgrades to container-interactive auth.
@@ -277,7 +290,9 @@ function Load-Instance([string] $ProjectPath) {
       -not ((Get-Item -Force -LiteralPath $LiveCodexAuth).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
       $env:WORKFLOW_MCP_HOST_CODEX_AUTH = $LiveCodexAuth
     } else {
-      Write-Host "Host Codex credential not found at $LiveCodexAuth; starting without inherited auth."
+      # stderr, never stdout: mcp-proxy's stdout is exclusively MCP JSON-RPC, and Write-Host
+      # renders to the redirected stdout pipe under pwsh, corrupting the protocol handshake.
+      [Console]::Error.WriteLine("Host Codex credential not found at $LiveCodexAuth; starting without inherited auth.")
     }
   }
   $ApiKeyProperty = $script:Instance.PSObject.Properties["apiKeyFile"]
@@ -325,6 +340,33 @@ function Compose-Arguments() {
 function Invoke-Compose([string[]] $Arguments) {
   & docker @((Compose-Arguments) + $Arguments)
   if ($LASTEXITCODE -ne 0) { Fail "Docker Compose command failed" }
+}
+
+# Mirrors the POSIX host_port_in_use: probe from inside the pinned image via host.docker.internal
+# (built into Docker Desktop; host-gateway supplies it on native engines) so the launcher needs no
+# host-side network tooling.
+function Test-HostPortInUse([int] $Port) {
+  & docker run --rm --add-host=host.docker.internal:host-gateway `
+    --entrypoint /usr/local/bin/node $Image -e @'
+const socket = require("node:net").connect(Number(process.argv[1]), "host.docker.internal");
+socket.on("connect", () => { socket.destroy(); process.exit(0) });
+socket.on("error", () => process.exit(1));
+setTimeout(() => process.exit(1), 1500);
+'@ "$Port" 2>$null | Out-Null
+  return ($LASTEXITCODE -eq 0)
+}
+
+# A colliding dashboard port degrades to "no web this start" instead of failing the daemon;
+# Codex connectivity outranks the dashboard. Explicit --web-port installs keep the loud failure.
+function Invoke-WebPortPreflight() {
+  if ($null -eq $script:InstanceWebPort) { return }
+  $Running = (& docker @((Compose-Arguments) + @("ps", "--status", "running", "--quiet", "workflow-mcp"))) 2>$null
+  if (-not [string]::IsNullOrWhiteSpace([string]$Running)) { return }
+  if (Test-HostPortInUse ([int]$script:InstanceWebPort)) {
+    [Console]::Error.WriteLine("Port $script:InstanceWebPort is already in use; starting without the web UI. Free the port (or reinstall with --web-port) and run up again.")
+    $script:InstanceWebPort = $null
+    Remove-Item Env:WORKFLOW_MCP_PORT -ErrorAction SilentlyContinue
+  }
 }
 
 function Attest-Volume() {
@@ -497,8 +539,9 @@ function Install-Command() {
   # Default profile: the tokenless read-only dashboard is on unless opted out; an old engine only
   # downgrades this default with the one-line fix, while an EXPLICIT --web-port keeps the hard
   # Host-Doctor refusal above. Mirrors the POSIX launcher exactly.
+  $DefaultWebSelected = $false
   if ($null -eq $WebPort -and -not $NoWeb -and -not $Hardened) {
-    if ([Version]$script:DockerServerVersion -ge [Version]"28.3.3") { $WebPort = 7331 }
+    if ([Version]$script:DockerServerVersion -ge [Version]"28.3.3") { $WebPort = 7331; $DefaultWebSelected = $true }
     else { Write-Host "Web UI disabled: loopback publication needs Docker Engine 28.3.3+ (found $script:DockerServerVersion). Update Docker, then reinstall." }
   }
   # Host Codex credential detection: record only the boolean; the live path is re-resolved every
@@ -514,6 +557,18 @@ function Install-Command() {
   docker image inspect $Image 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) { docker pull $Image | Out-Null }
   Set-DockerDaemonFingerprint
+  # Defaulted dashboard ports negotiate a free port from a fixed range (after the pull, because
+  # the probe runs inside the pinned image); explicit --web-port keeps exact-port semantics.
+  if ($DefaultWebSelected) {
+    $ScanPort = [int]$WebPort
+    $WebPort = $null
+    while ($ScanPort -le 7350) {
+      if (-not (Test-HostPortInUse $ScanPort)) { $WebPort = $ScanPort; break }
+      $ScanPort += 1
+    }
+    if ($null -eq $WebPort) { Write-Host "No free dashboard port in 7331-7350; installing without the web UI." }
+    elseif ($WebPort -ne 7331) { Write-Host "Port 7331 is in use; the dashboard will use http://127.0.0.1:$WebPort." }
+  }
   # Fail every ownership conflict before creating authoring/config/installation directories. A
   # rejected adoption must leave the project byte-for-byte outside Workflow MCP's authority.
   if (-not $NoCodex) { Test-CodexStanzaPreflight }
@@ -722,7 +777,10 @@ function Upgrade-Command() {
   try {
     foreach ($Name in $UpgradeNames) {
       $Existing = Join-Path $script:Installation $Name
-      if (-not (Test-Path -LiteralPath $Existing -PathType Leaf)) { Fail "installed bundle is incomplete: $Name" }
+      if (-not (Test-Path -LiteralPath $Existing -PathType Leaf)) {
+        if ($OptionalUpgradeNames -contains $Name) { continue }
+        Fail "installed bundle is incomplete: $Name"
+      }
       Copy-Item -LiteralPath $Existing -Destination (Join-Path $RollbackStage $Name)
     }
     foreach ($Name in @("compose.yaml", "compose.web.yaml", "compose.authoring.yaml", "compose.auth-api-key.yaml", "compose.auth-host-codex.yaml", "compose.hardened.yaml", "compose.project-codex-mask.yaml")) {
@@ -965,7 +1023,7 @@ function Restore-Command() {
 switch ($Command) {
   "install" { Install-Command }
   "upgrade" { Upgrade-Command }
-  "up" { if ($Rest.Count -ne 0) { Fail "up accepts a project path only" }; Load-Instance $Project; Require-RuntimeApiKey; if ($script:Instance.authoring) { Test-AuthoringPath $true }; Invoke-Compose @("create"); Attest-Volume; Invoke-Compose @("up", "--detach", "--wait") }
+  "up" { if ($Rest.Count -ne 0) { Fail "up accepts a project path only" }; Load-Instance $Project; Require-RuntimeApiKey; if ($script:Instance.authoring) { Test-AuthoringPath $true }; Invoke-WebPortPreflight; Invoke-Compose @("create"); Attest-Volume; Invoke-Compose @("up", "--detach", "--wait") }
   "down" { if ($Rest.Count -ne 0) { Fail "down accepts a project path only" }; Load-Instance $Project; Invoke-Compose @("down", "--remove-orphans") }
   "status" {
     if ($Rest.Count -gt 1 -or ($Rest.Count -eq 1 -and $Rest[0] -ne "--json")) { Fail "status accepts only --json" }
@@ -996,6 +1054,7 @@ switch ($Command) {
     if ([string]::IsNullOrWhiteSpace([string]$Running)) {
       Require-RuntimeApiKey
       if ($script:Instance.authoring) { Test-AuthoringPath $true }
+      Invoke-WebPortPreflight
       Invoke-Compose @("create") | Out-Null
       Attest-Volume
       Invoke-Compose @("up", "--detach", "--wait") | Out-Null

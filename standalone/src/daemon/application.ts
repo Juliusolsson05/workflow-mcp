@@ -140,7 +140,11 @@ async function createCodexProvider(
   // stays container-side, and deleting the host file acts as durable logout. This is the same
   // never-let-the-child-write-the-source shape agent-code uses, and it is why a read-only bind
   // cannot break Codex refresh. Validate the mount here so a broken bind fails startup loudly
-  // instead of surfacing as an EPIPE from the first spawned agent.
+  // instead of surfacing as an EPIPE from the first spawned agent. The check must actually READ
+  // the bytes, not just lstat: Compose file secrets are bind mounts that keep the host file's
+  // real owner and mode, so a native-Linux 0600 file stats fine yet EACCESes on open for UID
+  // 10001. The launcher preflights readability with the same UID before setting this variable,
+  // so failing loudly here catches only genuine drift between preflight and start.
   if (config.hostCodexAuthFile !== undefined) {
     const seed = await lstat(config.hostCodexAuthFile).catch(() => undefined)
     if (seed === undefined || !seed.isFile() || seed.isSymbolicLink()) {
@@ -149,6 +153,14 @@ async function createCodexProvider(
         'Mounted host Codex credential must be an ordinary readable file',
       )
     }
+    const seedBytes = await readFile(config.hostCodexAuthFile).catch(() => undefined)
+    if (seedBytes === undefined) {
+      throw credentialError(
+        'authentication-failed',
+        'Mounted host Codex credential is not readable by UID 10001; grant read access on the host (native Linux: setfacl -m u:10001:r <file>) and restart',
+      )
+    }
+    seedBytes.fill(0)
   }
   const isolation = {
     codexHome: join(config.dataDirectory, 'codex-home'),

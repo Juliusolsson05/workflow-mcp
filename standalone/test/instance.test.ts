@@ -128,6 +128,18 @@ describe('installation instance identity', () => {
     expect(output.split('\n')).toHaveLength(13)
     expect(output).toContain("hardened='false'")
     expect(output).toContain("host_codex_auth='false'")
+
+    // Encoding contract: a record with NO hardened field is from a pre-profile release whose only
+    // shipped posture was the hardened one — it must render hardened, never silently relax on
+    // upgrade. New records always carry the explicit boolean, which is what disambiguates them.
+    const legacy = parseInstanceRecord(JSON.parse(JSON.stringify({
+      ...record,
+      hardened: undefined,
+      hostCodexAuth: undefined,
+    })))
+    const legacyOutput = renderPosixInstanceEnvironment(legacy)
+    expect(legacyOutput).toContain("hardened='true'")
+    expect(legacyOutput).toContain("host_codex_auth='false'")
   })
 
   it('combines attested host and container diagnostics into one versioned report', async () => {

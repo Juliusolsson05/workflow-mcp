@@ -60,6 +60,18 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+# Pin the Codex home to a fixture: the default install inherits the HOST's real ~/.codex/auth.json
+# by design, and a release gate must never mount a maintainer's live credential into throwaway
+# containers (CI was only clean by accident of runners having no Codex login). The fixture also
+# makes host-auth detection deterministic in CI: the overlay path is exercised everywhere, with
+# public modes so UID 10001 can read the seed through a native-Linux bind.
+CODEX_HOME=$temporary/codex-home
+export CODEX_HOME
+mkdir -p "$CODEX_HOME"
+printf '{"OPENAI_API_KEY":null,"tokens":{"access_token":"smoke-fixture","refresh_token":"smoke-fixture"}}\n' > "$CODEX_HOME/auth.json"
+chmod 0755 "$CODEX_HOME"
+chmod 0644 "$CODEX_HOME/auth.json"
+
 mkdir -p "$project/.claude/workflows"
 # macOS exposes /var through /private/var. Installation intentionally records `pwd -P`, so the
 # expected generated command must use that same canonical spelling rather than the mktemp alias.
@@ -264,7 +276,18 @@ if grep -q '"id":"container-availability"' "$temporary/detailed-failure-doctor.j
   exit 1
 fi
 "$installed" down
-"$installed" up
+# The restart doubles as the auto-up contract check: mcp-proxy against a stopped daemon must
+# start it itself (Codex connecting is the real lifecycle trigger) while its stdout carries ONLY
+# MCP JSON-RPC — every recovery-start progress byte belongs on stderr. Any Compose noise on
+# stdout makes the first-line JSON assertion fail.
+cat > "$temporary/auto-up-requests.jsonl" <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"auto-up-smoke","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workflow_list","arguments":{}}}
+EOF
+"$installed" mcp-proxy < "$temporary/auto-up-requests.jsonl" > "$temporary/auto-up-responses.jsonl" 2>"$temporary/auto-up-stderr.log"
+head -c 1 "$temporary/auto-up-responses.jsonl" | grep -q '{'
+grep -q '"release-smoke"' "$temporary/auto-up-responses.jsonl"
 "$installed" ui --snapshot > "$temporary/ui-snapshot.txt"
 grep -q '^Workflow MCP ' "$temporary/ui-snapshot.txt"
 
@@ -343,11 +366,22 @@ cat > "$temporary/requests.jsonl" <<'EOF'
 {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workflow_run","arguments":{"name":"release-smoke","idempotencyKey":"published-release-smoke"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"workflow_run","arguments":{"script":"export const meta = { name: 'inline-default-smoke', description: 'Default profile inline authoring' }\nreturn 'inline authoring ran without approval'","idempotencyKey":"published-inline-default"}}}
 EOF
 "$installed" mcp-proxy < "$temporary/requests.jsonl" > "$temporary/responses.jsonl"
 grep -q '"workflow_list"' "$temporary/responses.jsonl"
 grep -q '"id":3' "$temporary/responses.jsonl"
 grep -q '"ok":true' "$temporary/responses.jsonl"
+# The product's headline default flow: an inline-authored workflow persists AND runs with no
+# approval step. A source-approval-required refusal here means the default profile regressed
+# into the hardened gate. (Match the exact error tokens — tool descriptions legitimately contain
+# the word "approval".)
+if grep -Eq 'source-approval-required|authoring-disabled|Workflow source approval is required' "$temporary/responses.jsonl"; then
+  echo 'default profile demanded source approval for inline-authored workflow' >&2
+  exit 1
+fi
+grep -q '"inline-default-smoke"' "$temporary/responses.jsonl"
+test -f "$project/.claude/workflows/inline-default-smoke.js"
 run_id=$(docker run --rm --network none --read-only -i --entrypoint /usr/local/bin/node \
   "$installed_image" -e '
   const fs=require("node:fs");

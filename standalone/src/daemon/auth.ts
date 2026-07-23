@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { lstatSync } from 'node:fs'
+import { accessSync, constants, lstatSync } from 'node:fs'
 import { join } from 'node:path'
 
 import type { WorkflowService } from 'workflow-mcp'
@@ -55,11 +55,14 @@ export class CodexCredentialBroker {
     }
     if (this.#hostCodexAuthFile !== undefined) {
       // Host-inherited auth: the mounted file only SEEDS the isolated home (rotation stays
-      // container-side), so status is a cheap mount-shape check rather than a Codex spawn. The
+      // container-side), so status is a cheap mount check rather than a Codex spawn. The
       // authoritative login state belongs to the host's own `codex login`; reporting anything
       // deeper here would race the host CLI over a file this daemon deliberately never writes.
+      // Readability matters as much as shape: a bind-mounted 0600 host file stats fine but
+      // EACCESes for UID 10001 on native Linux, and status must not call that "authenticated".
       const seed = lstatSyncSafe(this.#hostCodexAuthFile)
-      const usable = seed !== undefined && seed.isFile() && !seed.isSymbolicLink()
+      const usable = seed !== undefined && seed.isFile() && !seed.isSymbolicLink() &&
+        readableSync(this.#hostCodexAuthFile)
       return Object.freeze({
         schemaVersion: 1,
         mode: 'host-codex',
@@ -164,6 +167,15 @@ function lstatSyncSafe(path: string): ReturnType<typeof lstatSync> | undefined {
     return lstatSync(path)
   } catch {
     return undefined
+  }
+}
+
+function readableSync(path: string): boolean {
+  try {
+    accessSync(path, constants.R_OK)
+    return true
+  } catch {
+    return false
   }
 }
 

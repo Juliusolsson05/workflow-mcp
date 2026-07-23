@@ -21,11 +21,20 @@ RELEASE_REVISION='__WORKFLOW_MCP_RELEASE_REVISION__'
 
 fail() { printf 'workflow-mcp install: %s\n' "$1" >&2; exit 1; }
 
+# WHY the sentinel comparisons are assembled from two halves: the release pipeline reruns a plain
+# `sed s/__WORKFLOW_MCP_RELEASE_.*__/value/` over this whole file. A literal placeholder inside a
+# comparison would be rewritten too, making the rendered value equal its own "unrendered" guard —
+# every published script would refuse to run, and the version/revision passthroughs would compare
+# equal and silently drop their flags. Splitting the token keeps the guards invisible to sed.
+sentinel_prefix='__WORKFLOW_MCP_'
+unrendered_image="${sentinel_prefix}RELEASE_IMAGE__"
+unrendered_version="${sentinel_prefix}RELEASE_VERSION__"
+unrendered_revision="${sentinel_prefix}RELEASE_REVISION__"
+
 image=${WORKFLOW_MCP_IMAGE:-$RELEASE_IMAGE}
-case "$image" in
-  __WORKFLOW_MCP_RELEASE_IMAGE__)
-    fail 'unrendered development copy; set WORKFLOW_MCP_IMAGE to a local image or use a released install.sh' ;;
-esac
+if [ "$image" = "$unrendered_image" ]; then
+  fail 'unrendered development copy; set WORKFLOW_MCP_IMAGE to a local image or use a released install.sh'
+fi
 
 project=${1:-$PWD}
 [ -d "$project" ] || fail "project directory does not exist: $project"
@@ -43,8 +52,8 @@ docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
 staging=$(mktemp -d "${TMPDIR:-/tmp}/workflow-mcp-bootstrap.XXXXXX")
 trap 'rm -rf "$staging"' EXIT HUP INT TERM
 set -- --output=/render/bundle "--image=$image"
-[ "$RELEASE_VERSION" = '__WORKFLOW_MCP_RELEASE_VERSION__' ] || set -- "$@" "--version=$RELEASE_VERSION"
-[ "$RELEASE_REVISION" = '__WORKFLOW_MCP_RELEASE_REVISION__' ] || set -- "$@" "--revision=$RELEASE_REVISION"
+[ "$RELEASE_VERSION" = "$unrendered_version" ] || set -- "$@" "--version=$RELEASE_VERSION"
+[ "$RELEASE_REVISION" = "$unrendered_revision" ] || set -- "$@" "--revision=$RELEASE_REVISION"
 docker run --rm --network none --read-only --user "$(id -u):$(id -g)" \
   -v "$staging:/render" "$image" bundle-render "$@" >/dev/null
 
@@ -57,7 +66,13 @@ sh "$staging/bundle/workflow-mcp-docker" install "$project"
 shim_dir=${WORKFLOW_MCP_BIN:-$HOME/.local/bin}
 shim=$shim_dir/workflow-mcp
 mkdir -p "$shim_dir"
-if [ ! -e "$shim" ] || grep -q 'workflow-mcp shim v1' "$shim" 2>/dev/null; then
+# A symlink at the shim name — including a dangling one that `! -e` would treat as absent — must
+# never be followed: the heredoc write below would land at the link's target with this user's
+# authority (e.g. a planted link to ~/.ssh/authorized_keys). Only a real file we wrote, or true
+# absence, is overwritable.
+if [ -L "$shim" ]; then
+  printf 'Skipped PATH shim: %s is a symlink; remove it and rerun to install the shim.\n' "$shim"
+elif [ ! -e "$shim" ] || grep -q 'workflow-mcp shim v1' "$shim" 2>/dev/null; then
   cat > "$shim" <<'SHIM'
 #!/bin/sh
 # workflow-mcp shim v1: dispatch to the nearest project-installed launcher.
