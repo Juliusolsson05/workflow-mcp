@@ -21,7 +21,7 @@ const output = resolve(options.output)
 await mkdir(output, { recursive: true, mode: 0o700 })
 const server = JSON.parse(await readFile(join(root, 'distribution/mcp-registry/server.json'), 'utf8'))
 server.version = options.version
-server.packages[0].identifier = `docker.io/juliusolsson05/workflow-mcp@${options.digest}`
+server.packages[0].identifier = `docker.io/juliusolsson/workflow-mcp@${options.digest}`
 await writeFile(join(output, 'server.json'), `${JSON.stringify(server, null, 2)}\n`, { mode: 0o600 })
 
 const template = await readFile(join(root, 'distribution/docker-catalog/server.template.yaml'), 'utf8')

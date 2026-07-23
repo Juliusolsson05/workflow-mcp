@@ -52,7 +52,7 @@ for (const [name, value] of [
 if (!server.description.includes('Session-bound') || !server.description.includes('State is discarded')) {
   throw new Error('MCP Registry metadata must disclose its ephemeral compatibility lifecycle')
 }
-if (server.packages[0].identifier !== `docker.io/juliusolsson05/workflow-mcp:${packageDocument.version}`) {
+if (server.packages[0].identifier !== `docker.io/juliusolsson/workflow-mcp:${packageDocument.version}`) {
   throw new Error('MCP Registry image/version differs from the standalone release')
 }
 if (!/io\.modelcontextprotocol\.server\.name="io\.github\.juliusolsson05\/workflow-mcp"/.test(dockerfile)) {
@@ -156,7 +156,7 @@ if (activeGrypeConfiguration !== [
 ].join('\n')) {
   throw new Error('Grype suppression must remain the one exact Linux-inapplicable Git for Windows advisory')
 }
-if (!catalog.includes('image: docker.io/juliusolsson05/workflow-mcp:${VERSION}') || !catalog.includes('commit: ${REVISION}')) {
+if (!catalog.includes('image: docker.io/juliusolsson/workflow-mcp:${VERSION}') || !catalog.includes('commit: ${REVISION}')) {
   throw new Error('Docker Catalog metadata must retain explicit release substitution tokens')
 }
 const renderedCatalog = catalog
