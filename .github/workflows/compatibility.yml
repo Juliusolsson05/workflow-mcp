@@ -32,7 +32,7 @@ jobs:
           # WHY: current-ecosystem qualification must execute the real Bubblewrap boundary. Ubuntu
           # 24.04 AppArmor and the runner's generic clone control can independently deny the nested
           # namespace and measure the runner image instead of Workflow MCP's hardened container.
-          # The container's declared seccomp exception is tested separately as part of that exact
+          # The container's declared security-profile exceptions are tested as part of that exact
           # runtime contract; these host switches do not grant it capabilities or writable mounts.
           if test -e "$apparmor_control"; then
             echo 0 | sudo tee "$apparmor_control" >/dev/null

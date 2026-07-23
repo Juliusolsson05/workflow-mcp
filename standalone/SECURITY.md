@@ -42,12 +42,12 @@ recovery fingerprint and must re-pass that probe.
 The official MCP Registry record is an explicitly session-bound compatibility launch. It encodes
 the fixed user, read-only root, dropped capabilities, no-new-privileges, resource limits, private
 tmpfs paths, anonymous `/data`, and read-only project bind. It also disables Docker's stock seccomp
-filter because that outer filter blocks the user/mount namespace syscalls required to construct the
-inner Codex/Bubblewrap boundary. This is a deliberate layer substitution, not a sandbox bypass: the
-host user-namespace prerequisite and hostile final-image probe must both pass, while container
-removal still discards anonymous state. Clients that ignore declared OCI runtime arguments are
-unsupported. The verified Compose/launcher bundle remains the maintained durability and
-operator-control surface.
+and AppArmor profiles because those outer filters block the user/mount namespace syscalls and mount
+propagation required to construct the inner Codex/Bubblewrap boundary. This is a deliberate layer
+substitution, not a sandbox bypass: the host user-namespace prerequisite and hostile final-image
+probe must both pass, while container removal still discards anonymous state. Clients that ignore
+declared OCI runtime arguments are unsupported. The verified Compose/launcher bundle remains the
+maintained durability and operator-control surface.
 
 The daemon container itself needs outbound access to OpenAI. A model shell does not inherit that
 network permission. The base Compose service publishes no port. Optional web mode binds loopback

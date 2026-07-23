@@ -12,14 +12,15 @@ Desktop supplies that Linux-VM capability. Native Linux operators must allow the
 to create nested user namespaces; Ubuntu 24.04 enables an AppArmor restriction that can deny them
 unless the administrator supplies an appropriate AppArmor policy or changes the documented
 `kernel.apparmor_restrict_unprivileged_userns` host setting. Hosts that expose
-`kernel.unprivileged_userns_clone` must also enable it. Docker's default seccomp profile separately
-blocks the namespace and mount setup Bubblewrap needs, so the published Compose and OCI Registry
-profiles apply the documented per-container `seccomp=unconfined` exception. That exception enables
-the inner Codex sandbox; it does not disable it. The container remains non-root with every
-capability dropped, `no-new-privileges`, read-only mounts, and bounded resources. The launcher and
-doctor fail closed when the real sandbox probe cannot start. Do not replace this narrow runtime
-shape with a privileged container, added capabilities, an AppArmor-wide bypass, or a disabled Codex
-sandbox. See the [Docker seccomp documentation](https://docs.docker.com/engine/security/seccomp/)
+`kernel.unprivileged_userns_clone` must also enable it. Docker's default seccomp and AppArmor
+profiles separately block the namespace syscalls and mount propagation Bubblewrap needs, so the
+published Compose and OCI Registry profiles apply per-container `seccomp=unconfined` and
+`apparmor=unconfined` exceptions. Those exceptions enable the inner Codex sandbox; they do not
+disable it. The container remains non-root with every capability dropped, `no-new-privileges`,
+read-only mounts, and bounded resources. The launcher and doctor fail closed when the real sandbox
+probe cannot start. Do not replace this runtime shape with a privileged container, added
+capabilities, writable outer mounts, or a disabled Codex sandbox. See the
+[Docker runtime-security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt)
 and the
 [Ubuntu 24.04 security notes](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
 
@@ -414,8 +415,8 @@ macOS refer to Linux containers under Docker Desktop, not a native Windows image
 
 - The final image is non-root, drops every capability, enables `no-new-privileges`, has a read-only
   root/project, bounded tmpfs, PID limit, and no Docker socket. Its runtime disables Docker's stock
-  seccomp filter only because that filter blocks Bubblewrap setup; the real hostile probe must then
-  prove the narrower Codex command sandbox starts and holds.
+  seccomp and AppArmor profiles only because they block Bubblewrap setup; the real hostile probe
+  must then prove the narrower Codex command sandbox starts and holds.
 - Managed Codex permission profiles deny `/data`, `/run/secrets`, `/run/workflow-mcp`, and `/proc`;
   tools have no network and start inside Codex's Bubblewrap PID namespace.
 - The image doctor runs a hostile final-image probe which tries to read the MCP token and launch a

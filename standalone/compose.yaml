@@ -38,11 +38,13 @@ services:
     security_opt:
       - no-new-privileges:true
       # WHY: Codex's Linux sandbox deliberately creates a second user/mount/PID namespace with
-      # Bubblewrap. Docker's stock seccomp profile rejects those setup syscalls before Bubblewrap
-      # can install the narrower command boundary. Disable only Docker's syscall filter; the
-      # container remains non-root, capability-free, no-new-privileges, and read-only, while the
-      # hostile policy probe proves the nested sandbox rather than assuming it started.
+      # Bubblewrap. Docker's stock seccomp and AppArmor profiles reject its namespace syscalls and
+      # private mount propagation before Bubblewrap can install the narrower command boundary.
+      # Disable those two outer filters for this container; it remains non-root, capability-free,
+      # no-new-privileges, and read-only, while the hostile policy probe proves the nested sandbox
+      # rather than assuming it started.
       - seccomp=unconfined
+      - apparmor=unconfined
     healthcheck:
       test: ["CMD", "workflow-mcp", "healthcheck"]
       interval: 10s

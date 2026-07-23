@@ -8,9 +8,10 @@ The maintained artifact is a digest-pinned Alpine 3.23 / Node 22 Linux image for
 `linux/arm64`. It pins Codex and MCP SDK versions, exact runtime APK revisions, bundles native lock/CLOEXEC helpers, runs fixed
 UID/GID 10001, drops all capabilities, enables no-new-privileges, limits PIDs/logs/tmpfs, keeps root
 and project read-only, and never mounts the Docker socket. Base Compose disables Docker's stock
-seccomp profile because it blocks the syscalls Bubblewrap needs to construct the stricter nested
-Codex command sandbox; a hostile final-image probe must prove that replacement boundary on every
-release architecture. Base Compose exposes but does not publish the daemon port.
+seccomp and AppArmor profiles because they block the syscalls and mount propagation Bubblewrap
+needs to construct the stricter nested Codex command sandbox; a hostile final-image probe must prove
+that replacement boundary on every release architecture. Base Compose exposes but does not publish
+the daemon port.
 
 The launcher accepts local Docker contexts and ordinary labeled local volumes only. Web mode
 requires Engine 28.3.3+. Authoring validates every relevant host path and asks the exact image UID
