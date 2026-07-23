@@ -1,0 +1,71 @@
+services:
+  workflow-mcp:
+    image: ${WORKFLOW_MCP_IMAGE:?set WORKFLOW_MCP_IMAGE to the versioned image digest}
+    user: "10001:10001"
+    command:
+      - daemon
+      - --host=0.0.0.0
+      - --port=7331
+      - --workspace=/workspace
+      - --data-dir=/data
+    environment:
+      WORKFLOW_MCP_INSTANCE_ID: ${WORKFLOW_MCP_INSTANCE_ID:?stable instance ID required}
+      WORKFLOW_MCP_PROJECT_HASH: ${WORKFLOW_MCP_PROJECT_HASH:?canonical project hash required}
+      WORKFLOW_MCP_SOURCE_MODE: read-only
+      WORKFLOW_MCP_WEB_ENABLED: "false"
+      # The published constrained profile fits Docker Gateway/Desktop's common one-CPU/two-GiB
+      # allocation. Raise concurrency only together with the CPU and memory limits below.
+      WORKFLOW_MCP_CONCURRENCY: ${WORKFLOW_MCP_CONCURRENCY:-1}
+    restart: unless-stopped
+    stop_grace_period: 120s
+    expose:
+      - "7331"
+    volumes:
+      - workflow-mcp-data:/data
+      - type: bind
+        source: ${WORKFLOW_MCP_PROJECT_DIR:?absolute project path required}
+        target: /workspace
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777,uid=10001,gid=10001
+      - /run/workflow-mcp:size=16m,mode=0700,uid=10001,gid=10001
+    shm_size: 64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # WHY: Codex's Linux sandbox deliberately creates a second user/mount/PID namespace with
+      # Bubblewrap. Docker's stock seccomp and AppArmor profiles reject its namespace syscalls and
+      # private mount propagation before Bubblewrap can install the narrower command boundary.
+      # Disable those two outer filters for this container; it remains non-root, capability-free,
+      # no-new-privileges, and read-only, while the hostile policy probe proves the nested sandbox
+      # rather than assuming it started.
+      - seccomp=unconfined
+      - apparmor=unconfined
+    healthcheck:
+      test: ["CMD", "workflow-mcp", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+    pids_limit: ${WORKFLOW_MCP_PIDS_LIMIT:-512}
+    cpus: ${WORKFLOW_MCP_CPUS:-1.0}
+    mem_limit: ${WORKFLOW_MCP_MEMORY_LIMIT:-2g}
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  workflow-mcp-data:
+    labels:
+      io.workflow-mcp.instance-id: ${WORKFLOW_MCP_INSTANCE_ID:?stable instance ID required}
+      io.workflow-mcp.project-hash: ${WORKFLOW_MCP_PROJECT_HASH:?canonical project hash required}
+      # Context names/endpoints can be recreated. This digest binds preserved-volume adoption to
+      # the Docker Engine /info.ID that actually created it without publishing the raw daemon ID.
+      io.workflow-mcp.docker-daemon-fingerprint: ${WORKFLOW_MCP_DOCKER_DAEMON_FINGERPRINT:?Docker daemon identity required}
+      io.workflow-mcp.layout: "1"

@@ -1,14 +1,16 @@
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { describe, expect, it } from 'vitest'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
-import { serveWorkflowMcpHttp } from '../src/standaloneServer.js'
+import { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from '../src/standaloneServer.js'
 import { WorkflowService } from '../src/workflowService.js'
 
 describe('standalone Streamable HTTP server', () => {
@@ -20,8 +22,9 @@ describe('standalone Streamable HTTP server', () => {
       name: 'http-fixture', description: 'HTTP fixture'
     }
     return 'durable result'`)
+    const store = new FileWorkflowStore(join(cwd, 'state'))
     const service = new WorkflowService({
-      store: new FileWorkflowStore(join(cwd, 'state')),
+      store,
       provider: new FakeAgentProvider([]),
     })
     await service.initialize()
@@ -34,6 +37,24 @@ describe('standalone Streamable HTTP server', () => {
       headers: { authorization: `Bearer ${server.token}`, origin: 'https://attacker.example' },
     })
     expect(hostileOrigin.status).toBe(403)
+
+    const privateError = 'OPENAI_API_KEY=should-not-cross-http /private/store/path'
+    const transportFailure = vi.spyOn(StreamableHTTPServerTransport.prototype, 'handleRequest')
+      .mockRejectedValueOnce(new Error(privateError))
+    const internalFailure = await fetch(server.url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${server.token}`,
+        'content-type': 'application/json',
+      },
+      body: '{}',
+    })
+    expect(internalFailure.status).toBe(500)
+    const internalFailureBody = await internalFailure.text()
+    expect(internalFailureBody).toContain('internal-error')
+    expect(internalFailureBody).not.toContain(privateError)
+    expect(internalFailureBody).not.toContain('/private/store/path')
+    transportFailure.mockRestore()
 
     const first = await httpClient(server.url, server.token, 'first-http-client')
     expect(first.client.getInstructions()).toContain('scriptPath overrides script, which overrides name')
@@ -74,6 +95,54 @@ describe('standalone Streamable HTTP server', () => {
   }, 20_000)
 })
 
+describe('standalone STDIO server', () => {
+  it('flushes accepted responses and quiesces active ownership when the client closes input', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'workflow-stdio-eof-'))
+    const directory = join(cwd, '.claude', 'workflows')
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, 'wait.js'), `export const meta = {
+      name: 'stdio-wait', description: 'STDIO EOF ownership fixture'
+    }
+    return await agent('wait until the session owner closes')`)
+    const store = new FileWorkflowStore(join(cwd, 'state'))
+    const service = new WorkflowService({
+      store,
+      provider: new FakeAgentProvider([{ outcome: { type: 'wait-for-abort' } }]),
+    })
+    await service.initialize()
+    const input = new PassThrough()
+    const output = new PassThrough()
+    let transcript = ''
+    output.on('data', chunk => { transcript += chunk.toString() })
+    const server = await serveWorkflowMcpStdio(service, { cwd }, {
+      input,
+      output,
+      onInputClose: () => service.quiesce('STDIO client disconnected'),
+    })
+
+    input.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'eof-test', version: '1' } },
+    })}\n`)
+    await waitForResponse(() => transcript, 1)
+    input.write('{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}\n')
+    input.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'workflow_run', arguments: { name: 'stdio-wait' } },
+    })}\n`)
+    const started = await waitForResponse(() => transcript, 2) as {
+      result: { structuredContent: { run: { runId: string } } }
+    }
+    const runId = started.result.structuredContent.run.runId
+    input.end()
+    await server.closed
+
+    expect(service.lifecycleState()).toBe('STOPPED')
+    expect((await store.getManifest(runId))?.status).toBe('interrupted')
+    expect(transcript).toContain('"id":2')
+  }, 20_000)
+})
+
 async function httpClient(url: string, token: string, name: string) {
   const client = new Client({ name, version: '1' })
   const transport = new StreamableHTTPClientTransport(new URL(url), {
@@ -81,4 +150,16 @@ async function httpClient(url: string, token: string, name: string) {
   })
   await client.connect(transport)
   return { client, transport }
+}
+
+async function waitForResponse(read: () => string, id: number): Promise<unknown> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    for (const line of read().split('\n')) {
+      if (line.length === 0) continue
+      const message = JSON.parse(line) as { id?: unknown }
+      if (message.id === id) return message
+    }
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  throw new Error(`Timed out waiting for STDIO response ${id}`)
 }

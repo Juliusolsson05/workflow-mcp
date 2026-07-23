@@ -24,9 +24,28 @@ After a run finishes, inspect its constituent agents rather than only its final 
 
 The service has a shared provider capacity of nine by default. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed batches of nine: when only two slow agents remain in such a batch, JavaScript has not admitted the next batch and the scheduler cannot fill the other seven slots. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`
 
+export function workflowMcpInstructions(inlineAuthoring = true, providerCapacity = 9): string {
+  if (!Number.isSafeInteger(providerCapacity) || providerCapacity < 1) {
+    throw new TypeError('providerCapacity must be a positive integer')
+  }
+  const sourceInstructions = inlineAuthoring ? WORKFLOW_MCP_INSTRUCTIONS : WORKFLOW_MCP_INSTRUCTIONS.replace(
+    /To author one, call workflow_run with inline JavaScript in script\.[\s\S]*?Pass args as real JSON, never a JSON-encoded string\./,
+    'This instance is read-only: run only already-visible workflows by name or scriptPath. Inline script authoring is disabled and returns authoring-disabled. Pass args as real JSON, never a JSON-encoded string.',
+  ).replace(
+    /Inline source is saved under the current Git project's \.claude\/workflows and the run result returns scriptPath\.[\s\S]*?existing definitions are never overwritten implicitly\./,
+    'Workflow definitions are mounted read-only. Edit them on the host, then restart the daemon so the new source hash crosses the startup approval boundary.',
+  )
+  return sourceInstructions.replace(
+    /The service has a shared provider capacity of nine by default\.[\s\S]*?Do not invent run IDs or source paths\./,
+    `The service has a shared provider capacity of ${providerCapacity}. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed-size batches: stragglers in one batch prevent JavaScript from admitting later work to the scheduler. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`,
+  )
+}
+
 export type WorkflowMcpRegistrationHooks = {
   /** Called after a durable run exists, before its MCP result is returned. */
   onRunStarted?: (run: WorkflowRunStartResult) => void
+  /** Defaults true for the historical embedded Agent Code surface. */
+  inlineAuthoring?: boolean
 }
 
 /** Register the portable workflow surface on an MCP server owned by the embedding host. */
@@ -79,10 +98,14 @@ export function registerWorkflowMcpTools(
     'workflow_run',
     {
       title: 'Run workflow',
-      description: 'Author, start, or resume a durable Claude-compatible workflow. Source precedence is scriptPath > script > name. Inline script must begin with pure-literal `export const meta = { name, description }`; it is persisted under project .claude/workflows and the editable scriptPath is returned. The call returns immediately: poll workflow_run_events from its cursor until status is terminal.',
+      description: hooks.inlineAuthoring === false
+        ? 'Start or resume a durable already-visible workflow. This instance is read-only and rejects inline script authoring with authoring-disabled. The call returns immediately: poll workflow_run_events from its cursor until status is terminal.'
+        : 'Author, start, or resume a durable Claude-compatible workflow. Source precedence is scriptPath > script > name. Inline script must begin with pure-literal `export const meta = { name, description }`; it is persisted under project .claude/workflows and the editable scriptPath is returned. The call returns immediately: poll workflow_run_events from its cursor until status is terminal.',
       inputSchema: {
         name: z.string().min(1).optional().describe('Visible meta.name; lowest-precedence source selector.'),
-        script: z.string().max(MAX_WORKFLOW_BYTES).optional().describe('Inline workflow JavaScript. Persisted as an editable project .claude/workflows/*.js definition before execution.'),
+        script: z.string().max(MAX_WORKFLOW_BYTES).optional().describe(hooks.inlineAuthoring === false
+          ? 'Unavailable in this read-only instance; use a host-created visible workflow.'
+          : 'Inline workflow JavaScript. Persisted as an editable project .claude/workflows/*.js definition before execution.'),
         scriptPath: z.string().min(1).optional().describe('Editable .js definition under a visible user/project .claude/workflows directory. Highest precedence.'),
         args: z.unknown().optional(),
         resumeFromRunId: z.string().min(1).optional().describe('Native Agent Code run_* or real Claude wf_* run to continue as a new linked run.'),
@@ -192,35 +215,36 @@ export function registerWorkflowMcpTools(
     {
       title: 'Resume workflow run',
       description: 'Compatibility alias that continues a native Agent Code run_* or discovers and imports a real Claude wf_* run from the scoped project. claudeRunPath remains available for explicit metadata selection. Successful calls are reused while coverage gaps are retried. New clients may use workflow_run.resumeFromRunId.',
-      inputSchema: z.union([
-        z.object({
-          runId: z.string().min(1),
-          idempotencyKey: z.string().min(1).max(200).optional(),
-          abandonUnconfirmedProvider: z.boolean().optional().describe(
-            'Explicit operator acknowledgement for continuing a read-only offline run while an old provider descendant may still be alive',
-          ),
-        }),
-        z.object({
-          claudeRunPath: z.string().min(1),
-          workflowPath: z.string().min(1).optional(),
-          idempotencyKey: z.string().min(1).max(200).optional(),
-        }),
-      ]),
+      // McpServer's raw-shape API renders unions as an empty schema in SDK 1.29. Keep every public
+      // field discoverable and enforce the mutually-exclusive source pair in the handler instead;
+      // otherwise catalog metadata would promise resume arguments that tools/list silently omits.
+      inputSchema: {
+        runId: z.string().min(1).optional(),
+        claudeRunPath: z.string().min(1).optional(),
+        workflowPath: z.string().min(1).optional(),
+        idempotencyKey: z.string().min(1).max(200).optional(),
+        abandonUnconfirmedProvider: z.boolean().optional().describe(
+          'Explicit operator acknowledgement for continuing a read-only offline run while an old provider descendant may still be alive',
+        ),
+      },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },
     async (input) => {
+      if ((input.runId === undefined) === (input.claudeRunPath === undefined)) {
+        throw new TypeError('workflow_resume requires exactly one of runId or claudeRunPath')
+      }
       const run = await service.resume(
         scope,
-        'runId' in input
+        input.runId !== undefined
           ? {
-              runId: input.runId,
+            runId: input.runId,
               ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
               ...(input.abandonUnconfirmedProvider === undefined
                 ? {}
                 : { abandonUnconfirmedProvider: input.abandonUnconfirmedProvider }),
             }
           : {
-              claudeRunPath: input.claudeRunPath,
+              claudeRunPath: input.claudeRunPath!,
               ...(input.workflowPath === undefined ? {} : { workflowPath: input.workflowPath }),
               ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             },

@@ -1,0 +1,41 @@
+{
+  "name": "@workflow-mcp/standalone",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Docker-first daemon, MCP proxy, and local interfaces for Workflow MCP.",
+  "type": "module",
+  "bin": {
+    "workflow-mcp": "./dist/cli/main.js"
+  },
+  "scripts": {
+    "clean": "node ./scripts/clean.mjs",
+    "build": "npm run clean && tsc && node ./scripts/build-web.mjs",
+    "typecheck": "tsc --noEmit && tsc --project tsconfig.web.json",
+    "test": "npm run build && vitest run",
+    "bundle": "npm run build && node ./scripts/build-install-bundle.mjs",
+    "check:imports": "node ./scripts/check-imports.mjs",
+    "check:distribution": "node ./scripts/validate-distribution.mjs",
+    "check:host-launcher": "sh ./scripts/host-launcher-path-smoke.sh",
+    "check": "npm run typecheck && npm run test && npm run check:imports && npm run check:distribution && npm run check:host-launcher"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "workflow-mcp": "file:..",
+    "zod": "4.4.3"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11",
+    "fast-uri": "3.1.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "esbuild": "0.28.1",
+    "happy-dom": "20.11.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "license": "MIT"
+}

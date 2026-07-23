@@ -1,0 +1,139 @@
+param(
+  [Parameter(Mandatory = $true)] [string] $Bundle
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+$Temporary = Join-Path ([IO.Path]::GetTempPath()) ("workflow-mcp-windows-launcher-" + [Guid]::NewGuid().ToString("N"))
+$Project = Join-Path $Temporary "project"
+$Stub = Join-Path $Temporary "bin"
+
+try {
+  New-Item -ItemType Directory -Path $Project, $Stub | Out-Null
+  $env:WORKFLOW_MCP_FAKE_PROJECT = $Project
+  $env:WORKFLOW_MCP_FAKE_DOCKER_LOG = Join-Path $Temporary "docker-invocations.jsonl"
+  $FakeDocker = @'
+param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $DockerArguments)
+$ErrorActionPreference = "Stop"
+# WHY: PowerShell wraps native `.cmd` failures differently across runner releases, so the outer
+# contract cannot safely infer which Docker boundary ran from exception text. Record only this
+# non-secret fake argv as structured JSON; the smoke test can then prove a hostile instance reached
+# the strict image parser but never reached Compose command authority.
+[IO.File]::AppendAllText(
+  $env:WORKFLOW_MCP_FAKE_DOCKER_LOG,
+  (($DockerArguments | ConvertTo-Json -Compress) + [Environment]::NewLine),
+  [Text.UTF8Encoding]::new($false)
+)
+function ProjectHash() {
+  $Identity = $env:WORKFLOW_MCP_FAKE_PROJECT.TrimEnd('\').ToLowerInvariant()
+  $Bytes = [Text.Encoding]::UTF8.GetBytes("workflow-mcp-project-v1`0$Identity")
+  return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))).ToLowerInvariant()
+}
+function DaemonFingerprint() {
+  $Bytes = [Text.Encoding]::UTF8.GetBytes("workflow-mcp-docker-daemon-v1`0fake-engine-id")
+  return ([Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($Bytes))).ToLowerInvariant()
+}
+function ValidRecord() {
+  return [ordered]@{
+    schemaVersion = 1
+    instanceId = "11111111-2222-4333-8444-555555555555"
+    composeProjectName = "workflow-mcp-1111111122224333"
+    projectDirectory = $env:WORKFLOW_MCP_FAKE_PROJECT
+    projectHash = ProjectHash
+    dockerContext = "default"
+    dockerEndpoint = "npipe:////./pipe/docker_engine"
+    dockerDaemonFingerprint = DaemonFingerprint
+    image = "workflow-mcp:windows-smoke"
+    createdAt = "2026-01-01T00:00:00.000Z"
+    authoring = $false
+  }
+}
+if ($DockerArguments[0] -eq "info") {
+  if ($DockerArguments -contains "--format") { Write-Output "fake-engine-id" }
+  exit 0
+}
+if ($DockerArguments[0] -eq "compose" -and $DockerArguments[1] -eq "version") { Write-Output "2.32.0"; exit 0 }
+if ($DockerArguments[0] -eq "version") { Write-Output "28.3.3"; exit 0 }
+if ($DockerArguments[0] -eq "context" -and $DockerArguments[1] -eq "show") { Write-Output "default"; exit 0 }
+if ($DockerArguments[0] -eq "context" -and $DockerArguments[1] -eq "inspect") { Write-Output "npipe:////./pipe/docker_engine"; exit 0 }
+if ($DockerArguments[0] -eq "image" -and $DockerArguments[1] -eq "inspect") { Write-Output "{}"; exit 0 }
+if ($DockerArguments -contains "daemon-fingerprint") { Write-Output (DaemonFingerprint); exit 0 }
+if ($DockerArguments -contains "verify-policy") { exit 0 }
+if ($DockerArguments -contains "create") {
+  Write-Output ((ValidRecord) | ConvertTo-Json -Compress)
+  exit 0
+}
+if ($DockerArguments -contains "inspect") {
+  $Path = Join-Path $env:WORKFLOW_MCP_FAKE_PROJECT ".workflow-mcp/instance.json"
+  $Record = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+  $Expected = ValidRecord
+  if ($Record.schemaVersion -ne 1 -or $Record.instanceId -ne $Expected.instanceId -or
+      $Record.composeProjectName -ne $Expected.composeProjectName -or
+      $Record.projectDirectory -ne $Expected.projectDirectory -or
+      $Record.projectHash -ne $Expected.projectHash -or
+      $Record.dockerDaemonFingerprint -ne $Expected.dockerDaemonFingerprint -or
+      $Record.createdAt -ne $Expected.createdAt) {
+    Write-Error "instance record failed the fake strict parser"
+    exit 65
+  }
+  Write-Output ($Record | ConvertTo-Json -Compress)
+  exit 0
+}
+if ($DockerArguments -contains "hash") { Write-Output (ProjectHash); exit 0 }
+Write-Error "unexpected fake Docker invocation: $($DockerArguments -join ' ')"
+exit 64
+'@
+  [IO.File]::WriteAllText((Join-Path $Stub "fake-docker.ps1"), $FakeDocker, [Text.UTF8Encoding]::new($false))
+  $Wrapper = @'
+@echo off
+pwsh.exe -NoLogo -NoProfile -NonInteractive -File "%~dp0fake-docker.ps1" %*
+exit /b %ERRORLEVEL%
+'@
+  [IO.File]::WriteAllText((Join-Path $Stub "docker.cmd"), $Wrapper, [Text.ASCIIEncoding]::new())
+  $env:PATH = "$Stub;$env:PATH"
+
+  # WHY: installation immediately reloads its JSON record under StrictMode. A non-web record omits
+  # webPort by design, so this clean default path is the smallest executable regression for optional
+  # JSON-member handling without pretending a fake Docker daemon qualifies Docker Desktop itself.
+  & (Join-Path $Bundle "workflow-mcp-docker.ps1") install $Project --no-codex
+  $RecordPath = Join-Path $Project ".workflow-mcp/instance.json"
+  if (-not (Test-Path -LiteralPath $RecordPath -PathType Leaf)) { throw "default installation did not commit instance.json" }
+  $Record = Get-Content -Raw -LiteralPath $RecordPath | ConvertFrom-Json
+  if ($null -ne $Record.PSObject.Properties["webPort"]) { throw "default installation unexpectedly persisted webPort" }
+
+  # Installation must prove the strict image parser accepts a clean generated record. The tamper
+  # phase then needs only prove rejection before Compose: an earlier host/checksum fence is at least
+  # as restrictive as image rejection and pwsh versions disagree about which native `.cmd` failure
+  # becomes the catchable ErrorRecord.
+  $CleanInvocations = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG)
+  $CleanSawStrictInspect = $false
+  foreach ($Line in $CleanInvocations) {
+    $Invocation = @($Line | ConvertFrom-Json)
+    if ($Invocation -contains "instance" -and $Invocation -contains "inspect") {
+      $CleanSawStrictInspect = $true
+    }
+  }
+  if (-not $CleanSawStrictInspect) { throw "clean installation did not exercise the strict image parser" }
+  $InvocationCount = $CleanInvocations.Count
+  $Record.composeProjectName = "workflow-mcp-ffffffffffffffff"
+  [IO.File]::WriteAllText($RecordPath, (($Record | ConvertTo-Json -Compress) + "`n"), [Text.UTF8Encoding]::new($false))
+  $Caught = $null
+  try {
+    & (Join-Path $Project ".workflow-mcp/workflow-mcp-docker.ps1") mcp-proxy $Project
+  } catch {
+    $Caught = $_
+  }
+  if ($null -eq $Caught) { throw "tampered instance record was accepted" }
+  $SawCompose = $false
+  $Invocations = [IO.File]::ReadAllLines($env:WORKFLOW_MCP_FAKE_DOCKER_LOG)
+  for ($Index = $InvocationCount; $Index -lt $Invocations.Count; $Index += 1) {
+    $Invocation = @($Invocations[$Index] | ConvertFrom-Json)
+    if ($Invocation.Count -gt 0 -and $Invocation[0] -eq "compose") { $SawCompose = $true }
+  }
+  if ($SawCompose) { throw "tampered Compose authority reached the installed launcher" }
+  Write-Host "Windows default non-web launcher installation passed."
+} finally {
+  # This exact GUID-named temporary leaf is the only cleanup target.
+  if (Test-Path -LiteralPath $Temporary) { Remove-Item -Recurse -Force -LiteralPath $Temporary }
+}

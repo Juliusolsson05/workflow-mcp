@@ -1,0 +1,10 @@
+ARG WORKFLOW_MCP_IMAGE
+FROM ${WORKFLOW_MCP_IMAGE}
+
+USER root
+# Install only the compiler/runtime the project actually needs, then remove package-manager caches.
+# Keeping this as a derived image avoids turning the maintained MCP base into an unbounded dev box.
+# WHY: derived images share the maintained Alpine base. Exact revisions preserve the same
+# fail-closed rebuild behavior as the primary image instead of silently advancing a toolchain.
+RUN apk add --no-cache make=4.4.1-r3
+USER 10001:10001

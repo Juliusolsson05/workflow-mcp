@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import type {
   CodexOptions,
   Input,
@@ -24,6 +26,7 @@ import type {
   ProviderSessionReference,
 } from './agentProvider.js'
 import { ProcessOwnedCodexHost } from './processOwnedProviderHost.js'
+import { CODEX_SDK_VERSION } from './generatedBuildMetadata.js'
 
 export type CodexThreadLike = {
   readonly id: string | null
@@ -72,6 +75,12 @@ export type CodexExternalCapabilityEffect = 'read-only' | 'idempotent' | 'mutati
 
 export type CodexExecutionCapabilities = {
   inheritedMcpServers: 'disabled' | 'unknown'
+  /**
+   * Exact creation-time containment proven by the embedding host. Process groups alone are not
+   * enough because setsid() can escape; this attestation means every model command is born inside
+   * Codex's Bubblewrap PID namespace under an immutable managed permission profile.
+   */
+  attemptContainment?: 'codex-bwrap-pid-v1'
   mcpServers?: readonly {
     name: string
     effect: CodexExternalCapabilityEffect
@@ -104,13 +113,17 @@ export type CodexConfigurationIsolation = {
   effectiveConfigurationFingerprint?: string
 }
 
+export type CodexRecoveryFingerprintInput = {
+  executableEvidence?: CodexExecutableEvidence
+  configurationIsolation?: CodexConfigurationIsolation
+  capabilities: CodexExecutionCapabilities
+  modelAliases?: Readonly<Record<string, string | null>>
+  baseUrl?: string
+  config?: CodexOptions['config']
+}
+
 const CODEX_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 const CLAUDE_MODEL_NAMES = new Set(['haiku', 'sonnet', 'opus', 'inherit'])
-// Keep this literal beside the adapter and the exact package.json pin. Reading package metadata at
-// runtime fails under some package export maps and bundlers; a mismatched upgrade should therefore
-// be an obvious one-line review change rather than silently reporting the wrong installed version.
-const CODEX_SDK_VERSION = '0.144.4'
-
 /**
  * Supported Codex SDK adapter for one workflow `agent()` call.
  *
@@ -124,6 +137,7 @@ export class CodexAgentProvider implements AgentProvider {
   readonly #host: ProcessOwnedCodexHost | undefined
   readonly #modelAliases: Readonly<Record<string, string | null>>
   readonly #capabilities: CodexExecutionCapabilities
+  readonly recoveryFingerprint?: string
 
   constructor(options: CodexProviderOptions = {}) {
     const {
@@ -139,10 +153,24 @@ export class CodexAgentProvider implements AgentProvider {
     this.#modelAliases = { ...modelAliases }
     this.#capabilities = {
       inheritedMcpServers: capabilities.inheritedMcpServers,
+      ...(capabilities.attemptContainment === undefined
+        ? {}
+        : { attemptContainment: capabilities.attemptContainment }),
       ...(capabilities.mcpServers === undefined
         ? {}
         : { mcpServers: capabilities.mcpServers.map((server) => ({ ...server })) }),
     }
+    const recoveryFingerprint = client === undefined
+      ? buildCodexRecoveryFingerprint({
+          ...(executableEvidence === undefined ? {} : { executableEvidence }),
+          ...(configurationIsolation === undefined ? {} : { configurationIsolation }),
+          capabilities: this.#capabilities,
+          modelAliases: this.#modelAliases,
+          ...(codexOptions.baseUrl === undefined ? {} : { baseUrl: codexOptions.baseUrl }),
+          ...(codexOptions.config === undefined ? {} : { config: codexOptions.config }),
+        })
+      : undefined
+    if (recoveryFingerprint !== undefined) this.recoveryFingerprint = recoveryFingerprint
     if (client) {
       // Injected clients are an in-process conformance seam. Production never takes this branch;
       // preserving it keeps adapter tests focused on event translation without spawning hosts.
@@ -163,6 +191,18 @@ export class CodexAgentProvider implements AgentProvider {
         throw new AgentProviderFailure(
           'Codex inherited MCP servers can be marked disabled only with a verified effective-configuration fingerprint',
           { code: 'codex-capability-attestation-invalid' },
+        )
+      }
+      if (
+        capabilities.attemptContainment !== undefined &&
+        (
+          executableEvidence === undefined ||
+          configurationIsolation?.effectiveConfigurationFingerprint === undefined
+        )
+      ) {
+        throw new AgentProviderFailure(
+          'Codex attempt containment requires executable and effective-policy evidence',
+          { code: 'codex-containment-attestation-invalid' },
         )
       }
       this.#client = undefined
@@ -189,13 +229,15 @@ export class CodexAgentProvider implements AgentProvider {
     // Production turns always use the process owner. Injected clients deliberately retain the
     // weaker settlement boundary because no OS process exists for workflow-mcp to reap.
     //
-    // WHY POSIX is also unconfirmed: a process group is an escalation mechanism, not a containment
-    // boundary. Real Codex shell tools call setsid(), and therefore leave the provider host's group
-    // before this adapter can signal `-hostPid`. Windows taskkill has the equivalent creation-time
-    // race without a Job Object. Returning `process-tree` on either platform would let the runtime
-    // overlap a successor with a command which the OS boundary never owned.
+    // WHY POSIX is unconfirmed by default: a process group is an escalation mechanism, not a
+    // containment boundary. The one stronger value is an embedding-host attestation that every
+    // model command is created inside Codex's Bubblewrap PID namespace; when its PID 1 exits the
+    // kernel kills even setsid descendants. Without that exact tested policy, returning
+    // `process-tree` would let a successor overlap a command the OS boundary never owned.
     if (this.#host === undefined) return 'settlement'
-    return 'unconfirmed-descendants'
+    return this.#capabilities.attemptContainment === 'codex-bwrap-pid-v1'
+      ? 'process-tree'
+      : 'unconfirmed-descendants'
   }
 
   assessReplaySafety(request: AgentRequest): AgentReplaySafetyAssessment {
@@ -282,6 +324,60 @@ export class CodexAgentProvider implements AgentProvider {
       (server) => server.effect === 'read-only' || server.effect === 'idempotent',
     )
   }
+}
+
+/**
+ * Canonical evidence used on both sides of crash recovery.
+ *
+ * API keys are intentionally absent: persisting a hash of a secret creates a credential oracle and
+ * rotation does not change the local capability policy. Executable bytes, SDK behavior, explicit
+ * config, the effective configuration-layer attestation, aliases, and exposed MCP effects are the
+ * inputs which can change whether replay is the same execution contract.
+ */
+export function buildCodexRecoveryFingerprint(
+  input: CodexRecoveryFingerprintInput,
+): string | undefined {
+  if (
+    input.capabilities.inheritedMcpServers !== 'disabled' ||
+    input.executableEvidence === undefined ||
+    input.configurationIsolation?.effectiveConfigurationFingerprint === undefined ||
+    input.configurationIsolation.effectiveConfigurationFingerprint.length === 0
+  ) return undefined
+
+  const evidence = {
+    schemaVersion: 1,
+    provider: 'codex',
+    sdkVersion: CODEX_SDK_VERSION,
+    executable: input.executableEvidence,
+    effectiveConfigurationFingerprint:
+      input.configurationIsolation.effectiveConfigurationFingerprint,
+    capabilities: {
+      inheritedMcpServers: 'disabled',
+      ...(input.capabilities.attemptContainment === undefined
+        ? {}
+        : { attemptContainment: input.capabilities.attemptContainment }),
+      mcpServers: [...(input.capabilities.mcpServers ?? [])]
+        .map(server => ({ name: server.name, effect: server.effect }))
+        .sort((left, right) => (
+          left.name.localeCompare(right.name) || left.effect.localeCompare(right.effect)
+        )),
+    },
+    modelAliases: Object.fromEntries(
+      Object.entries(input.modelAliases ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
+    ...(input.config === undefined ? {} : { config: input.config }),
+  }
+  return `codex:v1:${createHash('sha256').update(canonicalJson(evidence)).digest('hex')}`
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  const object = value as Record<string, unknown>
+  return `{${Object.keys(object).sort().map(key => (
+    `${JSON.stringify(key)}:${canonicalJson(object[key])}`
+  )).join(',')}}`
 }
 
 /**

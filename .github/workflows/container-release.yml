@@ -1,0 +1,777 @@
+name: Container release
+
+on:
+  push:
+    tags: ["v*"]
+  # Dispatch the same immutable vX.Y.Z ref with `gh workflow run ... --ref vX.Y.Z` to reconcile a
+  # partial external publish; GitHub's web form exposes a branch selector rather than a tag picker.
+  # Every step compares existing registry/release/tag state before accepting it.
+  workflow_dispatch:
+
+# Jobs opt into only the capabilities they use. In particular, source validation and native image
+# gates cannot mutate releases, while publication is the only job that receives contents/write.
+permissions: {}
+
+concurrency:
+  group: workflow-mcp-container-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: docker.io/juliusolsson05/workflow-mcp
+
+jobs:
+  validate:
+    if: github.repository == 'Juliusolsson05/workflow-mcp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      minor: ${{ steps.release.outputs.minor }}
+      staging: ${{ steps.release.outputs.staging }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - name: Validate trusted immutable release input
+        id: release
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          version=${GITHUB_REF_NAME#v}
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          expected=$(node -p "require('./standalone/package.json').version")
+          test "$version" = "$expected"
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          # WHY: tag protection controls who may create a release-shaped ref, but it does not prove
+          # that the tagged commit passed through the repository's reviewed integration branch. Fetch
+          # the server-selected default branch into a forced, isolated tracking ref so a stale or
+          # checkout-provided local ref cannot satisfy this ancestry gate. This still runs before
+          # the separate protected preflight job can receive its repository-administration reader.
+          test -n "$DEFAULT_BRANCH"
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git fetch --no-tags --force origin \
+            "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$GITHUB_SHA" "refs/remotes/origin/$DEFAULT_BRANCH" || {
+            echo "Release tag $GITHUB_REF_NAME does not identify a commit on the fetched default branch $DEFAULT_BRANCH." >&2
+            exit 1
+          }
+          # A manual repair run may encounter an already-published immutable tag. Publication later
+          # accepts it only when its digest is exactly the gated build; existence alone is neither
+          # success nor a reason to destroy the resumable release path.
+          {
+            echo "version=$version"
+            echo "minor=${version%.*}"
+            # A run-attempt suffix prevents a Docker Hub writer from pre-seeding a known retry tag
+            # and persuading this trusted workflow to sign bytes it did not build. Reconciliation
+            # happens from the signed digest, never by trusting a mutable staging name.
+            echo "staging=build-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
+      - name: Require the owner-attested external release controls
+        env:
+          RELEASE_CONTROLS: ${{ vars.WORKFLOW_MCP_RELEASE_CONTROLS }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_CONTROLS" = github-immutable-v1+protected-tags-v1+protected-preflight-v1+protected-publication-v1+private-reporting-v1 || {
+            echo "Configure immutable GitHub releases, protected v* tags, isolated preflight/publication environments, and private vulnerability reporting; then set WORKFLOW_MCP_RELEASE_CONTROLS to the reviewed v1 attestation value." >&2
+            exit 1
+          }
+      - name: Test source and distribution contracts
+        run: |
+          npm ci --include=dev
+          npm --prefix standalone ci --include=dev
+          npm run typecheck
+          npm --prefix standalone run check
+
+  release-control-preflight:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: workflow-mcp-release-preflight
+    # The official immutable-release endpoint requires repository Administration(read), which is
+    # not a valid GITHUB_TOKEN workflow permission. This job intentionally has no checkout and no
+    # GitHub-token authority; its one separately provisioned credential is passed only to `gh` below.
+    permissions: {}
+    steps:
+      - name: Prove live immutable-release and private-reporting controls
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_MCP_GITHUB_ADMIN_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          # WHY: the owner variable attests controls such as the protected environment and tag
+          # ruleset, but a past review is not evidence that queryable repository settings remain
+          # enabled. Checking only after a draft is published is too late because GitHub does not
+          # retroactively lock that release, tag, or its assets. Keep this read-only credential in a
+          # distinct preflight environment with no Docker/publication secret, and make every later
+          # credential-bearing job depend on this reversible check.
+          test "$(gh api --method GET \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq '.enabled == true')" = true
+          test "$(gh api --method GET \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/private-vulnerability-reporting" \
+            --jq '.enabled == true')" = true
+
+  build:
+    needs: [validate, release-control-preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: workflow-mcp-release
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.identity.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Verify Docker Hub repository and full-SemVer immutability policy
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # WHY: `/v2/users/login` remains available but is deprecated. The current short-lived
+          # access-token API accepts a Docker username plus scoped PAT and avoids baking a known
+          # retirement point into the only preflight that protects immutable publication.
+          auth=$(jq -nc --arg identifier "$DOCKERHUB_USERNAME" --arg secret "$DOCKERHUB_TOKEN" \
+            '{identifier:$identifier,secret:$secret}' | \
+            curl --fail --silent --show-error --request POST --header 'Content-Type: application/json' \
+              --data-binary @- https://hub.docker.com/v2/auth/token)
+          bearer=$(printf '%s' "$auth" | node -e '
+            let body="";process.stdin.on("data",chunk=>body+=chunk).on("end",()=>{
+              const token=JSON.parse(body).access_token;if(typeof token!=="string"||token.length<32)process.exit(1);process.stdout.write(token);
+            });
+          ')
+          repository=$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $bearer" \
+            https://hub.docker.com/v2/namespaces/juliusolsson05/repositories/workflow-mcp)
+          # WHY: proving that the SemVer regex is present is insufficient when a second rule can
+          # also freeze candidate, compatible-minor, or latest tags. That drift can make the
+          # qualification rerun or convenience-tag update fail only after public state exists.
+          # Normalize order before requiring the complete policy to equal the one reviewed rule;
+          # duplicates and every additional regex remain fatal.
+          printf '%s' "$repository" | node -e '
+            let body="";process.stdin.on("data",chunk=>body+=chunk).on("end",()=>{
+              const repository=JSON.parse(body), settings=repository.immutable_tags_settings;
+              const rule="^[0-9]+\\.[0-9]+\\.[0-9]+$";
+              const rules=Array.isArray(settings?.rules)&&settings.rules.every(value=>typeof value==="string")
+                ? [...settings.rules].sort() : [];
+              const expectedRules=[rule];
+              if(repository.is_private!==false||settings?.enabled!==true||JSON.stringify(rules)!==JSON.stringify(expectedRules)) {
+                throw new Error("Docker Hub must be public with exactly these immutable-tag rules: "+JSON.stringify(expectedRules));
+              }
+            });
+          '
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+      - name: Discover a previously signed candidate checkpoint
+        id: checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference="$IMAGE:candidate-$GITHUB_SHA"
+          if docker buildx imagetools inspect "$reference" >/dev/null 2>checkpoint-inspect.err; then
+            digest=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$reference" | tr -d '"')
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            # This mutable resume handle is reusable only when a prior invocation of this exact
+            # tagged workflow signed its digest. Registry labels/tag ownership are not trust, and
+            # the immutable public SemVer remains absent until every qualification gate passes.
+            cosign verify "$IMAGE@$digest" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          elif grep -Eqi 'not found|no such manifest|manifest unknown' checkpoint-inspect.err; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat checkpoint-inspect.err >&2
+            exit 1
+          fi
+      - name: Build once and publish one run-unique attested staging index
+        id: build
+        if: steps.checkpoint.outputs.exists != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: standalone/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          # Stable tags are deliberately absent here. The run-attempt-unique name is only a handle
+          # for this build; every later gate and publication step is bound to its returned digest.
+          tags: ${{ env.IMAGE }}:${{ needs.validate.outputs.staging }}
+          build-args: |
+            VERSION=${{ needs.validate.outputs.version }}
+            REVISION=${{ github.sha }}
+            SOURCE=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=workflow-mcp-release
+          cache-to: type=gha,scope=workflow-mcp-release,mode=max
+      - name: Assert built digest identity and immutable source labels
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.checkpoint.outputs.exists }}" = true ]; then
+            actual=${{ steps.checkpoint.outputs.digest }}
+          else
+            actual=$(docker buildx imagetools inspect \
+              --format '{{json .Manifest.Digest}}' \
+              "$IMAGE:${{ needs.validate.outputs.staging }}" | tr -d '"')
+            test "$actual" = "${{ steps.build.outputs.digest }}"
+          fi
+          [[ "$actual" =~ ^sha256:[0-9a-f]{64}$ ]]
+          index=$(docker buildx imagetools inspect --raw "$IMAGE@$actual")
+          # WHY: merely counting two attestation manifests can pass when both point at one native
+          # image, leaving the other runnable child unattested. BuildKit's reference-digest annotation
+          # is the index-level subject binding, so construct a one-to-one map before trusting either
+          # predicates or image labels. Requiring exactly the two supported runnable children also
+          # prevents an uninspected extra platform from being published under the signed index.
+          descriptors=$(node -e '
+            const index=JSON.parse(process.argv[1]);
+            const manifests=index.manifests??[];
+            const referenceType="vnd.docker.reference.type";
+            const referenceDigest="vnd.docker.reference.digest";
+            const attestations=manifests.filter(value=>value.annotations?.[referenceType]==="attestation-manifest");
+            const children=manifests.filter(value=>value.annotations?.[referenceType]!=="attestation-manifest");
+            if(children.length!==2||attestations.length!==2) process.exit(1);
+            const expected=["linux/amd64","linux/arm64"];
+            const childByPlatform=new Map();
+            for(const child of children) {
+              const platform=`${child.platform?.os}/${child.platform?.architecture}`;
+              if(!expected.includes(platform)||childByPlatform.has(platform)||!/^sha256:[0-9a-f]{64}$/.test(child.digest??"")) process.exit(1);
+              childByPlatform.set(platform,child.digest);
+            }
+            const childDigests=new Set(childByPlatform.values());
+            const attestationByChild=new Map();
+            const attestationDigests=new Set();
+            for(const attestation of attestations) {
+              const child=attestation.annotations?.[referenceDigest];
+              if(!childDigests.has(child)||attestationByChild.has(child)||attestationDigests.has(attestation.digest)||!/^sha256:[0-9a-f]{64}$/.test(attestation.digest??"")) process.exit(1);
+              attestationByChild.set(child,attestation.digest);
+              attestationDigests.add(attestation.digest);
+            }
+            if(childByPlatform.size!==expected.length||attestationByChild.size!==expected.length) process.exit(1);
+            process.stdout.write(expected.map(platform=>`${platform} ${childByPlatform.get(platform)} ${attestationByChild.get(childByPlatform.get(platform))}`).join("\n"));
+          ' "$index")
+          while read -r platform child attestation; do
+            raw=$(docker buildx imagetools inspect --format '{{json .Image.Config.Labels}}' "$IMAGE@$child")
+            node -e '
+              const labels=JSON.parse(process.argv[1]);
+              if(labels["org.opencontainers.image.revision"]!==process.env.GITHUB_SHA) process.exit(1);
+              if(labels["org.opencontainers.image.version"]!==process.argv[2]) process.exit(1);
+              if(labels["io.modelcontextprotocol.server.name"]!=="io.github.juliusolsson05/workflow-mcp") process.exit(1);
+            ' "$raw" "${{ needs.validate.outputs.version }}"
+            raw=$(docker buildx imagetools inspect --raw "$IMAGE@$attestation")
+            node -e '
+              const manifest=JSON.parse(process.argv[1]);
+              const child=process.argv[2];
+              if(manifest.subject!==undefined&&manifest.subject?.digest!==child) process.exit(1);
+              const types=new Set((manifest.layers??[]).map(layer=>layer.annotations?.["in-toto.io/predicate-type"]));
+              if(!types.has("https://slsa.dev/provenance/v0.2") || !types.has("https://spdx.dev/Document")) process.exit(1);
+            ' "$raw" "$child"
+          done <<EOF
+          $descriptors
+          EOF
+          echo "digest=$actual" >> "$GITHUB_OUTPUT"
+      - name: Keyless-sign and verify the build-once index
+        env:
+          COSIGN_YES: "true"
+        run: |
+          if [ "${{ steps.checkpoint.outputs.exists }}" != true ]; then
+            cosign sign "$IMAGE@${{ steps.identity.outputs.digest }}"
+          fi
+          cosign verify "$IMAGE@${{ steps.identity.outputs.digest }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME"
+      - name: Publish the signed mutable candidate resume handle
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=${{ steps.identity.outputs.digest }}
+          docker buildx imagetools create --tag "$IMAGE:candidate-$GITHUB_SHA" "$IMAGE@$digest"
+          test "$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$IMAGE:candidate-$GITHUB_SHA" | tr -d '"')" = "$digest"
+          {
+            echo '## External platform candidate'
+            echo
+            echo "- Exact subject: \`$IMAGE@$digest\`"
+            echo "- Run-unique staging handle: \`$IMAGE:${{ needs.validate.outputs.staging }}\`"
+            echo "- Signed resume handle: \`$IMAGE:candidate-$GITHUB_SHA\` (resolve and verify; never trust by name)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  platform-gate:
+    needs: [validate, build]
+    timeout-minutes: 45
+    environment: workflow-mcp-release
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            uname: x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            uname: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pull and prove the native manifest member
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="docker.io/juliusolsson05/workflow-mcp@${{ needs.build.outputs.digest }}"
+          docker pull --platform "${{ matrix.platform }}" "$image"
+          test "$(docker run --rm --entrypoint /bin/uname "$image" -m)" = "${{ matrix.uname }}"
+      - name: Enable nested Codex sandbox namespaces on the disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          apparmor_control=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          clone_control=/proc/sys/kernel/unprivileged_userns_clone
+          # WHY: Ubuntu 24.04's AppArmor control and the runner's generic clone control can each
+          # block Bubblewrap before the candidate proves its no-capabilities/no-new-privileges
+          # sandbox. Release evidence must run that boundary with the candidate's declared Docker
+          # security-profile exceptions; these host changes last only for this no-secret VM and are
+          # verified before candidate execution.
+          if test -e "$apparmor_control"; then
+            echo 0 | sudo tee "$apparmor_control" >/dev/null
+            test "$(cat "$apparmor_control")" = 0
+          fi
+          if test -e "$clone_control"; then
+            echo 1 | sudo tee "$clone_control" >/dev/null
+            test "$(cat "$clone_control")" = 1
+          fi
+      - name: Exercise native final-image contracts
+        run: standalone/scripts/container-smoke.sh "$IMAGE@${{ needs.build.outputs.digest }}"
+      - name: Install checksum-pinned Grype
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=0.112.0
+          arch=${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          asset="grype_${version}_linux_${arch}.tar.gz"
+          case "$arch" in
+            amd64) expected=acb14a030010fe9bdb9594b4ae108d9d14ef2f926d936aa0916dc62c89c058ea ;;
+            arm64) expected=7fdeccf065965cc59386c656e5fcc1eb1bdf820e2433000bca7f010b8e6da155 ;;
+          esac
+          curl --fail --location --proto '=https' --tlsv1.2 --output "$asset" \
+            "https://github.com/anchore/grype/releases/download/v${version}/${asset}"
+          echo "$expected  $asset" | sha256sum --check --strict
+          tar --extract --gzip --file "$asset" grype
+          sudo install -m 0755 grype /usr/local/bin/grype
+          test "$(grype version -o json | jq -r .version)" = "$version"
+      - name: Scan the native manifest member
+        shell: bash
+        run: |
+          set +e
+          # HIGH is intentional: the Node runtime and sandbox are part of a credential boundary,
+          # so waiting for a finding to become CRITICAL is not an acceptable release policy.
+          # WHY: Grype's SARIF presenter omits ignoredMatches. Produce JSON and SARIF from one
+          # catalog/DB evaluation so retained evidence cannot disagree because a second scan saw a
+          # different vulnerability database, and so reviewers can prove which exact waiver fired.
+          arch=${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          grype --config .grype.yaml "$IMAGE@${{ needs.build.outputs.digest }}" --fail-on high \
+            --output "sarif=workflow-mcp-${arch}.sarif" \
+            --output "json=workflow-mcp-${arch}.json"
+          echo "$?" > grype-exit-code
+      - name: Prove the exact scanner waiver was applied
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch=${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          report="workflow-mcp-${arch}.json"
+          test -s "$report"
+          # The source-controlled policy already forbids broad ignores. This assertion separately
+          # proves the retained native report used that policy and that no stale/unneeded or newly
+          # matching exception can pass silently.
+          jq -e '
+            (.ignoredMatches | length) == 1 and
+            .ignoredMatches[0].vulnerability.id == "CVE-2026-32631" and
+            .ignoredMatches[0].artifact.name == "git" and
+            .ignoredMatches[0].artifact.version == "2.52.0-r0" and
+            .ignoredMatches[0].artifact.type == "apk" and
+            (.ignoredMatches[0].appliedIgnoreRules | length) == 1 and
+            .ignoredMatches[0].appliedIgnoreRules[0].vulnerability == "CVE-2026-32631" and
+            .ignoredMatches[0].appliedIgnoreRules[0].package.name == "git" and
+            .ignoredMatches[0].appliedIgnoreRules[0].package.version == "2.52.0-r0" and
+            .ignoredMatches[0].appliedIgnoreRules[0].package.type == "apk"
+          ' "$report" >/dev/null
+      - name: Retain the exact native scan report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workflow-mcp-scan-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: |
+            workflow-mcp-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}.sarif
+            workflow-mcp-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Enforce the HIGH vulnerability gate after retaining evidence
+        if: always()
+        shell: bash
+        run: test -f grype-exit-code && test "$(cat grype-exit-code)" = 0
+
+  publish:
+    needs: [validate, build, platform-gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: workflow-mcp-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ needs.validate.outputs.version }}
+      digest: ${{ needs.build.outputs.digest }}
+      bundle: ${{ steps.assets.outputs.bundle }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+      - name: Build reproducible release assets from the immutable digest
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${{ needs.validate.outputs.version }}
+          digest=${{ needs.build.outputs.digest }}
+          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          mkdir -p release-assets metadata
+          SOURCE_DATE_EPOCH=$epoch node standalone/scripts/build-install-bundle.mjs \
+            --output=release-bundle --release --version="$version" --revision="$GITHUB_SHA" \
+            --image="$IMAGE@$digest"
+          SOURCE_DATE_EPOCH=$epoch node standalone/scripts/render-release-metadata.mjs \
+            --output=metadata --version="$version" --revision="$GITHUB_SHA" --digest="$digest"
+          bundle="workflow-mcp-install-$version.tar.gz"
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            -czf "release-assets/$bundle" -C release-bundle .
+          cp metadata/server.json "release-assets/workflow-mcp-server-$version.json"
+          cp metadata/docker-catalog-server.yaml "release-assets/workflow-mcp-docker-catalog-$version.yaml"
+          tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner \
+            -czf "release-assets/workflow-mcp-docker-catalog-$version.tar.gz" \
+            -C metadata/docker-catalog workflow-mcp
+          printf '%s@%s\n' "$IMAGE" "$digest" > "release-assets/workflow-mcp-image-$version.txt"
+          cat > release-assets/RELEASE_NOTES.md <<EOF
+          Workflow MCP $version is the first Docker-first standalone release.
+
+          State layout: version 1. Downgrade: only to another release declaring layout 1.
+          Backup/restore: offline, exact-instance/project identity, credentials excluded.
+          Image: $IMAGE@$digest
+
+          Verify the image signature:
+          cosign verify $IMAGE@$digest --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity https://github.com/$GITHUB_REPOSITORY/.github/workflows/container-release.yml@refs/tags/$GITHUB_REF_NAME
+
+          BuildKit attached SPDX SBOM and SLSA provenance attestations to both native manifest members.
+          Inspect them with: docker buildx imagetools inspect --raw $IMAGE@$digest
+          Native amd64/arm64 Grype SARIF reports are retained with this release workflow run.
+          EOF
+          # JavaScript expands process.env below; the shell must preserve the template literal.
+          # shellcheck disable=SC2016
+          VERSION="$version" DIGEST="$digest" node -e '
+            const fs=require("node:fs"), crypto=require("node:crypto"), path=require("node:path");
+            const directory="release-assets"; const assets={};
+            for(const name of fs.readdirSync(directory).sort()) {
+              const bytes=fs.readFileSync(path.join(directory,name));
+              assets[name]=crypto.createHash("sha256").update(bytes).digest("hex");
+            }
+            const manifest={schemaVersion:1,version:process.env.VERSION,commit:process.env.GITHUB_SHA,
+              image:`${process.env.IMAGE}@${process.env.DIGEST}`,assets};
+            fs.writeFileSync(path.join(directory,"workflow-mcp-release-manifest.json"),JSON.stringify(manifest,null,2)+"\n");
+          '
+          (cd release-assets && sha256sum workflow-mcp-* RELEASE_NOTES.md > SHA256SUMS)
+          echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
+      - name: Install and validate with the pinned official MCP publisher
+        env:
+          # GitHub CLI requires authentication even when the requested release asset is public.
+          # Supplying the job-scoped token keeps a clean runner non-interactive without introducing
+          # a separate maintainer credential; this step needs only the job's existing repository access.
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          publisher_version=v1.7.9
+          publisher_asset=mcp-publisher_linux_amd64.tar.gz
+          gh release download "$publisher_version" --repo modelcontextprotocol/registry \
+            --pattern "$publisher_asset" --dir publisher
+          # Upstream ships Sigstore bundles but no GitHub release attestation. The reviewed digest
+          # is therefore the fail-closed authority; unsupported `gh release verify` would always
+          # fail and, in the old ordering, did so only after public tags were created.
+          echo 'ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac  publisher/mcp-publisher_linux_amd64.tar.gz' | sha256sum --check
+          tar -xzf "publisher/$publisher_asset" -C publisher mcp-publisher
+          publisher/mcp-publisher validate metadata/server.json
+      - name: Reproduce the bundle from the candidate image and smoke it before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${{ needs.validate.outputs.version }}
+          digest=${{ needs.build.outputs.digest }}
+          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          candidate=workflow-mcp-bundle-render-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
+          cleanup() { docker rm -f "$candidate" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker create --name "$candidate" --network none --read-only \
+            -e "SOURCE_DATE_EPOCH=$epoch" \
+            --mount type=volume,dst=/bundle-output \
+            "$IMAGE@$digest" bundle-render --output=/bundle-output/release-bundle \
+            --release --version="$version" --revision="$GITHUB_SHA" --image="$IMAGE@$digest" >/dev/null
+          docker start --attach "$candidate" >/dev/null
+          docker cp "$candidate:/bundle-output/release-bundle" image-release-bundle
+          diff --recursive --no-dereference release-bundle image-release-bundle
+          cleanup
+          trap - EXIT
+          # This is the same exact bundle/digest pair that later becomes immutable. The post-release
+          # smoke remains useful for GitHub attestation/download verification, but cannot be the
+          # first time installation, MCP execution, backup/restore, and adoption are exercised.
+          release-bundle/launcher-smoke.sh release-bundle
+      - name: Require qualification evidence for this exact candidate digest
+        env:
+          PLATFORM_QUALIFICATION: ${{ vars.WORKFLOW_MCP_PLATFORM_QUALIFICATION }}
+        shell: bash
+        run: |
+          expected='${{ needs.validate.outputs.version }}@${{ needs.build.outputs.digest }}'
+          test "$PLATFORM_QUALIFICATION" = "$expected" || {
+            echo "Run and review the external platform matrix for $expected, record its redacted evidence, then set WORKFLOW_MCP_PLATFORM_QUALIFICATION to that exact value and rerun this tag workflow." >&2
+            exit 1
+          }
+      - name: Attest every downloadable release subject
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: release-assets/*
+      - name: Commit or verify the signed immutable semantic checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${{ needs.validate.outputs.version }}
+          digest=${{ needs.build.outputs.digest }}
+          if docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>semantic-inspect.err; then
+            actual=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$IMAGE:$version" | tr -d '"')
+            test "$actual" = "$digest" || { echo "Immutable semantic tag has another digest" >&2; exit 1; }
+          elif grep -Eqi 'not found|no such manifest|manifest unknown' semantic-inspect.err; then
+            # This is the first irreversible public action. Candidate install/restore/adoption smoke,
+            # native gates, signature/attestation checks, and exact external platform evidence all
+            # precede it, so Docker Hub immutability cannot strand an unqualified SemVer.
+            docker buildx imagetools create --tag "$IMAGE:$version" "$IMAGE@$digest"
+          else
+            cat semantic-inspect.err >&2
+            exit 1
+          fi
+          test "$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$IMAGE:$version" | tr -d '"')" = "$digest"
+      - name: Reconcile an identical GitHub release draft and assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "Workflow MCP ${{ needs.validate.outputs.version }}" \
+              --notes-file release-assets/RELEASE_NOTES.md
+          fi
+          test "$(gh release view "$GITHUB_REF_NAME" --json name --jq .name)" = \
+            "Workflow MCP ${{ needs.validate.outputs.version }}"
+          test "$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)" = \
+            "$(cat release-assets/RELEASE_NOTES.md)"
+          mkdir -p existing-release
+          asset_count=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')
+          if [ "$asset_count" -gt 0 ]; then
+            gh release download "$GITHUB_REF_NAME" --dir existing-release
+          fi
+          for local in release-assets/*; do
+            name=${local##*/}
+            if [ -f "existing-release/$name" ]; then
+              cmp "$local" "existing-release/$name" || {
+                echo "Existing release asset differs: $name" >&2; exit 1;
+              }
+            else
+              test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true || {
+                echo "Published release is missing immutable asset: $name" >&2; exit 1;
+              }
+              gh release upload "$GITHUB_REF_NAME" "$local" --clobber=false
+            fi
+          done
+          for remote in existing-release/*; do
+            [ -e "$remote" ] || continue
+            test -f "release-assets/${remote##*/}" || {
+              echo "Existing release has an unexpected asset: ${remote##*/}" >&2; exit 1;
+            }
+          done
+      - name: Reconcile immutable version metadata in the official MCP Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(node -p "encodeURIComponent(require('./metadata/server.json').name)")
+          version=${{ needs.validate.outputs.version }}
+          endpoint="https://registry.modelcontextprotocol.io/v0.1/servers/$name/versions/$version"
+          status=$(curl --silent --show-error --output registry-existing.json --write-out '%{http_code}' "$endpoint")
+          if [ "$status" = 200 ]; then
+            # shellcheck disable=SC2016
+            node -e '
+              const expected=require("./metadata/server.json"), response=require("./registry-existing.json");
+              const actual=response.server ?? response;
+              const {$schema: _schema, ...semantic}=expected;
+              function subset(want, got, path="server") {
+                if(Array.isArray(want)) {
+                  if(!Array.isArray(got)||want.length!==got.length) throw new Error(`${path} differs`);
+                  want.forEach((value,index)=>subset(value,got[index],`${path}[${index}]`)); return;
+                }
+                if(want && typeof want==="object") {
+                  if(!got || typeof got!=="object") throw new Error(`${path} differs`);
+                  for(const [key,value] of Object.entries(want)) subset(value,got[key],`${path}.${key}`); return;
+                }
+                if(want!==got) throw new Error(`${path} differs`);
+              }
+              subset(semantic, actual);
+            '
+          elif [ "$status" = 404 ]; then
+            (cd publisher && ./mcp-publisher login github-oidc && ./mcp-publisher publish ../metadata/server.json)
+          else
+            echo "MCP Registry lookup failed with HTTP $status" >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error "$endpoint" > registry-published.json
+          # shellcheck disable=SC2016
+          node -e '
+            const expected=require("./metadata/server.json"), response=require("./registry-published.json");
+            const actual=response.server ?? response;
+            const {$schema: _schema, ...semantic}=expected;
+            function subset(want, got, path="server") {
+              if(Array.isArray(want)) {
+                if(!Array.isArray(got)||want.length!==got.length) throw new Error(`${path} differs`);
+                want.forEach((value,index)=>subset(value,got[index],`${path}[${index}]`)); return;
+              }
+              if(want && typeof want==="object") {
+                if(!got || typeof got!=="object") throw new Error(`${path} differs`);
+                for(const [key,value] of Object.entries(want)) subset(value,got[key],`${path}.${key}`); return;
+              }
+              if(want!==got) throw new Error(`${path} differs`);
+            }
+            subset(semantic, actual);
+          '
+      - name: Publish or accept the identical immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          fi
+          gh release verify "$GITHUB_REF_NAME"
+      - name: Update mutable convenience tags after immutable publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${{ needs.validate.outputs.version }}
+          minor=${{ needs.validate.outputs.minor }}
+          digest=${{ needs.build.outputs.digest }}
+          docker buildx imagetools create --tag "$IMAGE:$minor" --tag "$IMAGE:latest" "$IMAGE@$digest"
+          for tag in "$version" "$minor" latest; do
+            actual=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$IMAGE:$tag" | tr -d '"')
+            test "$actual" = "$digest"
+          done
+
+  release-smoke:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      # Deliberately no checkout: this proves the published release, checksum, bundle, and image are
+      # sufficient inputs on a clean Docker runner with no repository-local Node program.
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # WHY: pinning only the installer action still follows that action's changing default
+          # Cosign release. Post-publication verification must use the same reviewed binary as the
+          # pre-publication signature gate, or a default bump can make recovery nondeterministic.
+          cosign-release: v3.0.6
+      - name: Verify immutable release and published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ needs.publish.outputs.version }}"
+          gh release download "$tag" --repo "$GH_REPO" --dir release
+          gh release verify "$tag" --repo "$GH_REPO"
+          for asset in release/*; do
+            gh release verify-asset "$tag" "$asset" --repo "$GH_REPO"
+            gh attestation verify "$asset" --repo "$GH_REPO"
+          done
+          (cd release && sha256sum --check SHA256SUMS)
+          mkdir bundle
+          tar -xzf "release/${{ needs.publish.outputs.bundle }}" -C bundle
+          (cd bundle && sha256sum --check SHA256SUMS)
+          bundle/workflow-mcp-docker help >/dev/null
+          image="docker.io/juliusolsson05/workflow-mcp@${{ needs.publish.outputs.digest }}"
+          cosign verify "$image" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/$GH_REPO/.github/workflows/container-release.yml@refs/tags/$tag"
+          docker pull "$image"
+          docker run --rm "$image" help >/dev/null
+          # WHY: Default OCI STDIO is still the sole mutable owner. Keep the root filesystem
+          # read-only, but give its coordination/state contract an anonymous copy-up volume that
+          # `--rm` deletes with the smoke container; otherwise initialize never reaches MCP.
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"release-version-smoke","version":"1"}}}' | \
+            docker run --rm --network none --read-only -i \
+              --tmpfs /tmp --tmpfs /run/workflow-mcp:mode=0700,uid=10001,gid=10001 \
+              --mount type=volume,dst=/data \
+              "$image" > initialize.jsonl
+          docker run --rm --network none --read-only -i \
+            -e 'VERSION=${{ needs.publish.outputs.version }}' --entrypoint /usr/local/bin/node \
+            "$image" -e '
+            const fs=require("node:fs");
+            const message=JSON.parse(fs.readFileSync(0,"utf8").trim());
+            if(message.result?.serverInfo?.version!==process.env.VERSION) process.exit(1);
+          ' < initialize.jsonl
+          bundle/launcher-smoke.sh bundle

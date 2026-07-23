@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -9,11 +10,18 @@ import { describe, expect, it } from 'vitest'
 
 import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
-import { registerWorkflowMcpTools } from '../src/workflowMcp.js'
+import { registerWorkflowMcpTools, workflowMcpInstructions } from '../src/workflowMcp.js'
 import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
 
 describe('workflow MCP facade', () => {
+  it('describes the active source capability without teaching read-only clients to author', () => {
+    expect(workflowMcpInstructions(false)).toContain('Inline script authoring is disabled')
+    expect(workflowMcpInstructions(false)).not.toContain('To author one')
+    expect(workflowMcpInstructions(true)).toContain('To author one')
+    expect(workflowMcpInstructions(false, 1)).toContain('shared provider capacity of 1')
+  })
+
   it('registers the complete stable thirteen-tool surface', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-mcp-tools-'))
     const service = new WorkflowService({
@@ -43,6 +51,35 @@ describe('workflow MCP facade', () => {
       'workflow_run_status',
       'workflow_validate',
     ])
+    expect(tools.tools.find(tool => tool.name === 'workflow_resume')?.inputSchema.properties).toMatchObject({
+      runId: expect.any(Object),
+      claudeRunPath: expect.any(Object),
+      workflowPath: expect.any(Object),
+      idempotencyKey: expect.any(Object),
+      abandonUnconfirmedProvider: expect.any(Object),
+    })
+    const catalogTools = JSON.parse(await readFile(fileURLToPath(new URL(
+      '../standalone/distribution/docker-catalog/tools.json',
+      import.meta.url,
+    )), 'utf8')) as Array<{
+      name: string
+      arguments: Array<{ name: string; optional?: boolean }>
+      annotations: { readOnlyHint: boolean; destructiveHint: boolean; openWorldHint: boolean }
+    }>
+    for (const live of tools.tools) {
+      const catalog = catalogTools.find(tool => tool.name === live.name)
+      expect(catalog, `Catalog inventory is missing ${live.name}`).toBeDefined()
+      const properties = live.inputSchema.properties ?? {}
+      expect(catalog!.arguments.map(argument => argument.name).sort()).toEqual(Object.keys(properties).sort())
+      const required = new Set(live.inputSchema.required ?? [])
+      expect(catalog!.arguments.filter(argument => argument.optional !== true).map(argument => argument.name).sort())
+        .toEqual([...required].sort())
+      expect(catalog!.annotations).toEqual({
+        readOnlyHint: live.annotations?.readOnlyHint ?? false,
+        destructiveHint: live.annotations?.destructiveHint ?? false,
+        openWorldHint: live.annotations?.openWorldHint ?? true,
+      })
+    }
     const listed = await client.callTool({ name: 'workflow_list', arguments: {} })
     expect(listed.structuredContent).toMatchObject({ ok: true })
     expect((listed.structuredContent as { workflows: unknown[] }).workflows).toEqual(expect.any(Array))
@@ -230,15 +267,17 @@ describe('workflow MCP facade', () => {
     })
     expect(resumed.structuredContent, JSON.stringify(resumed)).toBeDefined()
     const runId = (resumed.structuredContent as { run: { runId: string } }).run.runId
-    let terminalStatus: string | undefined
-    for (let index = 0; index < 100; index += 1) {
+    // WHY this is a wall-clock deadline instead of a fixed number of polls: each
+    // MCP status request crosses both halves of an in-memory transport and reads
+    // persisted run state. On a contended CI runner, 100 requests can be consumed
+    // in under the time the imported Claude continuation needs to finish, even
+    // though the same continuation completes normally moments later. The test is
+    // about eventual MCP-visible completion, so bound elapsed time and let Vitest
+    // preserve the last observed value in its failure output.
+    await expect.poll(async () => {
       const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      terminalStatus = (status.structuredContent as { run: { status: string } }).run.status
-      if (terminalStatus === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
-
-    expect(terminalStatus).toBe('completed')
+      return (status.structuredContent as { run: { status: string } }).run.status
+    }, { timeout: 5_000, interval: 25 }).toBe('completed')
     expect(resumed.structuredContent).toMatchObject({
       ok: true,
       run: {

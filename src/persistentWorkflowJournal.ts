@@ -19,6 +19,7 @@ import {
   type WorkflowJournal,
   type WorkflowJournalRun,
 } from './workflowJournal.js'
+import type { WorkflowJournalWriteCoordinator } from './workflowWriteCoordinator.js'
 
 const FORMAT = 'workflow-mcp-journal'
 const VERSION = 2
@@ -59,15 +60,22 @@ export class PersistentJournalError extends Error {
 export class PersistentWorkflowJournal implements WorkflowJournal {
   readonly filePath: string
   readonly #inner: InMemoryWorkflowJournal
+  readonly #writeCoordinator: WorkflowJournalWriteCoordinator | undefined
 
-  private constructor(filePath: string, snapshots: Iterable<JournalSnapshot>) {
+  private constructor(
+    filePath: string,
+    snapshots: Iterable<JournalSnapshot>,
+    writeCoordinator?: WorkflowJournalWriteCoordinator,
+  ) {
     this.filePath = resolve(filePath)
     this.#inner = new InMemoryWorkflowJournal(snapshots)
+    this.#writeCoordinator = writeCoordinator
   }
 
   static async open(
     filePath: string,
     fallbackSnapshots: Iterable<JournalSnapshot> = [],
+    writeCoordinator?: WorkflowJournalWriteCoordinator,
   ): Promise<PersistentWorkflowJournal> {
     const fallback = [...fallbackSnapshots]
     const stored = await readStoredSnapshots(resolve(filePath))
@@ -95,7 +103,7 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
       )
     }
 
-    const journal = new PersistentWorkflowJournal(filePath, snapshots.values())
+    const journal = new PersistentWorkflowJournal(filePath, snapshots.values(), writeCoordinator)
     if (fallback.length > 0 || stored?.version === LEGACY_VERSION) {
       // Imported lineage must be durable before run.started can be published. This also migrates a
       // version-1 root-only file on first open instead of waiting for the next agent admission.
@@ -124,7 +132,9 @@ export class PersistentWorkflowJournal implements WorkflowJournal {
   }
 
   #persistAll(): void {
-    persistAtomically(this.filePath, this.#inner.getSnapshots())
+    const persist = (): void => persistAtomically(this.filePath, this.#inner.getSnapshots())
+    if (this.#writeCoordinator === undefined) persist()
+    else this.#writeCoordinator.runSync(persist)
   }
 }
 

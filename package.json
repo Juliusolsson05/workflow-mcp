@@ -29,7 +29,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc",
+    "generate:metadata": "node scripts/generate-build-metadata.mjs",
+    "build": "npm run generate:metadata && node scripts/clean-dist.mjs && tsc",
     "typecheck": "tsc --noEmit && npm run check:browser-state",
     "test": "npm run build && vitest run --project core && vitest run --project system && vitest run --project corpus",
     "test:core": "npm run build && vitest run --project core",
@@ -40,10 +41,11 @@
     "test:coverage": "npm run build && vitest run --coverage --maxWorkers=1",
     "test:package": "npm run build && node scripts/test-package.mjs",
     "test:contract": "node scripts/check-test-contract.mjs",
+    "check:standalone": "npm --prefix standalone ci --include=dev && npm --prefix standalone run check",
     "check:browser-state": "tsc -p tsconfig.browser-state.json",
     "test:integration": "npm run test:live",
     "benchmark:codex": "npm run build && node dist/benchmarkCodex.js",
-    "check": "npm run test:contract && npm run typecheck && npm test && npm run test:package",
+    "check": "npm run test:contract && npm run typecheck && npm test && npm run test:package && npm run check:standalone",
     "prepack": "npm run build"
   },
   "engines": {
@@ -55,6 +57,10 @@
     "acorn": "8.17.0",
     "ajv": "8.20.0",
     "zod": "4.4.3"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11",
+    "fast-uri": "3.1.4"
   },
   "devDependencies": {
     "@types/node": "^22.20.0",

@@ -84,7 +84,14 @@ export type {
   ProviderSessionReference,
 } from './agentProvider.js'
 
-export { CodexAgentProvider } from './codexProvider.js'
+export { buildCodexRecoveryFingerprint, CodexAgentProvider } from './codexProvider.js'
+export {
+  CODEX_SDK_VERSION,
+  MCP_SDK_VERSION,
+  MCP_STABLE_PROTOCOL_VERSION,
+  WORKFLOW_MCP_REVISION,
+  WORKFLOW_MCP_VERSION,
+} from './generatedBuildMetadata.js'
 export { startCodexProviderHost } from './providerHost.js'
 export type {
   CodexClientLike,
@@ -93,6 +100,7 @@ export type {
   CodexExecutableEvidence,
   CodexExternalCapabilityEffect,
   CodexProviderOptions,
+  CodexRecoveryFingerprintInput,
   CodexThreadLike,
 } from './codexProvider.js'
 
@@ -108,6 +116,7 @@ export type {
 
 export {
   WorkflowCancelledError,
+  WorkflowInterruptedError,
   WorkflowBudgetExceededError,
   WorkflowExecutionError,
   runWorkflow,
@@ -186,6 +195,11 @@ export {
   WorkflowStoreError,
 } from './fileWorkflowStore.js'
 export {
+  InheritedFlockLeaseBackend,
+  InheritedFlockLeaseError,
+} from './inheritedFlockLeaseBackend.js'
+export { LeaseScopedWriteCoordinator } from './workflowWriteCoordinator.js'
+export {
   DEFAULT_WORKFLOW_RESULT_PAGE_BYTES,
   MAX_WORKFLOW_RESULT_PAGE_BYTES,
   MIN_WORKFLOW_RESULT_PAGE_BYTES,
@@ -202,12 +216,18 @@ export type {
   WorkflowEventPage,
   WorkflowResultArtifact,
   WorkflowResultPage,
+  WorkflowRunListInput,
+  WorkflowRunListPage,
   WorkflowResultReadInput as WorkflowStoreResultReadInput,
   WorkflowRunManifest,
   WorkflowRunSnapshot,
+  WorkflowRunSummary,
   WorkflowStore,
   WorkflowStoreLease,
+  WorkflowStoreLeaseBackend,
+  WorkflowStoreLeaseBackendLease,
 } from './workflowStore.js'
+export type { WorkflowJournalWriteCoordinator } from './workflowWriteCoordinator.js'
 
 export { WorkflowService, WorkflowServiceError } from './workflowService.js'
 export type {
@@ -218,6 +238,7 @@ export type {
   WorkflowStartInput,
   WorkflowResumeInput,
   WorkflowServiceErrorCode,
+  WorkflowServiceLifecycleState,
   WorkflowServiceListener,
   WorkflowServiceOptions,
   WorkflowServiceScope,
@@ -226,10 +247,14 @@ export type {
   WorkflowSourceAuthorizationRequest,
 } from './workflowService.js'
 
-export { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
+export { registerWorkflowMcpTools, workflowMcpInstructions, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
 export type { WorkflowMcpRegistrationHooks } from './workflowMcp.js'
-export { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from './standaloneServer.js'
-export type { WorkflowMcpHttpServer } from './standaloneServer.js'
+export {
+  createWorkflowMcpHttpHandler,
+  serveWorkflowMcpHttp,
+  serveWorkflowMcpStdio,
+} from './standaloneServer.js'
+export type { WorkflowMcpHttpHandler, WorkflowMcpHttpServer } from './standaloneServer.js'
 export type {
   JournalAgentOptions,
   JournalCall,

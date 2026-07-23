@@ -1,0 +1,9 @@
+# The launcher selects this overlay only after proving that the host project already has a real
+# `.codex` directory. Docker cannot create this nested mountpoint beneath the base read-only bind,
+# and Workflow MCP must never create or replace a project directory just to make masking work.
+services:
+  workflow-mcp:
+    environment:
+      WORKFLOW_MCP_PROJECT_CODEX_MASKED: "true"
+    tmpfs:
+      - /workspace/.codex:ro,size=1m,mode=0555,uid=10001,gid=10001

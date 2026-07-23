@@ -40,3 +40,31 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # `standalone/` deliberately has its own lockfile and is not an npm workspace. Without a second
+  # update root, the isolation boundary would also hide its MCP/web/build transitive graph from
+  # routine security and patch proposals.
+  - package-ecosystem: "npm"
+    directory: "/standalone"
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "08:00"
+      timezone: "Europe/Stockholm"
+    open-pull-requests-limit: 3
+    groups:
+      security-updates:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
+      minor-and-patch:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
