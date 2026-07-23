@@ -24,9 +24,22 @@ After a run finishes, inspect its constituent agents rather than only its final 
 
 The service has a shared provider capacity of nine by default. To keep it full, admit the complete independent collection with parallel(tasks) or pipeline(items, ...stages). Do not manually await fixed batches of nine: when only two slow agents remain in such a batch, JavaScript has not admitted the next batch and the scheduler cannot fill the other seven slots. The runtime emits workflow-capacity-unfilled-no-runnable-work when it detects that shape. Do not invent run IDs or source paths.`
 
+export function workflowMcpInstructions(inlineAuthoring = true): string {
+  if (inlineAuthoring) return WORKFLOW_MCP_INSTRUCTIONS
+  return WORKFLOW_MCP_INSTRUCTIONS.replace(
+    /To author one, call workflow_run with inline JavaScript in script\.[\s\S]*?Pass args as real JSON, never a JSON-encoded string\./,
+    'This instance is read-only: run only already-visible workflows by name or scriptPath. Inline script authoring is disabled and returns authoring-disabled. Pass args as real JSON, never a JSON-encoded string.',
+  ).replace(
+    /Inline source is saved under the current Git project's \.claude\/workflows and the run result returns scriptPath\.[\s\S]*?existing definitions are never overwritten implicitly\./,
+    'Workflow definitions are mounted read-only. Edit them on the host, then restart the daemon so the new source hash crosses the startup approval boundary.',
+  )
+}
+
 export type WorkflowMcpRegistrationHooks = {
   /** Called after a durable run exists, before its MCP result is returned. */
   onRunStarted?: (run: WorkflowRunStartResult) => void
+  /** Defaults true for the historical embedded Agent Code surface. */
+  inlineAuthoring?: boolean
 }
 
 /** Register the portable workflow surface on an MCP server owned by the embedding host. */
@@ -79,10 +92,14 @@ export function registerWorkflowMcpTools(
     'workflow_run',
     {
       title: 'Run workflow',
-      description: 'Author, start, or resume a durable Claude-compatible workflow. Source precedence is scriptPath > script > name. Inline script must begin with pure-literal `export const meta = { name, description }`; it is persisted under project .claude/workflows and the editable scriptPath is returned. The call returns immediately: poll workflow_run_events from its cursor until status is terminal.',
+      description: hooks.inlineAuthoring === false
+        ? 'Start or resume a durable already-visible workflow. This instance is read-only and rejects inline script authoring with authoring-disabled. The call returns immediately: poll workflow_run_events from its cursor until status is terminal.'
+        : 'Author, start, or resume a durable Claude-compatible workflow. Source precedence is scriptPath > script > name. Inline script must begin with pure-literal `export const meta = { name, description }`; it is persisted under project .claude/workflows and the editable scriptPath is returned. The call returns immediately: poll workflow_run_events from its cursor until status is terminal.',
       inputSchema: {
         name: z.string().min(1).optional().describe('Visible meta.name; lowest-precedence source selector.'),
-        script: z.string().max(MAX_WORKFLOW_BYTES).optional().describe('Inline workflow JavaScript. Persisted as an editable project .claude/workflows/*.js definition before execution.'),
+        script: z.string().max(MAX_WORKFLOW_BYTES).optional().describe(hooks.inlineAuthoring === false
+          ? 'Unavailable in this read-only instance; use a host-created visible workflow.'
+          : 'Inline workflow JavaScript. Persisted as an editable project .claude/workflows/*.js definition before execution.'),
         scriptPath: z.string().min(1).optional().describe('Editable .js definition under a visible user/project .claude/workflows directory. Highest precedence.'),
         args: z.unknown().optional(),
         resumeFromRunId: z.string().min(1).optional().describe('Native Agent Code run_* or real Claude wf_* run to continue as a new linked run.'),

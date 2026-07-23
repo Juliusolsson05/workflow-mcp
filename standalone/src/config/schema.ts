@@ -3,6 +3,7 @@ export type StandaloneLeaseMode = 'inherited-flock' | 'embedded'
 
 export type StandaloneConfig = Readonly<{
   workspace: string
+  projectHash: string
   dataDirectory: string
   host: '127.0.0.1' | '0.0.0.0'
   port: number
@@ -10,6 +11,7 @@ export type StandaloneConfig = Readonly<{
   leaseMode: StandaloneLeaseMode
   lockFileDescriptor?: number
   lockPath?: string
+  adminSocketPath: string
   codexExecutable: string
   webEnabled: boolean
 }>

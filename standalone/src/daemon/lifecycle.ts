@@ -7,10 +7,12 @@ import {
 } from 'workflow-mcp'
 
 import { applySecurityHeaders, routeReadOnlyApi, sendJson, validLocalHost } from '../api/router.js'
+import { startStandaloneAdminServer, type StandaloneAdminServer } from '../admin/server.js'
 import type { StandaloneConfig } from '../config/schema.js'
 import { createStandaloneApplication, type StandaloneApplication } from './application.js'
 import { loadOrCreateTokens, type StandaloneTokens } from './tokens.js'
 import { loadStaticWebRouter, type StaticWebRouter } from '../web/staticRouter.js'
+import { CodexCredentialBroker } from './auth.js'
 
 export type StandaloneDaemon = {
   host: StandaloneConfig['host']
@@ -30,6 +32,7 @@ export async function startStandaloneDaemon(
   let tokens: StandaloneTokens | undefined
   let mcp: WorkflowMcpHttpHandler | undefined
   let web: StaticWebRouter | undefined
+  let admin: StandaloneAdminServer | undefined
   const http = createServer((request, response) => {
     void (async () => {
       applySecurityHeaders(response)
@@ -87,10 +90,28 @@ export async function startStandaloneDaemon(
       application.service,
       { cwd: config.workspace },
       tokens.mcp,
+      { inlineAuthoring: config.sourceMode === 'authoring' },
     )
     web = await loadStaticWebRouter(config.webEnabled)
+    const auth = new CodexCredentialBroker({
+      service: application.service,
+      codexExecutable: config.codexExecutable,
+      dataDirectory: config.dataDirectory,
+      apiKeySecret: options.environment?.WORKFLOW_MCP_OPENAI_API_KEY_FILE !== undefined ||
+        (options.environment === undefined && process.env.WORKFLOW_MCP_OPENAI_API_KEY_FILE !== undefined),
+    })
+    admin = await startStandaloneAdminServer({
+      config,
+      service: application.service,
+      approvals: application.sourceApprovals,
+      auth,
+      token: tokens.admin,
+    })
     ready = true
   } catch (error) {
+    await admin?.close().catch(() => undefined)
+    await mcp?.close().catch(() => undefined)
+    await application?.quiesce('Standalone daemon startup failed').catch(() => undefined)
     await closeHttp(http)
     throw error
   }
@@ -110,6 +131,15 @@ export async function startStandaloneDaemon(
         // transition. Closing the MCP transport concurrently was tempting, but it could replace a
         // useful protocol error with a generic socket reset precisely during operator shutdown.
         const outcomes: PromiseSettledResult<void>[] = []
+        try {
+          // Stop operator mutations before quiesce closes mutation admission. This produces one
+          // crisp boundary: an admin request either completed under the current lease or never
+          // entered, and clients cannot race a late approval against shutdown.
+          await admin!.close()
+          outcomes.push({ status: 'fulfilled', value: undefined })
+        } catch (error) {
+          outcomes.push({ status: 'rejected', reason: error })
+        }
         try {
           await application!.quiesce(reason)
           outcomes.push({ status: 'fulfilled', value: undefined })

@@ -12,6 +12,7 @@ import { startStandaloneDaemon } from '../daemon/lifecycle.js'
 import { printDoctor } from './output.js'
 import { startWorkflowMcpProxy } from '../mcp/proxy.js'
 import { StandaloneApiClient } from '../client/apiClient.js'
+import { StandaloneAdminClient } from '../admin/client.js'
 import { runTerminalUi } from '../tui/application.js'
 import {
   createInstanceRecord,
@@ -19,6 +20,11 @@ import {
   readInstanceRecord,
   renderCodexMcpConfiguration,
 } from '../instance/record.js'
+import {
+  createOfflineBackup,
+  restoreOfflineBackup,
+  verifyOfflineBackup,
+} from '../maintenance/backup.js'
 
 const EXIT_USAGE = 2
 const EXIT_UNAVAILABLE = 3
@@ -40,6 +46,24 @@ async function main(arguments_: string[]): Promise<void> {
   if (command === 'doctor') {
     const config = loadStandaloneConfig(parsed.flags)
     const report = await inspectContainer(config)
+    try {
+      const auth = await new StandaloneAdminClient({
+        socketPath: config.adminSocketPath,
+        token: await readAdminToken(config.dataDirectory),
+      }).authStatus()
+      report.checks.push({
+        id: 'provider-authentication',
+        status: auth.authenticated ? 'pass' : 'warn',
+        message: auth.detail,
+      })
+    } catch (error) {
+      report.checks.push({
+        id: 'provider-authentication',
+        status: 'fail',
+        message: error instanceof Error ? error.message : String(error),
+      })
+      report.ok = false
+    }
     printDoctor(report, parsed.flags.json === true)
     if (!report.ok) process.exitCode = EXIT_UNAVAILABLE
     return
@@ -86,6 +110,39 @@ async function main(arguments_: string[]): Promise<void> {
       return
     }
     throw new StandaloneConfigurationError('instance requires create, inspect, hash, or codex-config')
+  }
+  if (command === 'maintenance') {
+    const action = parsed.positionals[0]
+    const identity = maintenanceIdentity()
+    if (action === 'backup-create') {
+      const config = loadStandaloneConfig(parsed.flags)
+      const report = await createOfflineBackup({
+        dataDirectory: config.dataDirectory,
+        outputPath: requiredStringArgument(parsed.flags, 'output'),
+        identity,
+      })
+      process.stdout.write(`${JSON.stringify(report)}\n`)
+      return
+    }
+    if (action === 'backup-verify') {
+      const report = await verifyOfflineBackup({
+        inputPath: requiredStringArgument(parsed.flags, 'input'),
+        ...(parsed.flags['skip-identity'] === true ? {} : { expectedIdentity: identity }),
+      })
+      process.stdout.write(`${JSON.stringify(report)}\n`)
+      return
+    }
+    if (action === 'restore') {
+      const config = loadStandaloneConfig(parsed.flags)
+      const report = await restoreOfflineBackup({
+        dataDirectory: config.dataDirectory,
+        inputPath: requiredStringArgument(parsed.flags, 'input'),
+        identity,
+      })
+      process.stdout.write(`${JSON.stringify(report)}\n`)
+      return
+    }
+    throw new StandaloneConfigurationError('maintenance requires backup-create, backup-verify, or restore')
   }
   if (command === 'daemon') {
     const config = loadStandaloneConfig(parsed.flags)
@@ -145,13 +202,73 @@ async function main(arguments_: string[]): Promise<void> {
     process.stdout.write(`${await readAudienceToken(config.dataDirectory, purpose)}\n`)
     return
   }
+  if (command === 'auth') {
+    const config = loadStandaloneConfig(parsed.flags)
+    const client = new StandaloneAdminClient({
+      socketPath: config.adminSocketPath,
+      token: await readAdminToken(config.dataDirectory),
+    })
+    if (parsed.positionals[0] === 'status') {
+      const status = await client.authStatus()
+      if (parsed.flags.json === true) process.stdout.write(`${JSON.stringify(status)}\n`)
+      else process.stdout.write(`${status.authenticated ? 'Authenticated' : 'Not authenticated'} · ${status.detail}\n`)
+      if (!status.authenticated) process.exitCode = EXIT_UNAVAILABLE
+      return
+    }
+    if (parsed.positionals[0] === 'login') {
+      await client.login((stream, text) => {
+        // Device login instructions are operator-facing protocol output. Preserve their stream so
+        // URLs/codes remain visible while stdout discipline stays strict for MCP proxy processes.
+        if (stream === 'stdout') process.stdout.write(text)
+        else process.stderr.write(text)
+      })
+      return
+    }
+    if (parsed.positionals[0] === 'logout') {
+      await client.logout()
+      process.stdout.write('Codex authentication removed.\n')
+      return
+    }
+    throw new StandaloneConfigurationError('auth requires login, status, or logout')
+  }
+  if (command === 'source') {
+    const config = loadStandaloneConfig(parsed.flags)
+    const client = new StandaloneAdminClient({
+      socketPath: config.adminSocketPath,
+      token: await readAdminToken(config.dataDirectory),
+    })
+    if (parsed.positionals[0] === 'approvals') {
+      const result = await client.sourceApprovals()
+      if (parsed.flags.json === true) process.stdout.write(`${JSON.stringify(result)}\n`)
+      else if (result.items.length === 0) process.stdout.write('No durable source approvals.\n')
+      else for (const item of result.items) {
+        process.stdout.write(`${item.workflowName}\t${item.sourceHash}\t${item.approvedAt}\n`)
+      }
+      return
+    }
+    if (parsed.positionals[0] === 'approve') {
+      const expectedSourceHash = stringArgument(parsed.flags, 'source-hash')
+      const result = await client.approveSource({
+        name: requiredStringArgument(parsed.flags, 'name'),
+        ...(expectedSourceHash === undefined ? {} : { expectedSourceHash }),
+      })
+      if (parsed.flags.json === true) process.stdout.write(`${JSON.stringify(result)}\n`)
+      else process.stdout.write(`Approved ${result.approval.workflowName} at ${result.approval.sourceHash}.\n`)
+      return
+    }
+    throw new StandaloneConfigurationError('source requires approvals or approve')
+  }
   if (command === 'serve') {
     if (parsed.positionals[0] !== undefined && parsed.positionals[0] !== '--stdio') {
       parsed.flags.workspace = parsed.positionals[0]
     }
     const config = loadStandaloneConfig(parsed.flags)
     const application = await createStandaloneApplication(config)
-    const server = await serveWorkflowMcpStdio(application.service, { cwd: config.workspace })
+    const server = await serveWorkflowMcpStdio(
+      application.service,
+      { cwd: config.workspace },
+      { inlineAuthoring: config.sourceMode === 'authoring' },
+    )
     installShutdown(async signal => {
       await server.close()
       await application.quiesce(`Standalone STDIO received ${signal}`)
@@ -164,6 +281,20 @@ async function main(arguments_: string[]): Promise<void> {
 async function readAudienceToken(dataDirectory: string, purpose: 'mcp' | 'web'): Promise<string> {
   const value = await readFile(join(dataDirectory, 'secrets', `${purpose}.token`), 'utf8')
   return value.trim()
+}
+
+async function readAdminToken(dataDirectory: string): Promise<string> {
+  const value = await readFile(join(dataDirectory, 'secrets', 'admin.token'), 'utf8')
+  return value.trim()
+}
+
+function maintenanceIdentity(): { instanceId: string; projectHash: string } {
+  const instanceId = process.env.WORKFLOW_MCP_INSTANCE_ID
+  const projectHash = process.env.WORKFLOW_MCP_PROJECT_HASH
+  if (instanceId === undefined || projectHash === undefined) {
+    throw new StandaloneConfigurationError('Maintenance requires stable instance and project identity')
+  }
+  return { instanceId, projectHash }
 }
 
 function stringArgument(flags: Readonly<Record<string, string | boolean>>, name: string): string | undefined {
@@ -244,6 +375,9 @@ Usage:
   workflow-mcp status [--json] [--port=7331]
   workflow-mcp ui [--snapshot] [--port=7331]
   workflow-mcp token show --purpose=mcp|web [--force]
+  workflow-mcp auth login|status|logout [--json]
+  workflow-mcp source approvals [--json]
+  workflow-mcp source approve --name=NAME [--source-hash=SHA256] [--json]
   workflow-mcp instance create|inspect|hash|codex-config [options]
 `)
 }

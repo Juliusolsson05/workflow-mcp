@@ -93,6 +93,12 @@ export type WorkflowServiceOptions = {
    * prevents worker creation. A one-byte edit changes sourceHash and therefore requires a new grant.
    */
   authorizeWorkflowSource?(request: WorkflowSourceAuthorizationRequest): boolean | Promise<boolean>
+  /**
+   * Inline source persists into the project before execution. Embedded Agent Code keeps its
+   * historical authoring behavior by default; read-only products must disable it explicitly so a
+   * policy error is returned before mkdir/open rather than leaking an EROFS implementation detail.
+   */
+  allowInlineWorkflowAuthoring?: boolean
   workerLauncher?: WorkflowWorkerLauncher
   workerFilePath?: string
   limits?: Partial<WorkflowLimits>
@@ -199,6 +205,7 @@ export type WorkflowServiceErrorCode =
   | 'service-stopped'
   | 'unsafe-provider-active'
   | 'source-approval-required'
+  | 'authoring-disabled'
   | 'result-not-ready'
   | 'result-unavailable'
   | 'result-not-found'
@@ -618,6 +625,23 @@ export class WorkflowService {
   /** Synchronous process lease used by hosts which must not replace a provider executable mid-run. */
   hasActiveRuns(): boolean {
     return this.#active.size > 0 || this.#ownedRuns.size > 0
+  }
+
+  /**
+   * Serialize app-owned control-plane persistence with starts/cancels and the store lease. The
+   * callback itself remains application code, but it cannot begin after quiesce or finish after
+   * ownership transfer; a store without this explicit fence fails closed.
+   */
+  async runAdministrativeMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    return this.#withMutationAdmission(async () => {
+      if (this.#options.store.runOwnedMutation === undefined) {
+        throw new WorkflowServiceError(
+          'invalid-request',
+          'This workflow store does not support fenced administrative mutations',
+        )
+      }
+      return this.#options.store.runOwnedMutation(mutation)
+    })
   }
 
   async describe(scope: WorkflowServiceScope, input: { name: string }): Promise<FoundWorkflow> {
@@ -1334,7 +1358,15 @@ export class WorkflowService {
       // payload while adding script/scriptPath during iteration. Rejecting that combination would
       // make a harmless stale selector override the bytes the user explicitly asked to test.
       if (input.scriptPath !== undefined) return await loadScopedWorkflowPath(cwd, input.scriptPath)
-      if (input.script !== undefined) return await persistInlineWorkflow(cwd, input.script)
+      if (input.script !== undefined) {
+        if (this.#options.allowInlineWorkflowAuthoring === false) {
+          throw new WorkflowServiceError(
+            'authoring-disabled',
+            'Inline workflow authoring is disabled for this read-only service profile',
+          )
+        }
+        return await persistInlineWorkflow(cwd, input.script)
+      }
       if (input.name !== undefined) return await this.#resolveVisibleWorkflow(scope, input.name)
     } catch (cause) {
       if (cause instanceof WorkflowAuthoringError) {

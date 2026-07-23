@@ -169,6 +169,39 @@ install_codex_stanza() {
   note "Installed project-scoped Codex MCP stanza in $config_file"
 }
 
+authoring_preflight() {
+  workflow_directory=$project_directory/.claude/workflows
+  [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
+  [ ! -L "$workflow_directory" ] || fail "refusing symlinked workflow directory"
+  canonical_workflows=$(canonical_directory "$workflow_directory")
+  [ "$canonical_workflows" = "$workflow_directory" ] ||
+    fail "workflow authoring path redirects outside the canonical project: $workflow_directory"
+  case "$workflow_directory" in *:*) fail "authoring paths containing ':' are unsupported by the Docker bind probe" ;; esac
+  # Fixed UID 10001 is the runtime principal, so a host-user write test is meaningless on native
+  # Linux. Exercise create, file fsync, rename, directory fsync, and delete through the exact image
+  # UID and bind implementation. We fail with an ACL/ownership action instead of silently running
+  # the daemon as root or broadening the whole project mount.
+  if ! docker run --rm --network none --read-only --user 10001:10001 \
+    --entrypoint /usr/local/bin/node -v "$workflow_directory:/probe" "$WORKFLOW_MCP_IMAGE" -e '
+const fs = require("node:fs");
+const first = `/probe/.workflow-mcp-write-probe-${process.pid}`;
+const second = `${first}.renamed`;
+let fd;
+try {
+  fd = fs.openSync(first, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  fs.writeSync(fd, "probe\n"); fs.fsyncSync(fd); fs.closeSync(fd); fd = undefined;
+  fs.renameSync(first, second);
+  const directory = fs.openSync("/probe", fs.constants.O_RDONLY); fs.fsyncSync(directory); fs.closeSync(directory);
+  fs.unlinkSync(second);
+  const reopened = fs.openSync("/probe", fs.constants.O_RDONLY); fs.fsyncSync(reopened); fs.closeSync(reopened);
+} finally {
+  if (fd !== undefined) fs.closeSync(fd);
+  for (const path of [first, second]) { try { fs.unlinkSync(path); } catch {} }
+}' >/dev/null; then
+    fail "UID 10001 cannot durably author $workflow_directory; grant that UID a narrow ACL/ownership or use read-only mode"
+  fi
+}
+
 install_command() {
   project_arg=${1:-.}; shift || true
   web_arg= authoring_arg=false no_codex=false
@@ -189,6 +222,7 @@ install_command() {
   if [ "$authoring_arg" = true ]; then
     [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
     mkdir -p "$project_directory/.claude/workflows"
+    authoring_preflight
   fi
   mkdir -p "$installation"
   for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
@@ -253,12 +287,92 @@ uninstall_command() {
   [ "$script_dir" != "$installation" ] || note "Remove $installation/workflow-mcp-docker after this command returns."
 }
 
+maintenance_bind_path() {
+  requested=$1 mode=$2
+  case "$requested" in /*) ;; *) fail "$mode path must be absolute" ;; esac
+  maintenance_name=$(basename -- "$requested")
+  [ "$maintenance_name" != . ] && [ "$maintenance_name" != .. ] && [ -n "$maintenance_name" ] || fail "invalid $mode filename"
+  maintenance_directory=$(canonical_directory "$(dirname -- "$requested")")
+  maintenance_host_path=$maintenance_directory/$maintenance_name
+}
+
+run_offline_maintenance() {
+  volume=${compose_project}_workflow-mcp-data
+  docker run --rm --network none --read-only --user 10001:10001 \
+    -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
+    --mount "type=volume,src=$volume,dst=/data,volume-nocopy" "$@"
+}
+
+backup_command() {
+  project_arg=$1; shift
+  action=${1:-}; shift || true
+  case "$action" in
+    create)
+      output=
+      while [ "$#" -gt 0 ]; do case "$1" in --output=*) output=${1#*=} ;; *) fail "unknown backup create option: $1" ;; esac; shift; done
+      [ -n "$output" ] || fail "backup create requires --output=/absolute/file"
+      load_instance "$project_arg"
+      maintenance_bind_path "$output" output
+      [ ! -e "$maintenance_host_path" ] && [ ! -e "$maintenance_host_path.sha256" ] || fail "backup output already exists"
+      compose down --remove-orphans
+      attest_volume
+      note "Workflow MCP is offline; creating a credential-free backup."
+      run_offline_maintenance \
+        --mount "type=bind,src=$maintenance_directory,dst=/backup-output" \
+        "$WORKFLOW_MCP_IMAGE" maintenance backup-create --output="/backup-output/$maintenance_name"
+      note "Backup committed at $maintenance_host_path (checksum: $maintenance_host_path.sha256)."
+      ;;
+    verify)
+      input=
+      while [ "$#" -gt 0 ]; do case "$1" in --input=*) input=${1#*=} ;; *) fail "unknown backup verify option: $1" ;; esac; shift; done
+      [ -n "$input" ] || fail "backup verify requires --input=/absolute/file"
+      load_instance "$project_arg"
+      maintenance_bind_path "$input" input
+      [ -f "$maintenance_host_path" ] && [ -f "$maintenance_host_path.sha256" ] || fail "backup archive or checksum sidecar is missing"
+      docker run --rm --network none --read-only --user "$(id -u):$(id -g)" \
+        -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
+        --mount "type=bind,src=$maintenance_directory,dst=/backup-input,readonly" \
+        "$WORKFLOW_MCP_IMAGE" maintenance backup-verify --input="/backup-input/$maintenance_name"
+      ;;
+    *) fail "backup requires create or verify" ;;
+  esac
+}
+
+restore_command() {
+  project_arg=$1; shift
+  input=
+  while [ "$#" -gt 0 ]; do case "$1" in --input=*) input=${1#*=} ;; *) fail "unknown restore option: $1" ;; esac; shift; done
+  [ -n "$input" ] || fail "restore requires --input=/absolute/file"
+  load_instance "$project_arg"
+  maintenance_bind_path "$input" input
+  [ -f "$maintenance_host_path" ] && [ -f "$maintenance_host_path.sha256" ] || fail "backup archive or checksum sidecar is missing"
+  # Verify before creating or opening the destination volume. A corrupt/wrong-identity archive
+  # therefore cannot turn a fresh install into a partially restored, non-retryable target.
+  docker run --rm --network none --read-only --user "$(id -u):$(id -g)" \
+    -e "WORKFLOW_MCP_INSTANCE_ID=$instance_id" -e "WORKFLOW_MCP_PROJECT_HASH=$project_hash" \
+    --mount "type=bind,src=$maintenance_directory,dst=/backup-input,readonly" \
+    "$WORKFLOW_MCP_IMAGE" maintenance backup-verify --input="/backup-input/$maintenance_name" >/dev/null
+  compose down --remove-orphans
+  compose create
+  attest_volume
+  compose down --remove-orphans
+  run_offline_maintenance \
+    --mount "type=bind,src=$maintenance_directory,dst=/backup-input,readonly" \
+    "$WORKFLOW_MCP_IMAGE" maintenance restore --input="/backup-input/$maintenance_name"
+  note "Restore committed offline. Run $installation/workflow-mcp-docker up when ready; Codex login and local tokens must be recreated."
+}
+
 usage() {
   cat <<'EOF'
 Usage:
   workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--authoring] [--no-codex]
   workflow-mcp-docker up [PROJECT]
   workflow-mcp-docker down|status|logs|doctor|ui|mcp-proxy [PROJECT]
+  workflow-mcp-docker source [PROJECT] approvals|approve [options]
+  workflow-mcp-docker auth [PROJECT] login|status|logout [options]
+  workflow-mcp-docker backup [PROJECT] create --output=/absolute/file
+  workflow-mcp-docker backup [PROJECT] verify --input=/absolute/file
+  workflow-mcp-docker restore [PROJECT] --input=/absolute/file
   workflow-mcp-docker token [PROJECT] --purpose=mcp|web
   workflow-mcp-docker uninstall [PROJECT] [--delete-data --confirm=INSTANCE_ID]
 EOF
@@ -268,7 +382,17 @@ command=${1:-help}; shift || true
 case "$command" in
   install) install_command "$@" ;;
   help|-h|--help) usage ;;
-  up|down|status|logs|doctor|ui|mcp-proxy|token|uninstall)
+  backup)
+    project_arg=$(default_project)
+    if [ "$#" -gt 0 ] && [ "$1" != create ] && [ "$1" != verify ]; then project_arg=$1; shift; fi
+    backup_command "$project_arg" "$@"
+    ;;
+  restore)
+    project_arg=$(default_project)
+    if [ "$#" -gt 0 ]; then case "$1" in --*) ;; *) project_arg=$1; shift ;; esac; fi
+    restore_command "$project_arg" "$@"
+    ;;
+  up|down|status|logs|doctor|ui|mcp-proxy|token|source|auth|uninstall)
     project_arg=$(default_project)
     # Options belong to the selected command, while a non-option first argument
     # remains an explicit project override for source-tree and fleet workflows.
@@ -284,6 +408,8 @@ case "$command" in
       ui) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp ui ;;
       mcp-proxy) load_instance "$project_arg"; exec docker compose -p "$compose_project" --project-directory "$installation" -f "$installation/compose.yaml" exec -T workflow-mcp workflow-mcp mcp-proxy ;;
       token) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp token show "$@" ;;
+      source) load_instance "$project_arg"; compose exec -T workflow-mcp workflow-mcp source "$@" ;;
+      auth) load_instance "$project_arg"; compose exec workflow-mcp workflow-mcp auth "$@" ;;
       uninstall) uninstall_command "$project_arg" "$@" ;;
     esac
     ;;

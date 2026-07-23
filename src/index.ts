@@ -247,7 +247,7 @@ export type {
   WorkflowSourceAuthorizationRequest,
 } from './workflowService.js'
 
-export { registerWorkflowMcpTools, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
+export { registerWorkflowMcpTools, workflowMcpInstructions, WORKFLOW_MCP_INSTRUCTIONS } from './workflowMcp.js'
 export type { WorkflowMcpRegistrationHooks } from './workflowMcp.js'
 export {
   createWorkflowMcpHttpHandler,

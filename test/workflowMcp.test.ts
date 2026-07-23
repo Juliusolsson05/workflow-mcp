@@ -9,11 +9,17 @@ import { describe, expect, it } from 'vitest'
 
 import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
-import { registerWorkflowMcpTools } from '../src/workflowMcp.js'
+import { registerWorkflowMcpTools, workflowMcpInstructions } from '../src/workflowMcp.js'
 import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
 
 describe('workflow MCP facade', () => {
+  it('describes the active source capability without teaching read-only clients to author', () => {
+    expect(workflowMcpInstructions(false)).toContain('Inline script authoring is disabled')
+    expect(workflowMcpInstructions(false)).not.toContain('To author one')
+    expect(workflowMcpInstructions(true)).toContain('To author one')
+  })
+
   it('registers the complete stable thirteen-tool surface', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-mcp-tools-'))
     const service = new WorkflowService({
