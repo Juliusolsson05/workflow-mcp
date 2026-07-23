@@ -1,0 +1,11 @@
+services:
+  workflow-mcp:
+    environment:
+      WORKFLOW_MCP_OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+    secrets:
+      - source: openai-api-key
+        target: openai_api_key
+
+secrets:
+  openai-api-key:
+    file: ${WORKFLOW_MCP_OPENAI_API_KEY_FILE:?absolute API-key file required}

@@ -167,19 +167,26 @@ function inspectIdentity(fd: number, path: string): { dev: number; ino: number }
       )
     }
 
-    // Linux exposes the descriptor status flags without another native binding. The audited
-    // launcher opens O_RDWR|O_NOFOLLOW and clears CLOEXEC only for the one exec into Node. libuv
-    // does not inherit unspecified descriptors into provider children.
+    // Linux exposes both file status and descriptor flags here without another native binding. The
+    // audited launcher clears CLOEXEC for exactly one exec, while its preload constructor restores
+    // CLOEXEC before Node can launch a provider. Requiring the bit here makes child isolation a
+    // verifiable invariant instead of relying on libuv's current close-fd implementation detail.
     const fdInfo = readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8')
     const flagsText = /^flags:\s+([0-7]+)$/m.exec(fdInfo)?.[1]
     const flags = flagsText === undefined ? undefined : Number.parseInt(flagsText, 8)
     const oAccmode = 0o3
     const oRdwr = 0o2
     const oNofollow = 0o400000
-    if (flags === undefined || (flags & oAccmode) !== oRdwr || (flags & oNofollow) === 0) {
+    const oCloexec = 0o2000000
+    if (
+      flags === undefined ||
+      (flags & oAccmode) !== oRdwr ||
+      (flags & oNofollow) === 0 ||
+      (flags & oCloexec) === 0
+    ) {
       throw new InheritedFlockLeaseError(
         'invalid-lock',
-        'Inherited coordination descriptor lacks O_RDWR or O_NOFOLLOW',
+        'Inherited coordination descriptor lacks O_RDWR, O_NOFOLLOW, or O_CLOEXEC',
       )
     }
     return { dev: Number(descriptor.dev), ino: Number(descriptor.ino) }

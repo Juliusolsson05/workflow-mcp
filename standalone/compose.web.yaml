@@ -1,0 +1,10 @@
+services:
+  workflow-mcp:
+    environment:
+      WORKFLOW_MCP_WEB_ENABLED: "true"
+    ports:
+      - name: local-api
+        target: 7331
+        published: "${WORKFLOW_MCP_PORT:?explicit or launcher-allocated loopback port required}"
+        host_ip: 127.0.0.1
+        protocol: tcp

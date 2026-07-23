@@ -39,8 +39,16 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
   await pathCheck(checks, 'data-writable', config.dataDirectory, constants.R_OK | constants.W_OK | constants.X_OK)
   await pathCheck(checks, 'codex-executable', config.codexExecutable, constants.R_OK | constants.X_OK)
   if (config.leaseMode === 'inherited-flock') {
-    const descriptorPath = `/proc/self/fdinfo/${config.lockFileDescriptor}`
-    await pathCheck(checks, 'flock-descriptor', descriptorPath, constants.R_OK)
+    if (config.lockFileDescriptor === undefined) {
+      checks.push({
+        id: 'flock-descriptor',
+        status: 'warn',
+        message: 'Client process has no owner descriptor; daemon ownership must be inspected separately',
+      })
+    } else {
+      const descriptorPath = `/proc/self/fdinfo/${config.lockFileDescriptor}`
+      await pathCheck(checks, 'flock-descriptor', descriptorPath, constants.R_OK)
+    }
   } else {
     checks.push({
       id: 'flock-descriptor',

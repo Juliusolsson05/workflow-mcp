@@ -40,8 +40,11 @@ export function loadStandaloneConfig(
     'lease',
     ['inherited-flock', 'embedded'],
   )
-  const lockFileDescriptor = leaseMode === 'inherited-flock'
-    ? integer(environment.WORKFLOW_MCP_LOCK_FD ?? '', 'WORKFLOW_MCP_LOCK_FD', 3, 1_024)
+  // Client-only processes run in the same image but never receive the owner's descriptor. Keep
+  // configuration parseable for healthcheck/proxy/doctor and let the application composition root
+  // reject a missing descriptor before it touches durable state.
+  const lockFileDescriptor = leaseMode === 'inherited-flock' && environment.WORKFLOW_MCP_LOCK_FD !== undefined
+    ? integer(environment.WORKFLOW_MCP_LOCK_FD, 'WORKFLOW_MCP_LOCK_FD', 3, 1_024)
     : undefined
   const lockPath = leaseMode === 'inherited-flock'
     ? absolutePath(
