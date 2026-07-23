@@ -54,22 +54,43 @@ export class CodexCredentialBroker {
       })
     }
     if (this.#hostCodexAuthFile !== undefined) {
-      // Host-inherited auth: the mounted file only SEEDS the isolated home (rotation stays
-      // container-side), so status is a cheap mount check rather than a Codex spawn. The
-      // authoritative login state belongs to the host's own `codex login`; reporting anything
-      // deeper here would race the host CLI over a file this daemon deliberately never writes.
-      // Readability matters as much as shape: a bind-mounted 0600 host file stats fine but
-      // EACCESes for UID 10001 on native Linux, and status must not call that "authenticated".
+      // WHY this asks Codex instead of trusting the file: the previous version reported
+      // "configured" whenever the mounted seed was merely readable. That is not the same claim.
+      // A host ChatGPT/subscription login carries account/config state beyond auth.json, so the
+      // seed can copy cleanly and still leave the containerized Codex unable to authenticate —
+      // which surfaced to operators as a READY daemon whose every agent died with EPIPE. Status
+      // must reflect whether Codex can actually run, so a shape check gates a real `login status`
+      // spawn, and an inherited credential that cannot authenticate is reported honestly as
+      // unauthenticated with the actionable next step.
       const seed = lstatSyncSafe(this.#hostCodexAuthFile)
-      const usable = seed !== undefined && seed.isFile() && !seed.isSymbolicLink() &&
+      const mounted = seed !== undefined && seed.isFile() && !seed.isSymbolicLink() &&
         readableSync(this.#hostCodexAuthFile)
-      return Object.freeze({
-        schemaVersion: 1,
-        mode: 'host-codex',
-        authenticated: usable,
-        detail: usable
-          ? 'Codex credentials are inherited from the host Codex login'
-          : 'Mounted host Codex credential is missing; run `codex login` on the host, then restart',
+      if (!mounted) {
+        return Object.freeze({
+          schemaVersion: 1,
+          mode: 'host-codex',
+          authenticated: false,
+          detail: 'Mounted host Codex credential is missing or unreadable; run `auth login` to create a container credential instead',
+        })
+      }
+      return this.#exclusive(async () => {
+        const result = await runCodex(
+          this.#codexExecutable,
+          ['login', 'status'],
+          this.#environment(),
+          undefined,
+          signal,
+        )
+        return Object.freeze({
+          schemaVersion: 1,
+          mode: 'host-codex',
+          authenticated: result.code === 0,
+          detail: result.code === 0
+            ? 'Codex credentials inherited from the host login are usable in this container'
+            : boundedDetail(
+                `Inherited host credential is not usable by the containerized Codex; run \`auth login\` to create a container credential. ${result.stderr || result.stdout}`,
+              ),
+        })
       })
     }
     return this.#exclusive(async () => {
@@ -96,12 +117,14 @@ export class CodexCredentialBroker {
         'Interactive login is disabled while the API-key secret overlay is configured',
       ))
     }
-    if (this.#hostCodexAuthFile !== undefined) {
-      return Promise.reject(authError(
-        'auth-mode-conflict',
-        'Credentials are inherited from the host; run `codex login` on the host instead',
-      ))
-    }
+    // WHY inheritance never blocks login: refusing here created the worst possible state — the
+    // installer detected a host login, the containerized Codex could not actually use it, and the
+    // one command that would have fixed it was rejected as an "auth-mode conflict", leaving the
+    // operator with no in-product way out. A container-side device login is always permitted and
+    // deliberately WINS: it writes a real credential into the isolated Codex home, which the SDK's
+    // seed-and-preserve contract then keeps over the older mounted seed. Only an explicit API-key
+    // secret still refuses, because that credential is supplied by an external operator decision
+    // this daemon does not own.
     return this.#exclusive(async () => {
       const result = await runCodex(
         this.#codexExecutable,
@@ -121,12 +144,9 @@ export class CodexCredentialBroker {
         'Logout cannot remove a host-managed API-key secret; remove the Compose overlay instead',
       ))
     }
-    if (this.#hostCodexAuthFile !== undefined) {
-      return Promise.reject(authError(
-        'auth-mode-conflict',
-        'Credentials are inherited from the host; run `codex logout` on the host instead',
-      ))
-    }
+    // Logout clears the container's own Codex home for the same reason login may write it: the
+    // operator must be able to reset container credential state without editing host files. The
+    // host seed itself is never modified — removing it remains a host-side `codex logout`.
     return this.#exclusive(async () => {
       const result = await runCodex(
         this.#codexExecutable,

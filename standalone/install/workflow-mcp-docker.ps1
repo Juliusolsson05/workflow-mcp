@@ -514,7 +514,7 @@ function Test-AdoptionPreflight([string] $InstanceId) {
 
 function Install-Command() {
   $WebPort = $null; $ApiKeyFile = $null; $AdoptInstance = $null; $Authoring = $false; $NoCodex = $false
-  $Hardened = $false; $NoWeb = $false
+  $Hardened = $false; $NoWeb = $false; $NoHostAuth = $false
   foreach ($Argument in $Rest) {
     if ($Argument -match '^--web-port=(\d+)$') { $WebPort = [int]$Matches[1] }
     elseif ($Argument -eq "--authoring") { $Authoring = $true }
@@ -523,6 +523,7 @@ function Install-Command() {
     elseif ($Argument -match '^--adopt-instance=(.+)$') { $AdoptInstance = $Matches[1] }
     elseif ($Argument -eq "--no-codex") { $NoCodex = $true }
     elseif ($Argument -eq "--no-web") { $NoWeb = $true }
+    elseif ($Argument -eq "--no-host-auth") { $NoHostAuth = $true }
     else { Fail "unknown install option: $Argument" }
   }
   $script:ProjectDirectory = Canonical-Directory $Project
@@ -547,7 +548,7 @@ function Install-Command() {
   # Host Codex credential detection: record only the boolean; the live path is re-resolved every
   # command. Explicit API key wins; hardened never inherits host credentials.
   $HostCodexAuth = $false
-  if (-not $Hardened -and $null -eq $ApiKeyFile) {
+  if (-not $Hardened -and -not $NoHostAuth -and $null -eq $ApiKeyFile) {
     $DetectedCodexAuth = Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }) "auth.json"
     if ((Test-Path -LiteralPath $DetectedCodexAuth -PathType Leaf) -and
       -not ((Get-Item -Force -LiteralPath $DetectedCodexAuth).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
