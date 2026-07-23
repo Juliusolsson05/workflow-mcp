@@ -553,13 +553,11 @@ validate_authoring_path() {
   case "$workflow_directory" in *:*) fail "authoring paths containing ':' are unsupported by the Docker bind probe" ;; esac
 }
 
-authoring_preflight() {
-  validate_authoring_path
-  # Fixed UID 10001 is the runtime principal, so a host-user write test is meaningless on native
-  # Linux. Exercise create, file fsync, rename, directory fsync, and delete through the exact image
-  # UID and bind implementation. We fail with an ACL/ownership action instead of silently running
-  # the daemon as root or broadening the whole project mount.
-  if ! docker run --rm --network none --read-only --user 10001:10001 \
+# Fixed UID 10001 is the runtime principal, so a host-user write test is meaningless on native
+# Linux. Exercise create, file fsync, rename, directory fsync, and delete through the exact image
+# UID and bind implementation.
+authoring_probe() {
+  docker run --rm --network none --read-only --user 10001:10001 \
     --entrypoint /usr/local/bin/node -v "$workflow_directory:/probe" "$WORKFLOW_MCP_IMAGE" -e '
 const fs = require("node:fs");
 const first = `/probe/.workflow-mcp-write-probe-${process.pid}`;
@@ -575,9 +573,35 @@ try {
 } finally {
   if (fd !== undefined) fs.closeSync(fd);
   for (const path of [first, second]) { try { fs.unlinkSync(path); } catch {} }
-}' >/dev/null; then
+}' >/dev/null 2>&1
+}
+
+authoring_preflight() {
+  validate_authoring_path
+  # Hardened authoring stays fail-closed with an ACL/ownership action, instead of silently running
+  # the daemon as root or broadening the whole project mount.
+  authoring_probe ||
     fail "UID 10001 cannot durably author $workflow_directory; grant that UID a narrow ACL/ownership or use read-only mode"
+}
+
+# The default profile's inline authoring persists sources INTO the project through the container
+# UID. Docker Desktop rewrites bind ownership so this always works there, but a native Linux
+# engine keeps the host directory's real owner/mode and UID 10001 cannot write a runner-owned 755
+# directory — the exact macOS-passes/Linux-fails class from the bind-mount lessons. The launcher
+# owns install/start, so it repairs what it can (a narrow ACL on .claude/workflows only — never
+# the whole project) and otherwise DEGRADES with the one-line fix: file-based workflows still run;
+# only inline persistence would fail, with a clear MCP error rather than a broken install.
+default_authoring_setup() {
+  [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
+  mkdir -p "$project_directory/.claude/workflows"
+  validate_authoring_path
+  authoring_probe && return 0
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:10001:rwx -m d:u:10001:rwx "$workflow_directory" 2>/dev/null || true
+    authoring_probe && return 0
   fi
+  note "UID 10001 cannot write $workflow_directory; inline workflow authoring will fail until you run: setfacl -m u:10001:rwx -m d:u:10001:rwx $workflow_directory"
+  return 0
 }
 
 install_command() {
@@ -683,6 +707,8 @@ install_command() {
     [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
     mkdir -p "$project_directory/.claude/workflows"
     authoring_preflight
+  elif [ "$hardened_arg" = false ]; then
+    default_authoring_setup
   fi
   mkdir -m 700 "$installation"
   for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml; do
@@ -1135,7 +1161,7 @@ case "$command" in
       esac
     fi
     case "$command" in
-      up) [ "$#" -eq 0 ] || fail "up accepts a project path only"; load_instance "$project_arg"; require_runtime_api_key; [ "${authoring:-false}" != true ] || authoring_preflight; preflight_host_codex_auth; preflight_web_port; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
+      up) [ "$#" -eq 0 ] || fail "up accepts a project path only"; load_instance "$project_arg"; require_runtime_api_key; if [ "${authoring:-false}" = true ]; then authoring_preflight; elif [ "${hardened:-true}" != true ]; then default_authoring_setup; fi; preflight_host_codex_auth; preflight_web_port; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
       down) [ "$#" -eq 0 ] || fail "down accepts a project path only"; load_instance "$project_arg"; compose down --remove-orphans ;;
       status)
         [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = --json ]; } || fail "status accepts only --json"
@@ -1166,7 +1192,9 @@ case "$command" in
         # of the recovery start must go to stderr; a failed start still fails the proxy loudly.
         if ! compose ps --status running workflow-mcp 2>/dev/null | grep -q workflow-mcp; then
           require_runtime_api_key
-          [ "${authoring:-false}" != true ] || authoring_preflight
+          if [ "${authoring:-false}" = true ]; then authoring_preflight
+          elif [ "${hardened:-true}" != true ]; then default_authoring_setup >&2
+          fi
           preflight_host_codex_auth
           preflight_web_port
           compose create >&2

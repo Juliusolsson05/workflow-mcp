@@ -588,6 +588,16 @@ function Install-Command() {
     }
     New-Item -ItemType Directory -Force -Path $WorkflowDirectory | Out-Null
     Test-AuthoringPath $true
+  } elseif (-not $Hardened) {
+    # Default-profile inline authoring persists into .claude/workflows through the container UID.
+    # Windows always runs Docker Desktop, whose file sharing maps bind ownership, so creating the
+    # directory is sufficient here — the POSIX launcher additionally repairs native-Linux ACLs.
+    $ClaudeDirectory = Join-Path $script:ProjectDirectory ".claude"
+    if ((Test-Path -LiteralPath $ClaudeDirectory) -and
+        ((Get-Item -Force -LiteralPath $ClaudeDirectory).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      Fail "refusing redirected authoring path: $ClaudeDirectory"
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $ClaudeDirectory "workflows") | Out-Null
   }
   $CreatedInstallation = New-Item -ItemType Directory -Path $script:Installation
   if (-not $CreatedInstallation.PSIsContainer -or
