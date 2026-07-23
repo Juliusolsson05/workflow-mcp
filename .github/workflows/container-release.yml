@@ -303,7 +303,12 @@ jobs:
               const child=process.argv[2];
               if(manifest.subject!==undefined&&manifest.subject?.digest!==child) process.exit(1);
               const types=new Set((manifest.layers??[]).map(layer=>layer.annotations?.["in-toto.io/predicate-type"]));
-              if(!types.has("https://slsa.dev/provenance/v0.2") || !types.has("https://spdx.dev/Document")) process.exit(1);
+              // WHY both SLSA versions: the predicate version is chosen by the pinned BuildKit,
+              // not by this workflow — current BuildKit emits provenance v1 where older releases
+              // emitted v0.2 (the first real v0.1.0 run failed on exactly this drift, with both
+              // attestations present and correct). Either version proves the same mode=max
+              // provenance requirement; absence of any SLSA predicate remains fatal.
+              if(!(types.has("https://slsa.dev/provenance/v1") || types.has("https://slsa.dev/provenance/v0.2")) || !types.has("https://spdx.dev/Document")) process.exit(1);
             ' "$raw" "$child"
           done <<EOF
           $descriptors
