@@ -50,11 +50,17 @@ export async function createStandaloneApplication(
   const store = new FileWorkflowStore(join(config.dataDirectory, 'store'), {
     ...(leaseBackend === undefined ? {} : { leaseBackend }),
   })
-  // Read-only installations treat the operator-controlled checkout present at daemon startup as
-  // their review boundary. Authoring deliberately cannot inherit that shortcut: its own MCP/API
-  // can persist executable bytes, so re-snapshotting on restart would turn "write, restart" into
-  // an approval bypass and would also resurrect an approval after the reviewed hash was edited.
-  const approvedSources = config.sourceMode === 'read-only'
+  // Approval is a PROFILE decision, not a security invariant of this composition (see
+  // docs/CONSUMER_SIMPLIFICATION_PLAN.md §3). The default single-user profile runs without any
+  // source gate: the operator launched this daemon against their own project, and every authored
+  // workflow is their own agent's output, so demanding a hash-fenced re-authorization only
+  // re-created the friction the product exists to remove. The hardened profile keeps both
+  // original models intact: read-only snapshots the operator-controlled checkout at startup as
+  // its review boundary, while authoring deliberately cannot inherit that shortcut — its own
+  // MCP/API can persist executable bytes, so re-snapshotting on restart would turn
+  // "write, restart" into an approval bypass and would resurrect approvals after edits.
+  const approvalsRequired = config.approvalMode === 'required'
+  const approvedSources = approvalsRequired && config.sourceMode === 'read-only'
     ? await startupSourceApprovals(config.workspace)
     : new Set<string>()
   const sourceApprovals = new SourceApprovalStore(config.dataDirectory, config.projectHash)
@@ -68,12 +74,16 @@ export async function createStandaloneApplication(
     store,
     provider,
     // A source is approved by canonical path plus immutable bytes. Startup discovery is only the
-    // read-only profile's review boundary; authoring relies exclusively on the durable two-step
-    // approval store, including across restarts, because it can create its own visible files.
-    authorizeWorkflowSource: request => (
-      approvedSources.has(`${resolve(request.canonicalIdentity)}\0${request.sourceHash}`) ||
-      sourceApprovals.isApproved(request.canonicalIdentity, request.sourceHash)
-    ),
+    // read-only hardened profile's review boundary; hardened authoring relies exclusively on the
+    // durable two-step approval store because it can create its own visible files. The default
+    // profile authorizes unconditionally — the gate itself is what the consumer profile removes,
+    // and building a weaker provenance-tracking variant would only duplicate hardened poorly.
+    authorizeWorkflowSource: approvalsRequired
+      ? request => (
+          approvedSources.has(`${resolve(request.canonicalIdentity)}\0${request.sourceHash}`) ||
+          sourceApprovals.isApproved(request.canonicalIdentity, request.sourceHash)
+        )
+      : () => true,
     allowInlineWorkflowAuthoring: config.sourceMode === 'authoring',
     sandbox: {
       mode: config.sourceMode === 'authoring' ? 'workspace-write' : 'read-only',
@@ -125,8 +135,38 @@ async function createCodexProvider(
 ): Promise<CodexAgentProvider> {
   const executableBytes = await readFile(config.codexExecutable)
   const effectiveConfigurationFingerprint = await codexPolicyFingerprint(config, environment)
+  // Host-auth inheritance rides the SDK's existing seed-and-preserve contract: the mounted host
+  // file is read-only and only SEEDS the writable /data/codex-home copy, later token rotation
+  // stays container-side, and deleting the host file acts as durable logout. This is the same
+  // never-let-the-child-write-the-source shape agent-code uses, and it is why a read-only bind
+  // cannot break Codex refresh. Validate the mount here so a broken bind fails startup loudly
+  // instead of surfacing as an EPIPE from the first spawned agent. The check must actually READ
+  // the bytes, not just lstat: Compose file secrets are bind mounts that keep the host file's
+  // real owner and mode, so a native-Linux 0600 file stats fine yet EACCESes on open for UID
+  // 10001. The launcher preflights readability with the same UID before setting this variable,
+  // so failing loudly here catches only genuine drift between preflight and start.
+  if (config.hostCodexAuthFile !== undefined) {
+    const seed = await lstat(config.hostCodexAuthFile).catch(() => undefined)
+    if (seed === undefined || !seed.isFile() || seed.isSymbolicLink()) {
+      throw credentialError(
+        'authentication-failed',
+        'Mounted host Codex credential must be an ordinary readable file',
+      )
+    }
+    const seedBytes = await readFile(config.hostCodexAuthFile).catch(() => undefined)
+    if (seedBytes === undefined) {
+      throw credentialError(
+        'authentication-failed',
+        'Mounted host Codex credential is not readable by UID 10001; grant read access on the host (native Linux: setfacl -m u:10001:r <file>) and restart',
+      )
+    }
+    seedBytes.fill(0)
+  }
   const isolation = {
     codexHome: join(config.dataDirectory, 'codex-home'),
+    ...(config.hostCodexAuthFile === undefined
+      ? {}
+      : { authenticationFile: config.hostCodexAuthFile }),
     ...(effectiveConfigurationFingerprint === undefined
       ? {}
       : { effectiveConfigurationFingerprint }),

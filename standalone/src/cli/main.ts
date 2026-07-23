@@ -110,6 +110,8 @@ async function main(arguments_: string[]): Promise<void> {
         image: requiredStringArgument(parsed.flags, 'image'),
         ...(webPortValue === undefined ? {} : { webPort: parsePort(webPortValue, 'web-port') }),
         authoring: parsed.flags.authoring === true,
+        hardened: parsed.flags.hardened === true,
+        hostCodexAuth: parsed.flags['host-codex-auth'] === true,
         ...(stringArgument(parsed.flags, 'api-key-file') === undefined
           ? {}
           : { apiKeyFile: stringArgument(parsed.flags, 'api-key-file')! }),
@@ -130,7 +132,7 @@ async function main(arguments_: string[]): Promise<void> {
       if (format === 'posix-shell') process.stdout.write(renderPosixInstanceEnvironment(record))
       else if (format !== undefined) throw new StandaloneConfigurationError('Unsupported instance format')
       else if (field === undefined) process.stdout.write(`${JSON.stringify(record)}\n`)
-      else if (['instanceId', 'composeProjectName', 'projectHash', 'dockerContext', 'dockerEndpoint', 'dockerDaemonFingerprint', 'image', 'webPort', 'authoring', 'apiKeyFile'].includes(field)) {
+      else if (['instanceId', 'composeProjectName', 'projectHash', 'dockerContext', 'dockerEndpoint', 'dockerDaemonFingerprint', 'image', 'webPort', 'authoring', 'hardened', 'hostCodexAuth', 'apiKeyFile'].includes(field)) {
         const value = record[field as keyof typeof record]
         process.stdout.write(value === undefined ? '' : `${String(value)}\n`)
       } else throw new StandaloneConfigurationError('Unsupported instance field')
@@ -379,6 +381,14 @@ async function main(arguments_: string[]): Promise<void> {
     if (parsed.positionals[0] !== undefined) {
       parsed.flags.workspace = parsed.positionals[0]
     }
+    // The generic OCI/Registry STDIO surface has no launcher attesting mounts, no operator
+    // profile record, and its published metadata promises the conservative posture (read-only
+    // workspace, gated authoring). The consumer `default` profile is a decision an installer
+    // makes explicitly; an anonymous `docker run` must not inherit it, so this one entry point
+    // pins hardened unless the caller opts out in their own run command.
+    if (process.env.WORKFLOW_MCP_PROFILE === undefined && parsed.flags.profile === undefined) {
+      parsed.flags.profile = 'hardened'
+    }
     const config = loadStandaloneConfig(parsed.flags)
     // Generic OCI registries launch one STDIO process and cannot express the Compose daemon's
     // independent lifecycle. Put the distinction on stderr at the actual execution boundary so a
@@ -474,6 +484,8 @@ async function verifyInstalledPolicy(directory: string): Promise<void> {
     'compose.web.yaml',
     'compose.authoring.yaml',
     'compose.auth-api-key.yaml',
+    'compose.auth-host-codex.yaml',
+    'compose.hardened.yaml',
     'compose.project-codex-mask.yaml',
   ]) {
     const target = join(directory, name)
@@ -501,7 +513,8 @@ function parseArguments(arguments_: string[]): {
   // every boolean works in either option-first or positional-first order and generated Catalog
   // arguments behave exactly like the documented direct Docker invocation.
   const booleanFlags = new Set([
-    'authoring', 'container', 'force', 'help', 'json', 'skip-identity', 'snapshot', 'stdio',
+    'authoring', 'container', 'force', 'hardened', 'help', 'host-codex-auth', 'json',
+    'skip-identity', 'snapshot', 'stdio',
   ])
   const flags: Record<string, string | boolean> = {}
   const positionals: string[] = []
@@ -536,7 +549,7 @@ function validateCommandArguments(
   command: string,
   parsed: Readonly<{ flags: Readonly<Record<string, string | boolean>>; positionals: readonly string[] }>,
 ): void {
-  const common = ['workspace', 'data-dir', 'host', 'port', 'source-mode', 'lease', 'web', 'concurrency']
+  const common = ['workspace', 'data-dir', 'host', 'port', 'profile', 'source-mode', 'lease', 'web', 'concurrency']
   let flags: readonly string[]
   let positionals: number
   switch (command) {
@@ -567,7 +580,7 @@ function validateCommandArguments(
     ]; positionals = 1; break
     case 'instance': {
       const action = parsed.positionals[0]
-      const create = ['project', 'docker-context', 'docker-endpoint', 'docker-daemon-fingerprint', 'image', 'web-port', 'authoring', 'api-key-file']
+      const create = ['project', 'docker-context', 'docker-endpoint', 'docker-daemon-fingerprint', 'image', 'web-port', 'authoring', 'hardened', 'host-codex-auth', 'api-key-file']
       if (action === 'create') flags = create
       else if (action === 'adopt') flags = [...create, 'instance-id']
       else if (action === 'inspect') flags = ['file', 'field', 'format']
@@ -595,7 +608,7 @@ function validateCommandArguments(
   for (const flag of Object.keys(parsed.flags)) {
     if (!flags.includes(flag)) throw new StandaloneConfigurationError(`Unknown ${command} option --${flag}`)
   }
-  for (const flag of ['container', 'json', 'snapshot', 'stdio', 'skip-identity', 'force', 'authoring']) {
+  for (const flag of ['container', 'json', 'snapshot', 'stdio', 'skip-identity', 'force', 'authoring', 'hardened', 'host-codex-auth']) {
     const value = parsed.flags[flag]
     if (value !== undefined && value !== true) {
       throw new StandaloneConfigurationError(`--${flag} does not take a value`)

@@ -12,7 +12,19 @@ else
   bundle_root=$(CDPATH='' cd -- "$script_dir/.." && pwd -P)
 fi
 
-upgrade_names='LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env SHA256SUMS .gitignore instance.json'
+upgrade_names='LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env SHA256SUMS .gitignore instance.json'
+# Overlays introduced by the consumer-defaults release. A bundle installed by an earlier release
+# legitimately does not contain them, so upgrade staging and interrupted-upgrade recovery must
+# treat their absence as "older bundle", never as corruption — otherwise the first release that
+# adds a file makes every existing installation refuse to upgrade to it.
+optional_upgrade_names='compose.auth-host-codex.yaml compose.hardened.yaml'
+
+is_optional_upgrade_file() {
+  case " $optional_upgrade_names " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 cleanup_upgrade_directories() {
   [ ! -f "$1/.upgrade-transaction.preparing" ] || rm -- "$1/.upgrade-transaction.preparing"
@@ -36,11 +48,18 @@ recover_interrupted_upgrade() {
   recovery_rollback=$recovery_installation/.upgrade-rollback
   [ -d "$recovery_rollback" ] || fail "upgrade rollback marker exists without rollback bytes"
   for name in $upgrade_names; do
-    [ -f "$recovery_rollback/$name" ] || fail "upgrade rollback is incomplete: $name"
+    [ -f "$recovery_rollback/$name" ] || is_optional_upgrade_file "$name" ||
+      fail "upgrade rollback is incomplete: $name"
   done
   # Copy rather than move so recovery itself is retryable after interruption. Every public target
   # is replaced by rename, while the marker remains until the entire old bundle is coherent again.
+  # An optional overlay absent from the rollback set means the OLD bundle predates it: restore
+  # means removing any half-switched new copy, not failing on the missing old one.
   for name in $upgrade_names; do
+    if [ ! -f "$recovery_rollback/$name" ] && is_optional_upgrade_file "$name"; then
+      [ ! -e "$recovery_installation/$name" ] || rm -- "$recovery_installation/$name"
+      continue
+    fi
     recovery_temporary=$recovery_installation/.recover-$name-$$
     cp "$recovery_rollback/$name" "$recovery_temporary"
     mv "$recovery_temporary" "$recovery_installation/$name"
@@ -223,6 +242,7 @@ load_instance() {
   # Instance metadata is the source of truth. Ambient values from a previous load/parent shell
   # must not silently enable an overlay that the attested record does not name.
   unset WORKFLOW_MCP_PORT WORKFLOW_MCP_WORKFLOW_DIR WORKFLOW_MCP_OPENAI_API_KEY_FILE
+  unset WORKFLOW_MCP_PROFILE WORKFLOW_MCP_HOST_CODEX_AUTH
   api_key_unavailable=false
   # ShellCheck cannot infer the fixed variables emitted by `instance inspect`; the strict parser in
   # the pinned image is the only producer and the validation immediately below still fails closed.
@@ -275,6 +295,22 @@ load_instance() {
       api_key_unavailable=true
     fi
   fi
+  # shellcheck disable=SC2154
+  if [ "$hardened" = true ]; then export WORKFLOW_MCP_PROFILE=hardened; fi
+  # The record stores only the host-auth BOOLEAN. The path is re-resolved from the live
+  # CODEX_HOME/HOME at every command so host-side rotation or relocation keeps working without a
+  # record rewrite. A missing file downgrades to container-interactive auth with a warning — the
+  # daemon must still start so the operator can use `auth login` instead — mirroring how a
+  # rotated-away API key is a hard refusal (an explicit credential) but an inherited one is not.
+  # shellcheck disable=SC2154
+  if [ "$host_codex_auth" = true ]; then
+    live_codex_auth="${CODEX_HOME:-$HOME/.codex}/auth.json"
+    if [ -f "$live_codex_auth" ] && [ ! -L "$live_codex_auth" ]; then
+      export WORKFLOW_MCP_HOST_CODEX_AUTH="$live_codex_auth"
+    else
+      note "Host Codex credential not found at $live_codex_auth; starting without inherited auth. Run codex login on the host, or $installation/workflow-mcp-docker auth login."
+    fi
+  fi
 }
 
 require_runtime_api_key() {
@@ -296,6 +332,11 @@ compose() {
   fi
   if [ -n "${web_port:-}" ]; then set -- -f "$installation/compose.web.yaml" "$@"; fi
   if [ "${authoring:-false}" = true ]; then set -- -f "$installation/compose.authoring.yaml" "$@"; fi
+  if [ "${hardened:-false}" = true ]; then set -- -f "$installation/compose.hardened.yaml" "$@"; fi
+  if [ -n "${WORKFLOW_MCP_HOST_CODEX_AUTH:-}" ]; then
+    set -- -f "$installation/compose.auth-host-codex.yaml" "$@"
+    export WORKFLOW_MCP_HOST_CODEX_AUTH
+  fi
   if [ -n "${WORKFLOW_MCP_OPENAI_API_KEY_FILE:-}" ]; then
     case "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" in /*) ;; *) fail "API key file path must be absolute" ;; esac
     [ -f "$WORKFLOW_MCP_OPENAI_API_KEY_FILE" ] || fail "API key file does not exist"
@@ -304,6 +345,56 @@ compose() {
   fi
   set -- -p "$compose_project" --project-directory "$installation" -f "$installation/compose.yaml" "$@"
   docker compose "$@"
+}
+
+# The host credential seed is useless unless the runtime UID can actually read it through the
+# bind: native Linux preserves the host file's real owner and 0600 mode, so UID 10001 can lstat
+# yet not read it — which would otherwise surface as an opaque agent-spawn failure long after a
+# READY daemon claimed auth was configured. Same fixed-UID probe pattern as api_key_preflight.
+host_codex_auth_readable() {
+  docker run --rm --network none --read-only --user 10001:10001 \
+    --mount "type=bind,src=$1,dst=/probe/auth.json,readonly" \
+    --entrypoint /usr/local/bin/node "$WORKFLOW_MCP_IMAGE" -e '
+    require("node:fs").accessSync("/probe/auth.json", require("node:fs").constants.R_OK)
+  ' >/dev/null 2>&1
+}
+
+# Runs only on the daemon-start paths (up / mcp-proxy auto-up), not in load_instance: a per-command
+# container probe would tax every status/logs call for a check that only matters before a start.
+preflight_host_codex_auth() {
+  [ -n "${WORKFLOW_MCP_HOST_CODEX_AUTH:-}" ] || return 0
+  if ! host_codex_auth_readable "$WORKFLOW_MCP_HOST_CODEX_AUTH"; then
+    note "Host Codex credential at $WORKFLOW_MCP_HOST_CODEX_AUTH is not readable by UID 10001; starting without inherited auth. On native Linux run: setfacl -m u:10001:r $WORKFLOW_MCP_HOST_CODEX_AUTH"
+    unset WORKFLOW_MCP_HOST_CODEX_AUTH
+  fi
+}
+
+# WHY the probe runs inside a container: the launcher deliberately has no host Node/nc/curl
+# dependency, but every supported host has Docker. host.docker.internal is built into Docker
+# Desktop and the host-gateway alias provides it on native Linux engines, so one connect attempt
+# answers "is anything listening on this loopback port" identically on all platforms.
+host_port_in_use() {
+  docker run --rm --add-host=host.docker.internal:host-gateway \
+    --entrypoint /usr/local/bin/node "$WORKFLOW_MCP_IMAGE" -e '
+    const socket = require("node:net").connect(Number(process.argv[1]), "host.docker.internal");
+    socket.on("connect", () => { socket.destroy(); process.exit(0) });
+    socket.on("error", () => process.exit(1));
+    setTimeout(() => process.exit(1), 1500);
+  ' "$1" >/dev/null 2>&1
+}
+
+# A second default install on the same machine must not fight the first for the dashboard port,
+# and a colliding port must degrade to "no web this start" instead of failing the whole daemon —
+# Codex connectivity is strictly more important than the dashboard. Explicit --web-port keeps
+# today's loud failure; only the DEFAULTED port negotiates.
+preflight_web_port() {
+  [ -n "${web_port:-}" ] || return 0
+  compose ps --status running workflow-mcp 2>/dev/null | grep -q workflow-mcp && return 0
+  if host_port_in_use "$web_port"; then
+    note "Port $web_port is already in use; starting without the web UI. Free the port (or reinstall with --web-port) and run up again."
+    web_port=''
+    unset WORKFLOW_MCP_PORT
+  fi
 }
 
 attest_volume() {
@@ -462,13 +553,11 @@ validate_authoring_path() {
   case "$workflow_directory" in *:*) fail "authoring paths containing ':' are unsupported by the Docker bind probe" ;; esac
 }
 
-authoring_preflight() {
-  validate_authoring_path
-  # Fixed UID 10001 is the runtime principal, so a host-user write test is meaningless on native
-  # Linux. Exercise create, file fsync, rename, directory fsync, and delete through the exact image
-  # UID and bind implementation. We fail with an ACL/ownership action instead of silently running
-  # the daemon as root or broadening the whole project mount.
-  if ! docker run --rm --network none --read-only --user 10001:10001 \
+# Fixed UID 10001 is the runtime principal, so a host-user write test is meaningless on native
+# Linux. Exercise create, file fsync, rename, directory fsync, and delete through the exact image
+# UID and bind implementation.
+authoring_probe() {
+  docker run --rm --network none --read-only --user 10001:10001 \
     --entrypoint /usr/local/bin/node -v "$workflow_directory:/probe" "$WORKFLOW_MCP_IMAGE" -e '
 const fs = require("node:fs");
 const first = `/probe/.workflow-mcp-write-probe-${process.pid}`;
@@ -484,9 +573,35 @@ try {
 } finally {
   if (fd !== undefined) fs.closeSync(fd);
   for (const path of [first, second]) { try { fs.unlinkSync(path); } catch {} }
-}' >/dev/null; then
+}' >/dev/null 2>&1
+}
+
+authoring_preflight() {
+  validate_authoring_path
+  # Hardened authoring stays fail-closed with an ACL/ownership action, instead of silently running
+  # the daemon as root or broadening the whole project mount.
+  authoring_probe ||
     fail "UID 10001 cannot durably author $workflow_directory; grant that UID a narrow ACL/ownership or use read-only mode"
+}
+
+# The default profile's inline authoring persists sources INTO the project through the container
+# UID. Docker Desktop rewrites bind ownership so this always works there, but a native Linux
+# engine keeps the host directory's real owner/mode and UID 10001 cannot write a runner-owned 755
+# directory — the exact macOS-passes/Linux-fails class from the bind-mount lessons. The launcher
+# owns install/start, so it repairs what it can (a narrow ACL on .claude/workflows only — never
+# the whole project) and otherwise DEGRADES with the one-line fix: file-based workflows still run;
+# only inline persistence would fail, with a clear MCP error rather than a broken install.
+default_authoring_setup() {
+  [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
+  mkdir -p "$project_directory/.claude/workflows"
+  validate_authoring_path
+  authoring_probe && return 0
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:10001:rwx -m d:u:10001:rwx "$workflow_directory" 2>/dev/null || true
+    authoring_probe && return 0
   fi
+  note "UID 10001 cannot write $workflow_directory; inline workflow authoring will fail until you run: setfacl -m u:10001:rwx -m d:u:10001:rwx $workflow_directory"
+  return 0
 }
 
 install_command() {
@@ -495,14 +610,18 @@ install_command() {
   api_key_arg=''
   adopt_instance=''
   authoring_arg=false
+  hardened_arg=false
   no_codex=false
+  no_web=false
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --web-port=*) web_arg=${1#*=} ;;
       --authoring) authoring_arg=true ;;
+      --hardened) hardened_arg=true ;;
       --api-key-file=*) api_key_arg=${1#*=} ;;
       --adopt-instance=*) adopt_instance=${1#*=} ;;
       --no-codex) no_codex=true ;;
+      --no-web) no_web=true ;;
       *) fail "unknown install option: $1" ;;
     esac
     shift
@@ -517,8 +636,59 @@ install_command() {
     fail "installation path already exists; inspect and remove it explicitly before install: $installation"
   fi
   host_doctor "$( [ -n "$web_arg" ] && printf true || printf false )"
+  # The default profile turns the read-only browser dashboard on without being asked: it is
+  # zero-interaction (tokenless, loopback-only) and one of the product's main consumer surfaces.
+  # An explicit --web-port always wins; --no-web opts out; hardened keeps web strictly opt-in.
+  # An old engine only downgrades the default (with the one-line fix), never blocks the install —
+  # only an EXPLICIT --web-port on an old engine remains the hard host_doctor refusal above.
+  if [ -z "$web_arg" ] && [ "$no_web" = false ] && [ "$hardened_arg" = false ]; then
+    if version_at_least "$docker_server_version" 28.3.3; then
+      web_arg=7331
+    else
+      note "Web UI disabled: loopback publication needs Docker Engine 28.3.3+ (found $docker_server_version). Update Docker, then reinstall."
+    fi
+  fi
+  default_web_selected=$web_arg
+  # Host Codex credential detection: the whole point of the default profile is that a person who
+  # already uses Codex on this machine needs no second login. An explicit API key still wins, and
+  # hardened never inherits host credentials. Only the boolean is recorded — the path is resolved
+  # again at every `up` from the live CODEX_HOME/HOME so host-side rotation keeps working.
+  host_codex_auth_arg=false
+  if [ "$hardened_arg" = false ] && [ -z "$api_key_arg" ]; then
+    detected_codex_auth="${CODEX_HOME:-$HOME/.codex}/auth.json"
+    if [ -f "$detected_codex_auth" ] && [ ! -L "$detected_codex_auth" ]; then
+      host_codex_auth_arg=pending
+    fi
+  fi
   docker image inspect "$WORKFLOW_MCP_IMAGE" >/dev/null 2>&1 || docker pull "$WORKFLOW_MCP_IMAGE"
   fingerprint_current_daemon
+  # The defaulted dashboard port negotiates instead of colliding: scan a small fixed range so a
+  # second default install lands on the next free port. This runs after the pull because the probe
+  # executes inside the pinned image. Explicit --web-port skips negotiation entirely.
+  if [ -n "${default_web_selected:-}" ]; then
+    scan_port=$web_arg
+    web_arg=''
+    while [ "$scan_port" -le 7350 ]; do
+      if ! host_port_in_use "$scan_port"; then web_arg=$scan_port; break; fi
+      scan_port=$((scan_port + 1))
+    done
+    if [ -z "$web_arg" ]; then
+      note "No free dashboard port in 7331-7350; installing without the web UI."
+    elif [ "$web_arg" != 7331 ]; then
+      note "Port 7331 is in use; the dashboard will use http://127.0.0.1:$web_arg."
+    fi
+  fi
+  # Detection saw a host credential; now that the image exists, prove the runtime UID can read it.
+  # An unreadable file downgrades detection (with the one-line native-Linux fix) instead of
+  # recording an inheritance that would only fail at the first agent spawn.
+  if [ "$host_codex_auth_arg" = pending ]; then
+    if host_codex_auth_readable "$detected_codex_auth"; then
+      host_codex_auth_arg=true
+    else
+      host_codex_auth_arg=false
+      note "Host Codex credential at $detected_codex_auth is not readable by UID 10001; skipping inheritance. On native Linux run: setfacl -m u:10001:r $detected_codex_auth"
+    fi
+  fi
   # These checks precede every project mutation. A conflicting Codex owner or mismatched preserved
   # volume must leave no half-copied installation that a later command could mistake for authority.
   [ "$no_codex" = true ] || preflight_codex_stanza
@@ -537,9 +707,11 @@ install_command() {
     [ ! -L "$project_directory/.claude" ] || fail "refusing symlinked .claude directory"
     mkdir -p "$project_directory/.claude/workflows"
     authoring_preflight
+  elif [ "$hardened_arg" = false ]; then
+    default_authoring_setup
   fi
   mkdir -m 700 "$installation"
-  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml; do
     cp "$bundle_root/$name" "$installation/$name"
   done
   cp "$bundle_root/LICENSE" "$installation/LICENSE"
@@ -562,6 +734,8 @@ install_command() {
   [ -z "$adopt_instance" ] || set -- "$@" "--instance-id=$adopt_instance"
   [ -z "$web_arg" ] || set -- "$@" "--web-port=$web_arg"
   [ "$authoring_arg" = false ] || set -- "$@" --authoring
+  [ "$hardened_arg" = false ] || set -- "$@" --hardened
+  [ "$host_codex_auth_arg" = false ] || set -- "$@" --host-codex-auth
   [ -z "$api_key_arg" ] || set -- "$@" "--api-key-file=$api_key_arg"
   instance_json=$("$@")
   temporary=$(mktemp "$installation/instance.json.XXXXXX")
@@ -573,6 +747,7 @@ install_command() {
   [ "$no_codex" = true ] || install_codex_stanza
   note "Installed Workflow MCP instance $instance_id at $installation"
   [ -z "$adopt_instance" ] || note "Adopted preserved durable volume ${compose_project}_workflow-mcp-data."
+  [ "$host_codex_auth_arg" = false ] || note "Codex credentials will be inherited from the host login (read-only seed)."
   note "Start it with: $installation/workflow-mcp-docker up"
 }
 
@@ -627,7 +802,7 @@ uninstall_command() {
   fi
   # Every target is an exact file below the already-validated installation; the named volume is
   # preserved unless separately confirmed above.
-  for name in LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml version.env SHA256SUMS instance.json .gitignore workflow-mcp-docker.ps1; do
+  for name in LICENSE compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml version.env SHA256SUMS instance.json .gitignore workflow-mcp-docker.ps1; do
     [ ! -e "$installation/$name" ] || rm "$installation/$name"
   done
   note "Uninstalled public bundle; durable data was $( [ "$delete_data" = true ] && printf deleted || printf preserved )."
@@ -679,10 +854,13 @@ upgrade_command() {
   }
   trap upgrade_cleanup EXIT HUP INT TERM
   for name in $upgrade_names; do
+    if [ ! -f "$installation/$name" ] && is_optional_upgrade_file "$name"; then
+      continue
+    fi
     [ -f "$installation/$name" ] || fail "installed bundle is incomplete: $name"
     cp "$installation/$name" "$rollback_stage/$name"
   done
-  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml; do
+  for name in compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml; do
     cp "$bundle_root/$name" "$upgrade_stage/$name"
   done
   cp "$bundle_root/LICENSE" "$upgrade_stage/LICENSE"
@@ -932,7 +1110,7 @@ restore_command() {
 usage() {
   cat <<'EOF'
 Usage:
-  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
+  workflow-mcp-docker install [PROJECT] [--web-port=PORT] [--no-web] [--hardened] [--authoring] [--api-key-file=/absolute/file] [--adopt-instance=UUID] [--no-codex]
   workflow-mcp-docker up [PROJECT]
   workflow-mcp-docker down|status|logs|doctor|ui|mcp-proxy [PROJECT]
   workflow-mcp-docker source [PROJECT] approvals|approve [options]
@@ -983,7 +1161,7 @@ case "$command" in
       esac
     fi
     case "$command" in
-      up) [ "$#" -eq 0 ] || fail "up accepts a project path only"; load_instance "$project_arg"; require_runtime_api_key; [ "${authoring:-false}" != true ] || authoring_preflight; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
+      up) [ "$#" -eq 0 ] || fail "up accepts a project path only"; load_instance "$project_arg"; require_runtime_api_key; if [ "${authoring:-false}" = true ]; then authoring_preflight; elif [ "${hardened:-true}" != true ]; then default_authoring_setup; fi; preflight_host_codex_auth; preflight_web_port; compose create; attest_volume; compose up --detach --wait; note "Workflow MCP is ready${web_port:+ at http://127.0.0.1:$web_port}" ;;
       down) [ "$#" -eq 0 ] || fail "down accepts a project path only"; load_instance "$project_arg"; compose down --remove-orphans ;;
       status)
         [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = --json ]; } || fail "status accepts only --json"
@@ -1005,7 +1183,26 @@ case "$command" in
           compose exec workflow-mcp workflow-mcp ui
         fi
         ;;
-      mcp-proxy) [ "$#" -eq 0 ] || fail "mcp-proxy accepts a project path only"; load_instance "$project_arg"; compose exec -T workflow-mcp workflow-mcp mcp-proxy ;;
+      mcp-proxy)
+        [ "$#" -eq 0 ] || fail "mcp-proxy accepts a project path only"
+        load_instance "$project_arg"
+        # WHY auto-up: Codex connecting is the product's real lifecycle trigger. Requiring a
+        # separate `up` first turned "restart Codex" into a two-command dance and made a rebooted
+        # machine look broken. stdout is exclusively MCP JSON-RPC, so every Compose progress byte
+        # of the recovery start must go to stderr; a failed start still fails the proxy loudly.
+        if ! compose ps --status running workflow-mcp 2>/dev/null | grep -q workflow-mcp; then
+          require_runtime_api_key
+          if [ "${authoring:-false}" = true ]; then authoring_preflight
+          elif [ "${hardened:-true}" != true ]; then default_authoring_setup >&2
+          fi
+          preflight_host_codex_auth
+          preflight_web_port
+          compose create >&2
+          attest_volume
+          compose up --detach --wait >&2
+        fi
+        compose exec -T workflow-mcp workflow-mcp mcp-proxy
+        ;;
       token)
         load_instance "$project_arg"
         # Compose allocates a container TTY by default even when the host caller redirected stdout.

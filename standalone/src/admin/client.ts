@@ -154,7 +154,7 @@ export type SourceApprovalResponse = Readonly<{
 
 export type AuthenticationStatusResponse = Readonly<{
   schemaVersion: 1
-  mode: 'api-key-secret' | 'interactive'
+  mode: 'api-key-secret' | 'host-codex' | 'interactive'
   authenticated: boolean
   detail: string
 }>

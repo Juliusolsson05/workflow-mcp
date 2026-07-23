@@ -500,6 +500,15 @@ jobs:
             -czf "release-assets/workflow-mcp-docker-catalog-$version.tar.gz" \
             -C metadata/docker-catalog workflow-mcp
           printf '%s@%s\n' "$IMAGE" "$digest" > "release-assets/workflow-mcp-image-$version.txt"
+          # The one-command bootstrap ships digest-pinned: the mutable latest/download URL only
+          # selects WHICH release's script runs, while every image byte the script can pull is
+          # named by this immutable digest. sed with | delimiter because the image ref contains /.
+          sed -e "s|__WORKFLOW_MCP_RELEASE_IMAGE__|$IMAGE@$digest|" \
+            -e "s|__WORKFLOW_MCP_RELEASE_VERSION__|$version|" \
+            -e "s|__WORKFLOW_MCP_RELEASE_REVISION__|$GITHUB_SHA|" \
+            standalone/install/install.sh > release-assets/install.sh
+          chmod 755 release-assets/install.sh
+          grep -q "$digest" release-assets/install.sh || { echo 'install.sh render failed' >&2; exit 1; }
           cat > release-assets/RELEASE_NOTES.md <<EOF
           Workflow MCP $version is the first Docker-first standalone release.
 
@@ -527,7 +536,7 @@ jobs:
               image:`${process.env.IMAGE}@${process.env.DIGEST}`,assets};
             fs.writeFileSync(path.join(directory,"workflow-mcp-release-manifest.json"),JSON.stringify(manifest,null,2)+"\n");
           '
-          (cd release-assets && sha256sum workflow-mcp-* RELEASE_NOTES.md > SHA256SUMS)
+          (cd release-assets && sha256sum workflow-mcp-* install.sh RELEASE_NOTES.md > SHA256SUMS)
           echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
       - name: Install and validate with the pinned official MCP publisher
         env:

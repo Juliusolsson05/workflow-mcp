@@ -19,7 +19,7 @@ export async function routeReadOnlyApi(
     config: StandaloneConfig
     webToken: string
     startedAt: string
-    authenticationMode: 'api-key-secret' | 'interactive'
+    authenticationMode: 'api-key-secret' | 'host-codex' | 'interactive'
   },
 ): Promise<boolean> {
   const url = new URL(request.url ?? '/', 'http://localhost')
@@ -29,7 +29,13 @@ export async function routeReadOnlyApi(
     sendJson(response, 403, { schemaVersion: 1, error: { code: 'invalid-origin' } })
     return true
   }
-  if (!bearerMatches(request.headers.authorization, options.webToken)) {
+  // The bearer requirement is a hardened-profile control. The default single-user profile keeps
+  // only the checks the user never sees: this surface still binds to loopback, still rejects
+  // foreign Host headers (which defeats DNS rebinding — a rebound name arrives with the
+  // attacker's Host) and cross-site Origins, stays GET-only, and exposes zero mutation routes.
+  // A token whose only realistic reader is the machine's one user was pure paste-friction.
+  if (options.config.webAuthMode === 'token' &&
+    !bearerMatches(request.headers.authorization, options.webToken)) {
     response.setHeader('www-authenticate', 'Bearer')
     sendJson(response, 401, { schemaVersion: 1, error: { code: 'unauthorized' } })
     return true
@@ -58,10 +64,11 @@ export async function routeReadOnlyApi(
           mountMode: options.config.sourceMode === 'authoring' ? 'workflow-authoring' : 'project-read-only',
           authentication: {
             mode: options.authenticationMode,
-            // API-key bytes were validated before readiness. Interactive Codex state can change
-            // only through the admin broker, so this GET-only surface directs operators to the
-            // authoritative auth command instead of running Codex on every two-second UI poll.
-            status: options.authenticationMode === 'api-key-secret' ? 'configured' : 'operator-check-required',
+            // API-key bytes and the host-mounted credential were both validated before readiness.
+            // Interactive Codex state can change only through the admin broker, so this GET-only
+            // surface directs operators to the authoritative auth command instead of running
+            // Codex on every two-second UI poll.
+            status: options.authenticationMode === 'interactive' ? 'operator-check-required' : 'configured',
           },
           startedAt: options.startedAt,
           uptimeSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(options.startedAt)) / 1_000)),

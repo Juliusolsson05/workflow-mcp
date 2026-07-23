@@ -103,7 +103,8 @@ COPY --from=build /build/standalone/dist ./standalone/dist
 # host bundle. The digest itself cannot be embedded without a circular build; `bundle-render`
 # accepts that externally known digest and release metadata, then release CI proves byte parity.
 COPY standalone/compose.yaml standalone/compose.web.yaml standalone/compose.authoring.yaml \
-  standalone/compose.auth-api-key.yaml standalone/compose.project-codex-mask.yaml ./standalone/
+  standalone/compose.auth-api-key.yaml standalone/compose.auth-host-codex.yaml \
+  standalone/compose.hardened.yaml standalone/compose.project-codex-mask.yaml ./standalone/
 COPY standalone/install/workflow-mcp-docker standalone/install/workflow-mcp-docker.ps1 \
   standalone/install/bundle.gitignore ./standalone/install/
 COPY standalone/scripts/build-install-bundle.mjs standalone/scripts/launcher-smoke.sh standalone/scripts/stdio-session-smoke.mjs ./standalone/scripts/

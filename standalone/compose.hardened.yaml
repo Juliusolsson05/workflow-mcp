@@ -1,0 +1,18 @@
+# The single-flag return to the original shipped posture. Selecting this overlay flips the
+# daemon-derived defaults (read-only sources, durable approvals, token-gated web — see
+# standalone/src/config/loadConfig.ts) and re-narrows the project mount. Authoring under hardened
+# still exists but goes back through compose.authoring.yaml's dedicated writable
+# .claude/workflows bind and the two-step approval store.
+services:
+  workflow-mcp:
+    environment:
+      WORKFLOW_MCP_PROFILE: hardened
+    volumes:
+      # Compose merges service volumes by target, so this replaces only the /workspace bind from
+      # the base file; the /data named volume is untouched.
+      - type: bind
+        source: ${WORKFLOW_MCP_PROJECT_DIR:?absolute project path required}
+        target: /workspace
+        read_only: true
+        bind:
+          create_host_path: false

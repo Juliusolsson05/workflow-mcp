@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises'
+import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -29,7 +30,12 @@ describe('standalone daemon', () => {
       dataDirectory: join(root, 'data'),
       host: '127.0.0.1',
       port: 0,
+      // This suite proves the token-gated hardened web surface (401 without a bearer). The
+      // consumer default is tokenless and is covered end-to-end by the launcher release smoke.
+      profile: 'hardened',
       sourceMode: 'read-only',
+      approvalMode: 'required',
+      webAuthMode: 'token',
       leaseMode: 'embedded',
       adminSocketPath: join(root, 'run', 'admin.sock'),
       codexExecutable: '/unused/fake-codex',
@@ -170,5 +176,60 @@ describe('standalone daemon', () => {
 
     await daemon.close('test container replacement')
     expect((await daemon.application.store.getManifest(runId))?.status).toBe('interrupted')
+  }, 20_000)
+
+  it('serves the tokenless default web API with its invisible guards intact', async () => {
+    // The consumer default dropped only the bearer. What it must NOT drop: the foreign-Host
+    // refusal (the DNS-rebinding guard), the GET-only surface, and the read-only route set. A
+    // regression re-introducing the 401 — or losing the guards — must fail here, because the
+    // launcher release smoke can only exercise this path on engines above the web floor.
+    const root = await mkdtemp(join(tmpdir(), 'workflow-daemon-tokenless-'))
+    const workspace = join(root, 'workspace')
+    await mkdir(join(workspace, '.claude', 'workflows'), { recursive: true })
+    const config: StandaloneConfig = Object.freeze({
+      workspace,
+      projectHash: hashProjectIdentity(workspace),
+      dataDirectory: join(root, 'data'),
+      host: '127.0.0.1',
+      port: 0,
+      profile: 'default',
+      sourceMode: 'authoring',
+      approvalMode: 'none',
+      webAuthMode: 'none',
+      leaseMode: 'embedded',
+      adminSocketPath: join(root, 'run', 'admin.sock'),
+      codexExecutable: '/unused/fake-codex',
+      webEnabled: true,
+      concurrency: 1,
+    })
+    const daemon = await startStandaloneDaemon(config, { provider: new FakeAgentProvider([]) })
+    try {
+      const base = `http://127.0.0.1:${daemon.port}`
+      const open = await fetch(`${base}/api/v1/instance`)
+      expect(open.status).toBe(200)
+      expect(await open.json()).toMatchObject({ sourceMode: 'authoring' })
+      // fetch/undici silently refuses to override the forbidden Host header, so the rebinding
+      // probe must speak raw HTTP — exactly what a rebound browser connection looks like anyway.
+      const foreignHostStatus = await new Promise<number>((resolveStatus, rejectStatus) => {
+        const request = httpRequest({
+          host: '127.0.0.1',
+          port: daemon.port,
+          path: '/api/v1/instance',
+          headers: { host: 'attacker.example' },
+        }, response => {
+          response.resume()
+          resolveStatus(response.statusCode ?? 0)
+        })
+        request.on('error', rejectStatus)
+        request.end()
+      })
+      expect(foreignHostStatus).toBe(421)
+      const foreignOrigin = await fetch(`${base}/api/v1/instance`, { headers: { origin: 'https://attacker.example' } })
+      expect(foreignOrigin.status).toBe(403)
+      const mutation = await fetch(`${base}/api/v1/instance`, { method: 'POST' })
+      expect(mutation.status).toBe(405)
+    } finally {
+      await daemon.close('tokenless web test complete')
+    }
   }, 20_000)
 })

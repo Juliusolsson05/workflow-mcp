@@ -1,0 +1,18 @@
+# Host Codex credential inheritance. The launcher selects this overlay when it finds a real
+# auth.json in the host's Codex home (and no explicit API-key file was configured). The file
+# arrives as a read-only Compose file secret and only SEEDS the writable /data/codex-home copy —
+# the SDK's authenticationFile contract keeps later token rotation container-side and never
+# writes back to the host file, which is why a read-only mount cannot break Codex refresh.
+# Like the API-key secret, host-side rotation or logout takes effect at the next container start;
+# the bind captures the file's content at mount time, not a live view of a replaced inode.
+services:
+  workflow-mcp:
+    environment:
+      WORKFLOW_MCP_CODEX_AUTH_FILE: /run/secrets/host_codex_auth
+    secrets:
+      - source: host-codex-auth
+        target: host_codex_auth
+
+secrets:
+  host-codex-auth:
+    file: ${WORKFLOW_MCP_HOST_CODEX_AUTH:?absolute host Codex auth.json path required}

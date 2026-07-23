@@ -36,6 +36,8 @@ const inputs = Object.freeze([
   ['compose.web.yaml', 'compose.web.yaml'],
   ['compose.authoring.yaml', 'compose.authoring.yaml'],
   ['compose.auth-api-key.yaml', 'compose.auth-api-key.yaml'],
+  ['compose.auth-host-codex.yaml', 'compose.auth-host-codex.yaml'],
+  ['compose.hardened.yaml', 'compose.hardened.yaml'],
   ['compose.project-codex-mask.yaml', 'compose.project-codex-mask.yaml'],
   ['install/workflow-mcp-docker', 'workflow-mcp-docker'],
   ['install/workflow-mcp-docker.ps1', 'workflow-mcp-docker.ps1'],

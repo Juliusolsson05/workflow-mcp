@@ -47,12 +47,30 @@ cleanup() {
       "$installed" uninstall --delete-data "--confirm=$instance_id" >/dev/null 2>&1 || true
     fi
   fi
+  if [ -f "$temporary/hardened-project/.workflow-mcp/instance.json" ]; then
+    hardened_cleanup_id=$(sed -n 's/.*"instanceId":"\([^"]*\)".*/\1/p' "$temporary/hardened-project/.workflow-mcp/instance.json" | head -n 1)
+    "$temporary/hardened-project/.workflow-mcp/workflow-mcp-docker" down >/dev/null 2>&1 || true
+    [ -z "$hardened_cleanup_id" ] ||
+      "$temporary/hardened-project/.workflow-mcp/workflow-mcp-docker" uninstall --delete-data "--confirm=$hardened_cleanup_id" >/dev/null 2>&1 || true
+  fi
   # This is the exact private directory returned by mktemp above. Keeping all test state below one
   # leaf makes the release gate self-cleaning without ever resolving a user-provided removal path.
   rm -rf "$temporary"
   exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
+
+# Pin the Codex home to a fixture: the default install inherits the HOST's real ~/.codex/auth.json
+# by design, and a release gate must never mount a maintainer's live credential into throwaway
+# containers (CI was only clean by accident of runners having no Codex login). The fixture also
+# makes host-auth detection deterministic in CI: the overlay path is exercised everywhere, with
+# public modes so UID 10001 can read the seed through a native-Linux bind.
+CODEX_HOME=$temporary/codex-home
+export CODEX_HOME
+mkdir -p "$CODEX_HOME"
+printf '{"OPENAI_API_KEY":null,"tokens":{"access_token":"smoke-fixture","refresh_token":"smoke-fixture"}}\n' > "$CODEX_HOME/auth.json"
+chmod 0755 "$CODEX_HOME"
+chmod 0644 "$CODEX_HOME/auth.json"
 
 mkdir -p "$project/.claude/workflows"
 # macOS exposes /var through /private/var. Installation intentionally records `pwd -P`, so the
@@ -192,7 +210,7 @@ bogus_adoption_volume=
 # authority, proving recovery is a startup invariant rather than only an in-process catch block.
 mkdir -m 700 "$project/.workflow-mcp/.upgrade-rollback" "$project/.workflow-mcp/.upgrade-stage"
 expected_image=$(sed -n '/^WORKFLOW_MCP_IMAGE=/p' "$project/.workflow-mcp/version.env")
-for name in LICENSE SHA256SUMS compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env .gitignore instance.json; do
+for name in LICENSE SHA256SUMS compose.yaml compose.web.yaml compose.authoring.yaml compose.auth-api-key.yaml compose.auth-host-codex.yaml compose.hardened.yaml compose.project-codex-mask.yaml workflow-mcp-docker workflow-mcp-docker.ps1 version.env .gitignore instance.json; do
   cp "$project/.workflow-mcp/$name" "$project/.workflow-mcp/.upgrade-rollback/$name"
 done
 printf 'workflow-mcp-upgrade-v1\n' > "$project/.workflow-mcp/.upgrade-transaction"
@@ -205,6 +223,33 @@ test ! -e "$project/.workflow-mcp/.upgrade-transaction"
 "$installed" status --json > "$temporary/status.json"
 grep -q '^{' "$temporary/status.json"
 grep -q '"lifecycle":"READY"' "$temporary/status.json"
+# The default profile turns the read-only dashboard on with no token — but only on engines at or
+# above the 28.3.3 loopback-publication floor; older engines must DOWNGRADE the default instead of
+# blocking the install (GitHub's ubuntu-24.04 runner currently ships 28.0.4, so CI exercises the
+# downgrade branch while developer machines exercise the web branch). Branch on what the install
+# actually recorded, and keep the downgrade branch honest by proving the engine really is old.
+if grep -q '"webPort"' "$project/.workflow-mcp/instance.json"; then
+  # Prove the three properties that replaced the bearer: loopback API answers unauthenticated,
+  # the daemon reports the default authoring posture, and a foreign Host header is still refused
+  # (the DNS-rebinding guard stays).
+  curl -fsS http://127.0.0.1:7331/readyz | grep -q '"status":"ready"'
+  curl -fsS http://127.0.0.1:7331/api/v1/instance > "$temporary/web-instance.json"
+  grep -q '"sourceMode":"authoring"' "$temporary/web-instance.json"
+  [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:7331/api/v1/instance)" = 421 ]
+else
+  smoke_engine=$(docker version --format '{{.Server.Version}}' | sed 's/[^0-9.].*$//')
+  old_ifs=$IFS; IFS=.
+  # Deliberate POSIX field split of an already digits-and-dots value; cannot glob.
+  # shellcheck disable=SC2086
+  set -- $smoke_engine; smoke_major=${1:-0}; smoke_minor=${2:-0}; smoke_patch=${3:-0}
+  IFS=$old_ifs
+  if [ "$smoke_major" -gt 28 ] ||
+    { [ "$smoke_major" -eq 28 ] && [ "$smoke_minor" -gt 3 ]; } ||
+    { [ "$smoke_major" -eq 28 ] && [ "$smoke_minor" -eq 3 ] && [ "$smoke_patch" -ge 3 ]; }; then
+    echo "default install skipped the web UI although engine $smoke_engine supports it" >&2
+    exit 1
+  fi
+fi
 "$installed" doctor > "$temporary/doctor.json"
 grep -q '"schemaVersion":1,"ok":true,"host":' "$temporary/doctor.json"
 grep -q '"container":{"schemaVersion":1,"ok":true' "$temporary/doctor.json"
@@ -231,9 +276,49 @@ if grep -q '"id":"container-availability"' "$temporary/detailed-failure-doctor.j
   exit 1
 fi
 "$installed" down
-"$installed" up
+# The restart doubles as the auto-up contract check: mcp-proxy against a stopped daemon must
+# start it itself (Codex connecting is the real lifecycle trigger) while its stdout carries ONLY
+# MCP JSON-RPC — every recovery-start progress byte belongs on stderr. Any Compose noise on
+# stdout makes the first-line JSON assertion fail.
+cat > "$temporary/auto-up-requests.jsonl" <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"auto-up-smoke","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workflow_list","arguments":{}}}
+EOF
+"$installed" mcp-proxy < "$temporary/auto-up-requests.jsonl" > "$temporary/auto-up-responses.jsonl" 2>"$temporary/auto-up-stderr.log"
+head -c 1 "$temporary/auto-up-responses.jsonl" | grep -q '{'
+grep -q '"release-smoke"' "$temporary/auto-up-responses.jsonl"
 "$installed" ui --snapshot > "$temporary/ui-snapshot.txt"
 grep -q '^Workflow MCP ' "$temporary/ui-snapshot.txt"
+
+# The hardened profile is the one recorded bit that must restore the entire original posture. If
+# this leg rots, "hardened" becomes marketing: prove the read-only source mode is derived from the
+# profile, that inline MCP authoring is refused again, and that a workflow visible at startup
+# still runs under the snapshot approval boundary — the exact behaviors the default removed.
+hardened_project=$temporary/hardened-project
+mkdir -p "$hardened_project/.claude/workflows"
+cat > "$hardened_project/.claude/workflows/hardened-smoke.js" <<'EOF'
+export const meta = { name: 'hardened-smoke', description: 'Hardened profile gate fixture' }
+return 'hardened gate passed'
+EOF
+chmod 0755 "$hardened_project" "$hardened_project/.claude" "$hardened_project/.claude/workflows"
+chmod 0644 "$hardened_project/.claude/workflows/hardened-smoke.js"
+"$launcher" install "$hardened_project" --hardened --no-codex >/dev/null
+hardened_launcher=$hardened_project/.workflow-mcp/workflow-mcp-docker
+hardened_instance=$(sed -n 's/.*"instanceId":"\([^"]*\)".*/\1/p' "$hardened_project/.workflow-mcp/instance.json" | head -n 1)
+"$hardened_launcher" up >/dev/null 2>&1
+"$hardened_launcher" status --json | grep -q '"sourceMode":"read-only"'
+cat > "$temporary/hardened-requests.jsonl" <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"hardened-smoke","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workflow_run","arguments":{"script":"export const meta = { name: 'refused', description: 'must not author' }\nreturn 1","idempotencyKey":"hardened-refusal"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workflow_run","arguments":{"name":"hardened-smoke","idempotencyKey":"hardened-startup-approved"}}}
+EOF
+"$hardened_launcher" mcp-proxy < "$temporary/hardened-requests.jsonl" > "$temporary/hardened-responses.jsonl"
+grep -q 'authoring-disabled' "$temporary/hardened-responses.jsonl"
+grep -q '"hardened-smoke"' "$temporary/hardened-responses.jsonl"
+"$hardened_launcher" down >/dev/null 2>&1
+"$hardened_launcher" uninstall --delete-data "--confirm=$hardened_instance" >/dev/null
 
 # A copied trusted bundle is the recovery entry point when the installed launcher is missing. It
 # must authenticate executable Compose policy against the immutable image, not a project-owned
@@ -281,11 +366,22 @@ cat > "$temporary/requests.jsonl" <<'EOF'
 {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workflow_run","arguments":{"name":"release-smoke","idempotencyKey":"published-release-smoke"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"workflow_run","arguments":{"script":"export const meta = { name: 'inline-default-smoke', description: 'Default profile inline authoring' }\nreturn 'inline authoring ran without approval'","idempotencyKey":"published-inline-default"}}}
 EOF
 "$installed" mcp-proxy < "$temporary/requests.jsonl" > "$temporary/responses.jsonl"
 grep -q '"workflow_list"' "$temporary/responses.jsonl"
 grep -q '"id":3' "$temporary/responses.jsonl"
 grep -q '"ok":true' "$temporary/responses.jsonl"
+# The product's headline default flow: an inline-authored workflow persists AND runs with no
+# approval step. A source-approval-required refusal here means the default profile regressed
+# into the hardened gate. (Match the exact error tokens — tool descriptions legitimately contain
+# the word "approval".)
+if grep -Eq 'source-approval-required|authoring-disabled|Workflow source approval is required' "$temporary/responses.jsonl"; then
+  echo 'default profile demanded source approval for inline-authored workflow' >&2
+  exit 1
+fi
+grep -q '"inline-default-smoke"' "$temporary/responses.jsonl"
+test -f "$project/.claude/workflows/inline-default-smoke.js"
 run_id=$(docker run --rm --network none --read-only -i --entrypoint /usr/local/bin/node \
   "$installed_image" -e '
   const fs=require("node:fs");
