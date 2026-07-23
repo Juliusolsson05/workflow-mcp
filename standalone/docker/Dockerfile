@@ -70,7 +70,7 @@ LABEL org.opencontainers.image.title="Workflow MCP" \
       org.opencontainers.image.revision=${REVISION} \
       org.opencontainers.image.version=${VERSION} \
       org.opencontainers.image.licenses="MIT" \
-      io.modelcontextprotocol.server.name="io.github.juliusolsson05/workflow-mcp"
+      io.modelcontextprotocol.server.name="io.github.Juliusolsson05/workflow-mcp"
 
 # WHY: direct pins are insufficient because APK may legally advance a dependency while keeping the
 # requested Git revision available. Naming the complete added closure makes repository movement
