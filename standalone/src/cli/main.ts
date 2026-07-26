@@ -85,6 +85,11 @@ async function main(arguments_: string[]): Promise<void> {
         status: auth.authenticated ? 'pass' : 'warn',
         message: auth.detail,
       })
+      // N1: a daemon whose provider cannot authenticate is not "ready" — every workflow will fail.
+      // The check is kept at `warn` (a user-actionable config state, distinct from a broker `fail`),
+      // but the overall report must NOT read green, or `doctor` (the command operators are told to
+      // run) reports all-clear while no workflow can run. This flips the top-line and the exit code.
+      if (!auth.authenticated) report.ok = false
     } catch (error) {
       report.checks.push({
         id: 'provider-authentication',

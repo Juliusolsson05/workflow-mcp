@@ -147,7 +147,10 @@ export async function inspectContainer(config: StandaloneConfig): Promise<Doctor
           id: 'agent-startup',
           // Deliberately narrow: this proves the wrapper's gates admit a provider process, which is
           // exactly the failure that used to surface as EPIPE. It is NOT a claim that a model call
-          // would succeed — credential state is reported by the separate authentication check.
+          // would succeed — credential usability is reported by the `provider-authentication` check
+          // that the `doctor` CLI appends after contacting the admin broker (see cli/main.ts), which
+          // now also flips the overall report when the inherited/host credential cannot authenticate.
+          // (inspectContainer runs in-container and has no broker socket, so it cannot add it here.)
           status: 'pass',
           message: 'the provider isolation wrapper starts, so agent launches are not blocked by project or secret policy',
         })

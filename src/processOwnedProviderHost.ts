@@ -404,7 +404,16 @@ function prepareIsolatedCodexAttempt(
   }
 }
 
-function synchronizeIsolatedAuthentication(sourcePath: string | undefined, destination: string): void {
+/**
+ * Copy a host login into an isolated Codex home, preserving a newer in-home credential.
+ *
+ * Exported so the standalone daemon can seed the isolated home ONCE at startup with the exact same
+ * semantics used per attempt — the credential broker's `auth status` then reads a truthful home
+ * instead of an empty one and stops misdirecting logged-in users to the device-code login. The
+ * mtime guard makes this idempotent and safe as a single writer: a newer rotated in-home token is
+ * never clobbered by the older host seed, and a removed host file revokes the isolated copy.
+ */
+export function synchronizeIsolatedAuthentication(sourcePath: string | undefined, destination: string): void {
   if (sourcePath === undefined) return
   const source = resolve(sourcePath)
   if (!existsSync(source)) {
