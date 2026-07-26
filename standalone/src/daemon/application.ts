@@ -191,7 +191,10 @@ async function createCodexProvider(
     // every non-git project. The `hardened` profile keeps the rail, and because the flag is set only
     // in this standalone entry, no other CodexAgentProvider consumer is affected. This removes only
     // the git-root prerequisite — the managed sandbox, approvals, and config-trust are unchanged.
-    skipGitRepoCheck: config.profile !== 'hardened',
+    // WHY `=== 'default'` (fail-closed) rather than `!== 'hardened'`: a malformed or legacy config
+    // shape with a missing/invalid profile must NOT silently relax the git-trust rail. Only the
+    // explicit, recognized `default` profile opts in; anything else keeps Codex's refusal.
+    skipGitRepoCheck: config.profile === 'default',
     // The outer service selects the source capability; the policy launcher
     // independently checks that the SDK's requested sandbox cannot exceed it.
     env: {

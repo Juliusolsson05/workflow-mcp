@@ -73,11 +73,18 @@ inside the image can render the exact stanza for recovery.
 
 ## Authentication
 
-Run this once per installation and everything works:
+If the host already has a Codex login, the daemon inherits it and you do not need to log in at all —
+`workflow-mcp doctor` and `auth status` will report `Authenticated`. Only if there is no usable host
+credential do you run:
 
 ```bash
 workflow-mcp auth login
 ```
+
+This uses Codex's **device-code** flow, which your ChatGPT account must permit — if device
+authorization is disabled in your ChatGPT security settings, this command fails until you enable it
+(or supply an API key at install with `--api-key-file`). Host-login inheritance is the path that
+avoids this entirely.
 
 That is a Codex device login owned by the container: it prints a URL and code, and writes a real
 credential into the container's own Codex home. It always works, and a container login always

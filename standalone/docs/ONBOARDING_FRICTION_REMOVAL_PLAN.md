@@ -131,6 +131,26 @@ data across trust boundaries):
   hardened git behavior, and web/TUI auth truthfulness. Commit the experiment harness into the branch
   (`standalone/scripts/`), not the session scratchpad.
 
+### 0.4b Post-implementation review (Tranche A code) — resolved & deferred
+
+A second 2-agent review ran against the shipped Tranche A diff (not the plan). Verdict: **no blocking
+findings; the hardened path stays fail-closed.** Applied before merge:
+- Profile gate made fail-closed: `config.profile === 'default'` (not `!== 'hardened'`), so a
+  malformed/legacy config cannot silently relax the git-trust rail (`application.ts`).
+- `doctor` now prints an explicit `READY` / `NOT READY` line so a not-ok-for-a-warn report is
+  visible to a terminal reader, matching the exit code (`cli/output.ts`).
+- README auth section corrected: `auth login` is device-code (account must permit it); host-login
+  inheritance is the path that avoids it — no longer claims it "always works."
+
+Deferred (non-production edges, follow-up):
+- **Embedded-mode startup-seed race**: the startup seed runs before `service.initialize()` acquires
+  ownership. The shipping container is safe (the launcher takes flock before Node starts); only an
+  *embedded* second daemon without that flock could race. Fix belongs with embedded-mode locking.
+- **Injected-provider compositions skip the A1 seed** (seed lives in `createCodexProvider`, bypassed
+  when a provider is injected). Production always uses `createCodexProvider`; a derived daemon with
+  host auth + a custom provider would see the old false `auth status`. Move the seed to a
+  provider-independent startup step if that composition becomes real.
+
 ### 0.5 Corrected priority (supersedes §3)
 
 1. **Auth status honesty** via startup-only single-writer seed (A1, corrected).
