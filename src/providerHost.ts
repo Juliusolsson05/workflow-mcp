@@ -102,7 +102,7 @@ export function startCodexProviderHost(): void {
     }
 
     try {
-      const result = await executeCodexTurn(client, message.request, context, message.modelAliases)
+      const result = await executeCodexTurn(client, message.request, context, message.modelAliases, message.skipGitRepoCheck ?? false)
       await finish({ type: 'result', result })
     } catch (error) {
       await finish({ type: 'error', error: serializeProviderError(error) })

@@ -30,11 +30,15 @@ services:
       - type: bind
         source: ${WORKFLOW_MCP_PROJECT_DIR:?absolute project path required}
         target: /workspace
-        # WHY writable: the product's core use is agents editing the user's own project — the
-        # same authority the user grants any host-side coding agent. The container root fs stays
-        # read-only, /data and /run/secrets stay deny-read to agents, and the project .codex mask
-        # still blocks config injection AND writes to project Codex config. The hardened overlay
-        # restores the read-only bind plus the narrow .claude/workflows authoring window.
+        # WHY the bind is writable even though agents are write-limited: the default managed Codex
+        # profile (workflow_mcp_authoring) grants write ONLY to .claude/workflows, so a read-only
+        # bind could not even persist an authored workflow. The bind being writable at the container
+        # layer does NOT mean agents may edit the whole project — codex-requirements.toml is the
+        # authority and currently denies writes outside .claude/workflows. Broadening that is a
+        # separately threat-modeled writable-subtree profile, not a default. The container root fs
+        # stays read-only, /data and /run/secrets stay deny-read to agents, and the project .codex
+        # mask still blocks config injection AND writes to project Codex config. The hardened overlay
+        # restores the read-only bind plus the same narrow .claude/workflows authoring window.
         read_only: false
         bind:
           create_host_path: false

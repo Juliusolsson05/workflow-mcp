@@ -49,6 +49,8 @@ export type ProcessOwnedCodexHostOptions = {
   modelAliases: Readonly<Record<string, string | null>>
   configurationIsolation?: CodexConfigurationIsolation
   executableEvidence?: CodexExecutableEvidence
+  /** Forwarded verbatim into each attempt's start message; see CodexProviderOptions.skipGitRepoCheck. */
+  skipGitRepoCheck?: boolean
 }
 
 export type ProcessOwnedCodexExecutionOptions = {
@@ -88,6 +90,7 @@ export class ProcessOwnedCodexHost {
   readonly #hostFilePath: string
   readonly #codexOptions: SerializedCodexHostOptions
   readonly #modelAliases: Readonly<Record<string, string | null>>
+  readonly #skipGitRepoCheck: boolean
   readonly #configurationIsolation: CodexConfigurationIsolation | undefined
   readonly #executableEvidence: CodexExecutableEvidence | undefined
   readonly #executions = new Map<string, HostExecution>()
@@ -97,6 +100,7 @@ export class ProcessOwnedCodexHost {
     this.#hostFilePath = resolve(options.hostFilePath ?? defaultProviderHostFilePath())
     this.#codexOptions = options.codexOptions
     this.#modelAliases = { ...options.modelAliases }
+    this.#skipGitRepoCheck = options.skipGitRepoCheck ?? false
     this.#configurationIsolation = options.configurationIsolation === undefined
       ? undefined
       : { ...options.configurationIsolation }
@@ -223,6 +227,7 @@ export class ProcessOwnedCodexHost {
       request: prepared.request,
       options: prepared.codexOptions,
       modelAliases: this.#modelAliases,
+      skipGitRepoCheck: this.#skipGitRepoCheck,
       heartbeatIntervalMs: HOST_HEARTBEAT_INTERVAL_MS,
     })
     return result
@@ -399,7 +404,16 @@ function prepareIsolatedCodexAttempt(
   }
 }
 
-function synchronizeIsolatedAuthentication(sourcePath: string | undefined, destination: string): void {
+/**
+ * Copy a host login into an isolated Codex home, preserving a newer in-home credential.
+ *
+ * Exported so the standalone daemon can seed the isolated home ONCE at startup with the exact same
+ * semantics used per attempt — the credential broker's `auth status` then reads a truthful home
+ * instead of an empty one and stops misdirecting logged-in users to the device-code login. The
+ * mtime guard makes this idempotent and safe as a single writer: a newer rotated in-home token is
+ * never clobbered by the older host seed, and a removed host file revokes the isolated copy.
+ */
+export function synchronizeIsolatedAuthentication(sourcePath: string | undefined, destination: string): void {
   if (sourcePath === undefined) return
   const source = resolve(sourcePath)
   if (!existsSync(source)) {

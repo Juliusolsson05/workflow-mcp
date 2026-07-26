@@ -93,6 +93,7 @@ export {
   WORKFLOW_MCP_VERSION,
 } from './generatedBuildMetadata.js'
 export { startCodexProviderHost } from './providerHost.js'
+export { synchronizeIsolatedAuthentication } from './processOwnedProviderHost.js'
 export type {
   CodexClientLike,
   CodexConfigurationIsolation,

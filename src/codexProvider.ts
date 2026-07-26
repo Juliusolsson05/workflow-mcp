@@ -48,6 +48,18 @@ export type CodexProviderOptions = Omit<CodexOptions, 'env'> & {
   /** Built provider-host entry; Agent Code supplies its electron-vite emitted sibling. */
   providerHostFilePath?: string
   /**
+   * Allow Codex to run when the working directory is not inside a Git repository.
+   *
+   * WHY provider-level and off by default: Codex refuses a non-git working directory
+   * ("Not inside a trusted directory and --skip-git-repo-check was not specified") as a rail against
+   * unrecoverable edits to unversioned trees. The standalone single-user (`default`) profile
+   * deliberately points Codex at the operator's own directory, so that rail is pure onboarding
+   * friction there; the hardened profile and every other embedder keep it by leaving this false.
+   * Setting it removes ONLY the git-root prerequisite — never the command sandbox, approvals, or
+   * configuration-trust boundaries.
+   */
+  skipGitRepoCheck?: boolean
+  /**
    * Dedicated Codex state root used to prevent workflow attempts from inheriting user/project
    * configuration while retaining durable thread files for provider-session resume.
    */
@@ -118,6 +130,7 @@ export type CodexRecoveryFingerprintInput = {
   configurationIsolation?: CodexConfigurationIsolation
   capabilities: CodexExecutionCapabilities
   modelAliases?: Readonly<Record<string, string | null>>
+  skipGitRepoCheck?: boolean
   baseUrl?: string
   config?: CodexOptions['config']
 }
@@ -137,6 +150,7 @@ export class CodexAgentProvider implements AgentProvider {
   readonly #host: ProcessOwnedCodexHost | undefined
   readonly #modelAliases: Readonly<Record<string, string | null>>
   readonly #capabilities: CodexExecutionCapabilities
+  readonly #skipGitRepoCheck: boolean
   readonly recoveryFingerprint?: string
 
   constructor(options: CodexProviderOptions = {}) {
@@ -148,9 +162,11 @@ export class CodexAgentProvider implements AgentProvider {
       capabilities = { inheritedMcpServers: 'unknown' },
       executableEvidence,
       env,
+      skipGitRepoCheck = false,
       ...codexOptions
     } = options
     this.#modelAliases = { ...modelAliases }
+    this.#skipGitRepoCheck = skipGitRepoCheck
     this.#capabilities = {
       inheritedMcpServers: capabilities.inheritedMcpServers,
       ...(capabilities.attemptContainment === undefined
@@ -166,6 +182,9 @@ export class CodexAgentProvider implements AgentProvider {
           ...(configurationIsolation === undefined ? {} : { configurationIsolation }),
           capabilities: this.#capabilities,
           modelAliases: this.#modelAliases,
+          // Only fold this into the fingerprint when enabled, so hardened/other consumers that leave
+          // it false keep byte-identical recovery fingerprints to before this option existed.
+          ...(this.#skipGitRepoCheck ? { skipGitRepoCheck: true } : {}),
           ...(codexOptions.baseUrl === undefined ? {} : { baseUrl: codexOptions.baseUrl }),
           ...(codexOptions.config === undefined ? {} : { config: codexOptions.config }),
         })
@@ -215,6 +234,7 @@ export class CodexAgentProvider implements AgentProvider {
           env: safeCodexEnvironment(env),
         },
         modelAliases: this.#modelAliases,
+        skipGitRepoCheck: this.#skipGitRepoCheck,
       })
     }
   }
@@ -303,7 +323,7 @@ export class CodexAgentProvider implements AgentProvider {
       })
     }
     if (!this.#client) throw new Error('Codex provider has neither a client nor a process host')
-    return executeCodexTurn(this.#client, request, context, this.#modelAliases)
+    return executeCodexTurn(this.#client, request, context, this.#modelAliases, this.#skipGitRepoCheck)
   }
 
   async terminateAttempt(
@@ -365,6 +385,9 @@ export function buildCodexRecoveryFingerprint(
     modelAliases: Object.fromEntries(
       Object.entries(input.modelAliases ?? {}).sort(([left], [right]) => left.localeCompare(right)),
     ),
+    // Absent unless enabled, so a false value keeps the pre-existing fingerprint bytes. When true it
+    // changes the execution contract (a non-git working tree is now admissible) and must be recorded.
+    ...(input.skipGitRepoCheck ? { skipGitRepoCheck: true } : {}),
     ...(input.baseUrl === undefined ? {} : { baseUrl: input.baseUrl }),
     ...(input.config === undefined ? {} : { config: input.config }),
   }
@@ -393,6 +416,7 @@ export async function executeCodexTurn(
   request: AgentRequest,
   context: AgentProviderExecutionContext,
   modelAliases: Readonly<Record<string, string | null>> = {},
+  skipGitRepoCheck = false,
 ): Promise<AgentProviderResult> {
     if (context.signal.aborted) throw new AgentProviderAbortError(context.signal.reason)
     if (request.session !== undefined && request.session.provider !== 'codex') {
@@ -412,7 +436,7 @@ export async function executeCodexTurn(
       )
     }
 
-    const threadOptions = codexThreadOptions(request, modelAliases)
+    const threadOptions = codexThreadOptions(request, modelAliases, skipGitRepoCheck)
     const thread = request.session
       ? client.resumeThread(request.session.id, threadOptions)
       : client.startThread(threadOptions)
@@ -558,6 +582,7 @@ function isMissingCodexRollout(error: unknown): boolean {
 function codexThreadOptions(
   request: AgentRequest,
   modelAliases: Readonly<Record<string, string | null>>,
+  skipGitRepoCheck = false,
 ): ThreadOptions {
   const model = codexModel(request.model, modelAliases)
   if (request.effort !== undefined && !CODEX_EFFORTS.has(request.effort)) {
@@ -570,6 +595,9 @@ function codexThreadOptions(
     sandboxMode: request.sandbox.mode,
     approvalPolicy: request.sandbox.approvalPolicy,
     networkAccessEnabled: request.sandbox.network,
+    // Off unless the embedder's profile explicitly enabled it (standalone `default`); removes only
+    // Codex's git-root prerequisite so a non-git project can run. See CodexProviderOptions.
+    ...(skipGitRepoCheck ? { skipGitRepoCheck: true } : {}),
     // Codex web search is a separate native tool, not ordinary shell network access. Explicitly
     // removing it for an offline request keeps the replay-safety classification truthful even if
     // the user's normal Codex profile enables live search by default.
