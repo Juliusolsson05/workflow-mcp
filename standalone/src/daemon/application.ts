@@ -8,6 +8,7 @@ import {
   InheritedFlockLeaseBackend,
   WorkflowService,
   findWorkflows,
+  synchronizeIsolatedAuthentication,
   type AgentProvider,
 } from 'workflow-mcp'
 
@@ -161,6 +162,17 @@ async function createCodexProvider(
       )
     }
     seedBytes.fill(0)
+    // A1: seed the isolated home ONCE at startup, with the exact per-attempt semantics. Before this,
+    // the credential broker's `auth status` ran `codex login status` against an empty codex-home
+    // (the SDK only seeds per attempt), so every fresh host-auth install reported "Not authenticated"
+    // and pushed the user toward the device-code login — which is off by default in ChatGPT. Seeding
+    // here makes status truthful the moment the daemon is healthy. It is a single, idempotent write:
+    // synchronizeIsolatedAuthentication preserves a newer rotated in-home token via its mtime guard,
+    // so this never resurrects an older refresh token, and the broker's status path stays read-only.
+    synchronizeIsolatedAuthentication(
+      config.hostCodexAuthFile,
+      join(config.dataDirectory, 'codex-home', 'auth.json'),
+    )
   }
   const isolation = {
     codexHome: join(config.dataDirectory, 'codex-home'),
@@ -173,6 +185,16 @@ async function createCodexProvider(
   }
   return new CodexAgentProvider({
     codexPathOverride: config.codexExecutable,
+    // WHY profile-gated here rather than unconditionally in the shared provider: the single-user
+    // `default` profile deliberately points Codex at the operator's own directory, where Codex's
+    // git-root refusal ("Not inside a trusted directory…") is pure onboarding friction that blocked
+    // every non-git project. The `hardened` profile keeps the rail, and because the flag is set only
+    // in this standalone entry, no other CodexAgentProvider consumer is affected. This removes only
+    // the git-root prerequisite — the managed sandbox, approvals, and config-trust are unchanged.
+    // WHY `=== 'default'` (fail-closed) rather than `!== 'hardened'`: a malformed or legacy config
+    // shape with a missing/invalid profile must NOT silently relax the git-trust rail. Only the
+    // explicit, recognized `default` profile opts in; anything else keeps Codex's refusal.
+    skipGitRepoCheck: config.profile === 'default',
     // The outer service selects the source capability; the policy launcher
     // independently checks that the SDK's requested sandbox cannot exceed it.
     env: {

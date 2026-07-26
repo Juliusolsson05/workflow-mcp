@@ -23,6 +23,9 @@ export type ProviderHostStartMessage = {
   request: AgentRequest
   options: SerializedCodexHostOptions
   modelAliases: Readonly<Record<string, string | null>>
+  // Carried alongside options (not inside them) because it is a per-thread ThreadOptions concern,
+  // not a Codex client-constructor option; the child forwards it to executeCodexTurn.
+  skipGitRepoCheck?: boolean
   heartbeatIntervalMs: number
 }
 

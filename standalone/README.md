@@ -55,10 +55,15 @@ which downloads and verifies the same bundle without piping anything to a shell.
 Installation creates `<project>/.workflow-mcp/`, writes one marked project-local Codex MCP stanza
 to `<project>/.codex/config.toml`, pulls the image pinned by digest, and records stable instance,
 Compose project, Docker context, Docker Engine ID fingerprint, project, and named-volume identities. Machine-specific files are
-gitignored. In the default profile the project bind is writable — agents editing the user's own
-project is the product, the same authority any host-side coding agent gets — while the container
-root filesystem stays read-only, the daemon stays UID/GID `10001:10001`, `/data` and every secret
-mount stay unreadable to agent commands, and the project `.codex` directory stays masked. Install
+gitignored. In the default profile agents read the whole mounted project but the managed Codex
+permission profile currently grants **write only under `.claude/workflows`** (the authoring
+subtree) — the project bind is writable at the container layer, yet an agent commanded to edit
+other project files is denied by policy, so a workflow that rewrites source will not succeed today.
+Broadening agent writes to the rest of the project is deliberately deferred to a separately
+threat-modeled writable-subtree profile (an agent is a prompt-injectable LLM, so widening its reach
+is not a default). Meanwhile the container root filesystem stays read-only, the daemon stays
+UID/GID `10001:10001`, `/data` and every secret mount stay unreadable to agent commands, and the
+project `.codex` directory stays masked. Install
 with `--hardened` to restore the original shipped posture: read-only project bind, startup/durable
 source approvals, token-gated web, and isolated container-only credentials, all from one recorded
 profile bit.
@@ -68,11 +73,18 @@ inside the image can render the exact stanza for recovery.
 
 ## Authentication
 
-Run this once per installation and everything works:
+If the host already has a Codex login, the daemon inherits it and you do not need to log in at all —
+`workflow-mcp doctor` and `auth status` will report `Authenticated`. Only if there is no usable host
+credential do you run:
 
 ```bash
 workflow-mcp auth login
 ```
+
+This uses Codex's **device-code** flow, which your ChatGPT account must permit — if device
+authorization is disabled in your ChatGPT security settings, this command fails until you enable it
+(or supply an API key at install with `--api-key-file`). Host-login inheritance is the path that
+avoids this entirely.
 
 That is a Codex device login owned by the container: it prints a URL and code, and writes a real
 credential into the container's own Codex home. It always works, and a container login always

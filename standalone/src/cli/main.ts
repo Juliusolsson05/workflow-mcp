@@ -85,6 +85,13 @@ async function main(arguments_: string[]): Promise<void> {
         status: auth.authenticated ? 'pass' : 'warn',
         message: auth.detail,
       })
+      // N1: surface an unusable/absent credential as a VISIBLE warn (with the broker's actionable
+      // detail), but deliberately do NOT hard-fail the report for it. "Not logged in yet" on a fresh
+      // interactive install is a documented user step, not an install fault — treating it as a
+      // failure (exit 3) breaks the clean-install contract smoke and would make `doctor` non-zero
+      // for every install before `auth login`. A genuine broker error is still a `fail` (catch
+      // below). Post-A1 a host-codex install authenticates at startup, so this warn only appears
+      // when the operator truly has no usable credential — exactly when the actionable line helps.
     } catch (error) {
       report.checks.push({
         id: 'provider-authentication',
