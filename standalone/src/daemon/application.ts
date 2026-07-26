@@ -173,6 +173,13 @@ async function createCodexProvider(
   }
   return new CodexAgentProvider({
     codexPathOverride: config.codexExecutable,
+    // WHY profile-gated here rather than unconditionally in the shared provider: the single-user
+    // `default` profile deliberately points Codex at the operator's own directory, where Codex's
+    // git-root refusal ("Not inside a trusted directory…") is pure onboarding friction that blocked
+    // every non-git project. The `hardened` profile keeps the rail, and because the flag is set only
+    // in this standalone entry, no other CodexAgentProvider consumer is affected. This removes only
+    // the git-root prerequisite — the managed sandbox, approvals, and config-trust are unchanged.
+    skipGitRepoCheck: config.profile !== 'hardened',
     // The outer service selects the source capability; the policy launcher
     // independently checks that the SDK's requested sandbox cannot exceed it.
     env: {

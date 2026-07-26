@@ -49,6 +49,8 @@ export type ProcessOwnedCodexHostOptions = {
   modelAliases: Readonly<Record<string, string | null>>
   configurationIsolation?: CodexConfigurationIsolation
   executableEvidence?: CodexExecutableEvidence
+  /** Forwarded verbatim into each attempt's start message; see CodexProviderOptions.skipGitRepoCheck. */
+  skipGitRepoCheck?: boolean
 }
 
 export type ProcessOwnedCodexExecutionOptions = {
@@ -88,6 +90,7 @@ export class ProcessOwnedCodexHost {
   readonly #hostFilePath: string
   readonly #codexOptions: SerializedCodexHostOptions
   readonly #modelAliases: Readonly<Record<string, string | null>>
+  readonly #skipGitRepoCheck: boolean
   readonly #configurationIsolation: CodexConfigurationIsolation | undefined
   readonly #executableEvidence: CodexExecutableEvidence | undefined
   readonly #executions = new Map<string, HostExecution>()
@@ -97,6 +100,7 @@ export class ProcessOwnedCodexHost {
     this.#hostFilePath = resolve(options.hostFilePath ?? defaultProviderHostFilePath())
     this.#codexOptions = options.codexOptions
     this.#modelAliases = { ...options.modelAliases }
+    this.#skipGitRepoCheck = options.skipGitRepoCheck ?? false
     this.#configurationIsolation = options.configurationIsolation === undefined
       ? undefined
       : { ...options.configurationIsolation }
@@ -223,6 +227,7 @@ export class ProcessOwnedCodexHost {
       request: prepared.request,
       options: prepared.codexOptions,
       modelAliases: this.#modelAliases,
+      skipGitRepoCheck: this.#skipGitRepoCheck,
       heartbeatIntervalMs: HOST_HEARTBEAT_INTERVAL_MS,
     })
     return result
