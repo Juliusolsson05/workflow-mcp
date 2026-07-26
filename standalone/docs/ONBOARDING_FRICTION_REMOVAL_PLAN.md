@@ -1,7 +1,150 @@
 # Onboarding Friction Removal — plan (v0.1.4)
 
-Status: PLAN. This file is the first commit on the branch; the full implementation lands on top of
-it in the same PR. **No implementation is included in this commit — plan only, by request.**
+Status: PLAN, REVISED AFTER REVIEW. This file is the first commit on the branch; the full
+implementation lands on top of it in the same PR. **No implementation is included yet — plan only.**
+
+> **§0 below supersedes any conflicting text further down.** The original analysis (§1–§8) was
+> confirmed by a 4-agent review (2 Claude, 2 Codex) for its *diagnoses*, but the review found real
+> factual errors and unsafe proposals in the *fixes* and threat-model framing. §0 records that
+> outcome and the corrected direction. Read §0 first; treat §1–§8 as the original draft it corrects.
+
+---
+
+## 0. Review outcome & corrected direction (authoritative)
+
+Four independent reviewers verified this plan against source before implementation. Verdict:
+
+- **Diagnoses of the failures: CONFIRMED.** Auth inheritance works; the pre-first-run status
+  misreport is real; git-trust independently blocks non-git projects; the identity gates strand a
+  single user; doctor's top-line stays green. All citations trace (with the nits in §0.3).
+- **Fixes & framing: NEEDS REWORK.** Both Codex reviewers returned "needs rework / not sound as
+  written." The plan over-relaxed **agent containment** (a real boundary) while trying to relax
+  **operator-identity ceremony** (safe to relax). Corrected below.
+
+### 0.1 The reframe was too broad — trusted operator ≠ trusted agent
+
+The original §1 premise ("own project, no adversary") conflates the *operator* (trusted) with the
+*agent* (a semi-trusted, prompt-injectable LLM). A developer routinely feeds the agent cloned repos,
+PR branches, dependency code, issue text, and fetched web content — any of which can prompt-inject
+it. The repo's accepted architecture already treats model commands as untrusted **even for a single
+operator**: ADR `standalone/docs/adr/0001-runtime-topology.md:12,20` (mode 0600 "is not isolation";
+the managed Codex sandbox is the boundary), threat-model summary
+`docs/DOCKER_FIRST_CODEX_MCP_IMPLEMENTATION_PLAN.md:2316`, and the prior
+`CONSUMER_SIMPLIFICATION_PLAN.md:134` deliberately retained the `.codex` mask for injection/write
+protection.
+
+**Corrected principle:** local-first relaxes **operator & installation identity ceremony**. It does
+**not** relax **agent containment**. Anything that widens what the agent can read, write, or reach
+stays behind an explicit, separately threat-modeled opt-in — never the default.
+
+### 0.2 Two tranches (this is the real scope change)
+
+**TRANCHE A — v0.1.4, safe to implement now** (identity ceremony + honesty + admission):
+
+- **A1 (auth status honesty):** seed the isolated home **at daemon startup only**, then let
+  `status` read it. **Do NOT** seed from `status()` and **do NOT** drop the active-runs guard for a
+  path that can mutate auth state (kills the A1+A5+A7 race the reviewers flagged, `auth.ts:18,162`).
+  The seed must be a **single-writer** design — startup seeds once; the provider's mtime-guarded
+  sync (`processOwnedProviderHost.ts:419`) remains the only in-run writer.
+- **I1 (git-trust):** `skipGitRepoCheck` — but **profile-gated**, threaded from the recorded profile
+  through provider construction and process isolation (`codexProvider.ts:558`, `application.ts:174`),
+  so `--hardened` and non-standalone consumers keep `false`. Safe (removes only the git-root
+  prerequisite, not the sandbox), but not "one line."
+- **Status/doctor consistency:** `doctor`'s `provider-authentication` check exists at the CLI level
+  (`main.ts:78`), not in `health.ts` — so N1 is a **severity/consistency** fix, not "add a check":
+  make the top-line reflect it (today `ok = every status !== 'fail'`, `health.ts:202`, so a `warn`
+  stays green), fix the dangling `health.ts:150` comment, and fix the web `/api/v1/instance`
+  `configured`-without-probe report (`router.ts:65-71`, which is mode-scoped, not unconditional).
+- **Bootstrap resume + PowerShell parity:** make `install.sh` idempotent for a *valid-but-unhealthy*
+  install (not just "no instance.json"), auth-aware final message; **every launcher change must be
+  mirrored in `workflow-mcp-docker.ps1`** (auth auto-up, identity gates) — the original plan ignored
+  Windows entirely.
+- **Identity ceremony:** demote **same-daemon** context rename and path-casing to warn-and-reattach,
+  and always allow `uninstall`. **Cross-daemon** movement (Docker Desktop reset / colima) is NOT a
+  warn-and-continue — volumes are daemon-local and labels are copyable, so it needs an explicit
+  backup/restore/import flow (Tranche B).
+- **Error-message + resume UX:** turn `.codex` exit 77 and image-mismatch into clear, actionable
+  messages. **Keep the `.codex` mask attached** (see 0.3 I2).
+- **Decision, not code:** resolve the **full-project-write contradiction** (0.3, missed blocker).
+
+**TRANCHE B — deferred to separate, threat-modeled PRs** (each widens the agent's reach or moves
+data across trust boundaries):
+
+- Network egress (I3), extra writable dirs (I4), Bubblewrap fallback (I5, likely never — see 0.3),
+  cross-daemon reattach/migration (N2/N8 migration half), direct API-key persistence (A4 storage
+  half), and removing the `.codex` mask (I2). Per-command checksum removal (N7) stays advisory —
+  keep it unless latency is measured.
+
+### 0.3 Factual corrections to §1–§8 (verified against source)
+
+- **I5 Bubblewrap — REFUTE the fallback.** bwrap is the *actual* enforcement of `deny_read`/network/
+  write against same-UID descendants, not a PID-reaping nicety; the outer container runs
+  `seccomp=unconfined`+`apparmor=unconfined` (`compose.yaml:48`) *specifically* so bwrap can install
+  the inner boundary. "Degrade gracefully" would pair an unconfined outer container with same-UID
+  credential access — do not. Also factually: `policy-probe` runs in `doctor` (`health.ts:103`),
+  **not at startup**; and `attemptContainment: 'codex-bwrap-pid-v1'` (`application.ts:186`) is
+  declared from file-hash availability, so it is a **false attestation** that does not prove bwrap is
+  effective — worth fixing separately.
+- **I2 `.codex` mask — rationale was false.** `--ignore-user-config` ignores only
+  `$CODEX_HOME/config.toml`; the project `.codex` **is** read (its layer is disabled via the
+  trust-less isolated config), so "not even read" is wrong. Exit 77 already prints an explicit reason
+  (`codex-isolated.sh:21`) — it is a UX defect, not opaque. **Keep the mask**; only improve the error.
+- **N1 — check exists.** `provider-authentication` is appended by the CLI (`main.ts:78`); `health.ts`
+  has none. Reframe as severity/consistency (above), not "doctor has no auth check."
+- **A3 — credential copy is unsafe.** `.workflow-mcp` is under `/workspace` (agent-visible, same UID,
+  not in the deny list `codex-requirements.toml:42`); with network it is exfiltratable. Auto-`setfacl`
+  durably grants UID 10001 the host credential. Use a **private broker / named-volume import**, never
+  a copy under the workspace.
+- **A1/A5/A7 conflict.** Copying the host seed creates two consumers of one rotating refresh token;
+  documentation can't fix that (`processOwnedProviderHost.ts:419`). A5's acceptance must be
+  **deterministic refresh-order tests**, not "documented guidance." Startup-only seeding fixes the
+  status bug; `status` must not mutate auth state, and the exclusive/active-runs guard stays for any
+  mutating path.
+- **§2b ordering — imprecise.** The seed is copied **before** the provider fork
+  (`processOwnedProviderHost.ts:146,358`); the git-root gate precedes the model request; and
+  `codex login status` only reads **local** storage (no remote call). So the non-git run proves
+  seeding + git-trust independence, **not** that a remote auth call succeeded first. The git run
+  separately proves the credential was usable. Independence conclusion stands; the "auth succeeds
+  then git-trust kills" phrasing is corrected to "seeding precedes an independent git-trust refusal."
+- Minor citation fixes: `/data` is denied by per-profile fs entries, not global `deny_read`
+  (`codex-requirements.toml`); `codexProvider.ts:244` blocks *replay*, not execution; launcher `:393`
+  points at `setfacl`, not `auth login`.
+
+### 0.4 Missed blockers surfaced by review (add to catalog)
+
+- **HEADLINE — full-project writes are denied.** Default requests `workspace-write`, but the launcher
+  forces the `workflow_mcp_authoring` profile that opens writes only to `.claude/workflows`
+  (`codex-requirements.toml:22`), and the policy self-test *requires* all other project writes to
+  fail (`codex-policy-launcher.mjs:301`). This contradicts the README/compose claim that editing the
+  user's project is the product (`compose.yaml:33`, `README.md:55`). **After auth+git are fixed, a
+  workflow asked to edit project files still fails.** The plan must decide: workflow-authoring-only,
+  or genuinely project-authoring (and then align permissions, UI, recovery, docs). This is arguably
+  the biggest functional gap and the original draft missed it.
+- **`allowMutableSandbox: false`** disables automatic restart recovery (`application.ts:93`) — a real
+  usage hole to surface in MCP/TUI/web/docs.
+- **`concurrency: 1`** default caps a multi-agent product at one provider turn (`compose.yaml:21`) —
+  expose as a recorded option / size from Docker resources.
+- **`hostCodexAuth: false` is sticky** — if host auth was absent at install, a later host login does
+  not enable inheritance (`record.ts:20`); needs a re-detect path.
+- **Verification plan is far too small** — must add POSIX/PowerShell parity, credential
+  invalid/expired/absent/concurrent-refresh, partial/unhealthy-install resume, bwrap-unavailable,
+  hardened git behavior, and web/TUI auth truthfulness. Commit the experiment harness into the branch
+  (`standalone/scripts/`), not the session scratchpad.
+
+### 0.5 Corrected priority (supersedes §3)
+
+1. **Auth status honesty** via startup-only single-writer seed (A1, corrected).
+2. **Profile-gated `skipGitRepoCheck`** (I1, corrected — not one line).
+3. **Resolve the full-project-write contradiction** (missed headline blocker) — decision first.
+4. **Doctor/web status consistency** (N1, corrected) + clearer `.codex`/image-mismatch errors.
+5. **Bootstrap idempotent resume + PowerShell parity + same-daemon identity reattach**; `uninstall`
+   always proceeds.
+
+Everything that widens agent reach (network, writable dirs, bwrap fallback, cross-daemon, key
+persistence, mask removal) → **Tranche B**, separately threat-modeled. Overall review verdict:
+**implement Tranche A with these corrections; do not implement §1–§8 as originally written.**
+
+---
 
 Origin: a real onboarding attempt (`html-test`) where a logged-in ChatGPT/Codex user could not run
 a single workflow. Debugging surfaced a pattern much larger than one bug: workflow-mcp is armored
