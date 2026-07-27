@@ -95,7 +95,7 @@ describe('standalone daemon', () => {
       requestInit: { headers: { authorization: `Bearer ${daemon.tokens.mcp}` } },
     })
     await client.connect(transport)
-    expect((await client.listTools()).tools).toHaveLength(13)
+    expect((await client.listTools()).tools).toHaveLength(14)
     const started = await client.callTool({ name: 'workflow_run', arguments: { name: 'wait' } })
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
     await client.close()
