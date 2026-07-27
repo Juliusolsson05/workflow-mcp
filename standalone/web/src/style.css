@@ -1,91 +1,137 @@
+/*
+ * The web dashboard IS the Ink terminal, in the browser — same look, pixel for pixel: pure-black
+ * canvas, bordered boxes with gaps (header / RUNS / detail), and the exact terminal palette. The
+ * accent renders CYAN and "completed"/✓ render GOLD because that is how the reference terminal paints
+ * them; we hard-code those visible values here so the browser matches the terminal on the same
+ * screen. An expanded agent's Prompt/Activity/Result each get their own bordered panel with a ↗
+ * fullscreen overlay. One mono family, flat, zero radius, dense. Swap the :root block to retheme.
+ */
 :root {
+  --canvas: #000000;
+  --surface: #000000;
+  --surface-hi: #16181d;   /* faint hover only */
+  --ink: #eaeaea;          /* primary text (white) */
+  --dim: #bdbdbd;          /* body text inside panels */
+  --muted: #808080;        /* secondary / separators / timestamps */
+  --border: #454851;       /* gray box borders */
+  --code-bg: #0b0c0e;      /* panel + overlay body background (near black) */
+  --accent: #5cd6de;       /* cyan/teal — title, RUNS, selection, focus border, keys */
+  --gold: #d2ab55;         /* completed + ✓ (the terminal paints "done" gold, not green) */
+  --danger: #f7768e;       /* failed */
+  --warning: #e0af68;      /* completed-with-errors */
+
   color-scheme: dark;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #090b10;
-  color: #e9edf5;
-  font-synthesis: none;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  background: var(--canvas);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
 }
-
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 15% -10%, #202941 0, transparent 34rem), #090b10; }
-button, input { font: inherit; }
-button { color: inherit; }
+::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+body { margin: 0; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; text-align: left; }
+input { font: inherit; }
 
-#app { min-height: 100vh; }
-.login-card { width: min(460px, calc(100% - 32px)); margin: 0 auto; padding-top: max(12vh, 64px); }
-.product-mark { display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid #617197; border-radius: 14px; background: linear-gradient(145deg, #273450, #121824); color: #c8d8ff; font: 700 13px/1 ui-monospace, monospace; letter-spacing: .08em; box-shadow: inset 0 1px 0 #ffffff1c, 0 18px 60px #0008; }
-.product-mark.compact { width: 34px; height: 34px; border-radius: 9px; font-size: 10px; }
-.eyebrow { margin: 26px 0 8px; color: #8191b5; font: 700 11px/1.2 ui-monospace, monospace; letter-spacing: .15em; }
-h1 { margin: 0; font-size: clamp(34px, 8vw, 52px); letter-spacing: -.05em; }
-.login-copy { color: #a4aec4; line-height: 1.6; max-width: 42ch; }
-form { display: grid; gap: 10px; margin-top: 34px; padding: 22px; border: 1px solid #263048; border-radius: 16px; background: #11151ed9; box-shadow: 0 25px 80px #0007; }
-label { color: #b7c0d3; font-size: 13px; }
-input { width: 100%; padding: 12px 13px; border: 1px solid #35405a; border-radius: 9px; outline: none; background: #090c12; color: #f4f7ff; }
-input:focus { border-color: #829ee7; box-shadow: 0 0 0 3px #617fcc25; }
-form button { padding: 12px; border: 0; border-radius: 9px; background: #dce6ff; color: #111725; font-weight: 700; cursor: pointer; }
-.privacy-note, .empty-copy, .muted { color: #7f899f; font-size: 12px; line-height: 1.5; }
-.form-error, .warning-copy { color: #ffac9c; font-size: 13px; }
+/* Whole app is padded so the bordered boxes float on black with gaps, exactly like the TUI. */
+#app { height: 100vh; display: flex; flex-direction: column; gap: 8px; padding: 8px; background: var(--canvas); }
 
-.shell { min-height: 100vh; }
-.topbar { height: 64px; display: flex; align-items: center; gap: 24px; padding: 0 22px; border-bottom: 1px solid #222938; background: #0d1017e8; backdrop-filter: blur(14px); position: sticky; top: 0; z-index: 4; }
-.identity { display: flex; align-items: center; gap: 11px; font-weight: 750; letter-spacing: -.02em; }
-.instance-facts { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-.pill, .status { display: inline-flex; align-items: center; white-space: nowrap; border: 1px solid #343d50; border-radius: 999px; padding: 4px 8px; color: #aeb9ce; background: #171c27; font: 650 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .04em; }
-.pill.good, .status-completed { color: #9ee7c1; border-color: #285d47; background: #10271e; }
-.pill.warn, .status-running, .status-queued { color: #b9ccff; border-color: #37528c; background: #14213d; }
-.status-failed, .status-cancelled, .status-interrupted { color: #ffb2a5; border-color: #704036; background: #301a17; }
-.status-completed-with-errors { color: #f5d293; border-color: #715d30; background: #2c2515; }
-.version { color: #667086; font: 11px ui-monospace, monospace; }
-.ghost-button { border: 1px solid #30394d; border-radius: 8px; padding: 7px 10px; background: transparent; color: #929db4; cursor: pointer; }
-.content { display: grid; grid-template-columns: minmax(270px, 340px) 1fr; min-height: calc(100vh - 64px); }
-.run-list { border-right: 1px solid #222938; background: #0d1016; padding: 18px 12px; }
-.section-heading { display: flex; justify-content: space-between; padding: 0 10px 12px; color: #758099; font: 700 10px ui-monospace, monospace; letter-spacing: .14em; }
-.count { color: #c1c9d8; }
-.run-rows { display: grid; gap: 5px; }
-.run-row { display: grid; gap: 8px; width: 100%; padding: 12px; border: 1px solid transparent; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
-.run-row:hover { background: #151a24; }
-.run-row.selected { border-color: #3d4e73; background: #182033; box-shadow: inset 3px 0 #7898e4; }
-.run-row-top, .run-row-bottom { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
-.run-row-top strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
-.run-row-bottom { color: #707b91; font: 10px ui-monospace, monospace; }
-.detail { padding: clamp(22px, 4vw, 50px); max-width: 1100px; width: 100%; }
-.detail.empty { display: grid; place-items: center; max-width: none; color: #707b91; }
-.detail-heading { display: flex; justify-content: space-between; align-items: end; margin-bottom: 28px; }
-.detail-heading .eyebrow { margin: 0 0 7px; }
-h2 { margin: 0; font-size: clamp(26px, 4vw, 38px); letter-spacing: -.04em; }
-.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 24px; }
-.metric { display: grid; gap: 8px; padding: 15px; border: 1px solid #242c3c; border-radius: 11px; background: #10141c; }
-.metric-label { color: #778198; font-size: 11px; }
-.metric strong { font: 700 20px ui-monospace, monospace; }
-.panel { margin-top: 14px; padding: 18px; border: 1px solid #242c3c; border-radius: 12px; background: #10141c; }
-.panel h3 { margin: 0 0 14px; font-size: 13px; }
-.phase-row, .agent-row { display: grid; grid-template-columns: 10px 1fr auto; gap: 11px; align-items: center; min-height: 42px; border-top: 1px solid #1d2431; }
-.phase-row:first-of-type, .agent-row:first-of-type { border-top: 0; }
-.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #536079; box-shadow: 0 0 0 3px #53607918; }
-.status-dot.status-running { background: #7898e4; box-shadow: 0 0 0 3px #7898e42b; }
-.status-dot.status-completed { background: #70d6a1; }
-.status-dot.status-failed { background: #ff806b; }
-.block { display: block; margin-top: 3px; }
-.loading { padding: 30px 10px; color: #7f899f; font-size: 13px; }
-.evidence-group { margin-top: 10px; border-top: 1px solid #1d2431; padding-top: 10px; }
-.evidence-group summary { cursor: pointer; color: #b7c0d3; font-size: 13px; }
-.evidence-reader { display: grid; gap: 8px; justify-items: start; margin-top: 10px; width: 100%; }
-.pagination-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; width: 100%; }
-.run-pagination { margin-top: 12px; padding: 10px; border-top: 1px solid #1d2431; }
-.page-status { margin-left: auto; color: #707b91; font: 10px ui-monospace, monospace; }
-.ghost-button:disabled { cursor: default; opacity: .42; }
-.evidence-output { width: 100%; max-height: 320px; overflow: auto; margin: 0; padding: 10px; border-radius: 8px; background: #090c12; color: #cbd5e8; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.5 ui-monospace, monospace; }
-.evidence-output:empty { display: none; }
+/* ---- header box (2 lines) ---- */
+.tui-header { border: 1px solid var(--border); padding: 7px 12px; }
+.h1 { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.h-title { font-weight: 700; color: var(--accent); }
+.h-ver { color: var(--muted); }
+.h-sep { color: var(--muted); }
+.h-ready { font-weight: 700; color: var(--ink); }
+.h-warn { font-weight: 700; color: var(--warning); }
+.h-mode { color: var(--muted); }
+.h-err { color: var(--danger); }
+.h2 { color: var(--muted); }
 
-@media (max-width: 760px) {
-  .topbar { height: auto; min-height: 64px; flex-wrap: wrap; padding-block: 10px; }
-  .instance-facts .version { display: none; }
-  .content { grid-template-columns: 1fr; }
-  .run-list { border-right: 0; border-bottom: 1px solid #222938; max-height: 42vh; overflow: auto; }
-  .metrics { grid-template-columns: repeat(2, 1fr); }
-}
+/* ---- body: RUNS box | detail box, with a gap ---- */
+.tui-body { flex: 1; display: grid; grid-template-columns: minmax(240px, 320px) 1fr; gap: 8px; min-height: 0; }
+/* RUNS is the active nav list — cyan border, like the focused pane in the TUI. */
+.tui-runs { border: 1px solid var(--accent); background: var(--surface); overflow-y: auto; padding: 8px 10px; }
+.runs-head { color: var(--accent); font-weight: 700; margin-bottom: 6px; }
+.run-row { width: 100%; display: flex; gap: 6px; padding: 3px 0; }
+.run-row:hover { background: var(--surface-hi); }
+.run-row .cursor { color: var(--accent); width: 8px; flex: none; }
+.run-col { min-width: 0; }
+.run-title { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-row.selected .run-title { color: var(--accent); text-decoration: underline; font-weight: 700; }
+.run-sub { color: var(--muted); }
 
-@media (prefers-reduced-motion: no-preference) {
-  .run-row, button { transition: background-color .15s ease, border-color .15s ease, transform .15s ease; }
-  form button:hover { transform: translateY(-1px); }
+.tui-detail { border: 1px solid var(--border); background: var(--surface); overflow-y: auto; padding: 8px 12px; }
+.detail-title { display: flex; gap: 10px; align-items: baseline; }
+.dt-name { font-weight: 700; color: var(--ink); }
+.detail-counts { color: var(--muted); margin: 2px 0 12px; }
+
+.phase { margin-bottom: 10px; }
+.phase-title { color: var(--ink); font-weight: 700; margin-bottom: 2px; }
+.phase-title.warn { color: var(--warning); }
+.agent-row { width: 100%; display: flex; gap: 8px; align-items: baseline; padding: 2px 4px; }
+.agent-row:hover { background: var(--surface-hi); }
+.agent-row.expanded { border-left: 2px solid var(--accent); padding-left: 2px; }
+.glyph { flex: none; width: 12px; }
+.agent-label { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-status { flex: none; }
+.agent-detail { margin: 1px 0 6px 24px; padding-left: 8px; border-left: 1px solid var(--border); }
+.warn-line { color: var(--warning); }
+
+/* expanded-agent content: Prompt / Activity / Result, EACH a bordered panel (like the Ink rebuild).
+   The border turns accent on hover — the mouse analog of Ink's keyboard focus border. */
+.panel { border: 1px solid var(--border); margin: 6px 0; background: var(--surface); }
+.panel:hover { border-color: var(--accent); }
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 8px; border-bottom: 1px solid var(--border); }
+.panel-title { color: var(--accent); font-weight: 700; font-size: 11px; letter-spacing: .08em; }
+.panel-title.err { color: var(--danger); }
+/* ↗ fullscreen: dim until you hover the panel (the affordance appears where the eye already is). */
+.panel-fs { flex: none; color: var(--muted); font-size: 11px; }
+.panel:hover .panel-fs { color: var(--accent); }
+.panel-body { margin: 0; padding: 6px 8px; background: var(--code-bg); color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 260px; overflow: auto; }
+.activities { display: flex; flex-direction: column; gap: 1px; padding: 4px 6px; }
+.activity-row { width: 100%; display: flex; gap: 8px; align-items: baseline; padding: 1px 2px; }
+.activity-row:hover { background: var(--surface-hi); }
+.act-kind { flex: none; color: var(--dim); text-transform: capitalize; min-width: 66px; }
+.act-summary { flex: 1; min-width: 0; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act-caret { flex: none; }
+.act-body { margin: 1px 0 4px 20px; padding: 6px 8px; background: var(--code-bg); border: 1px solid var(--border); color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 260px; overflow: auto; }
+
+/* fullscreen overlay: one panel zoomed to fill the viewport, scrollable, accent-framed. */
+.fs-backdrop { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--canvas) 82%, transparent); }
+.fs-modal { display: flex; flex-direction: column; width: min(1000px, 92vw); height: min(80vh, 900px); background: var(--surface); border: 1px solid var(--accent); }
+.fs-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--border); }
+.fs-title { color: var(--accent); font-weight: 700; letter-spacing: .08em; }
+.fs-title.err { color: var(--danger); }
+.fs-close { flex: none; color: var(--muted); }
+.fs-close:hover { color: var(--ink); }
+.fs-body { flex: 1; margin: 0; padding: 12px; overflow: auto; background: var(--code-bg); color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+
+/* footer keybind/hint line (no box, like the TUI) */
+.tui-footer { padding: 2px 6px; color: var(--muted); }
+.tui-footer .k { color: var(--accent); font-weight: 700; }
+
+.muted { color: var(--muted); }
+.pad { padding: 12px; }
+
+/* status colors — shared by status text and glyphs. "done" is gold to match the terminal. */
+.st-completed { color: var(--gold); }
+.st-running, .st-queued, .st-pending, .st-cancellation-requested { color: var(--accent); }
+.st-failed, .st-cancelled, .st-interrupted { color: var(--danger); }
+.st-completed-with-errors { color: var(--warning); }
+
+/* ---- hardened-only token prompt (kept minimal) ---- */
+.token-prompt { max-width: 420px; margin: 12vh auto 0; padding: 0 16px; }
+.tp-title { font-weight: 700; font-size: 16px; color: var(--accent); }
+.tp-copy { color: var(--dim); margin: 8px 0 16px; }
+.token-prompt form { display: flex; flex-direction: column; gap: 8px; }
+.token-prompt input { padding: 8px 10px; background: var(--surface); border: 1px solid var(--border); color: var(--ink); }
+.token-prompt input:focus { outline: none; border-color: var(--accent); }
+.token-prompt button { padding: 8px; background: var(--accent); color: var(--canvas); font-weight: 700; }
+.tp-error { color: var(--danger); }
+
+@media (max-width: 720px) {
+  .tui-body { grid-template-columns: 1fr; }
+  .tui-runs { max-height: 38vh; }
 }
