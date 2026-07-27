@@ -180,7 +180,7 @@ export class StandaloneApiClient {
   constructor(options: { baseUrl?: string; token: string; fetch?: typeof fetch }) {
     this.#baseUrl = (options.baseUrl ?? '').replace(/\/$/, '')
     this.#token = options.token
-    this.#fetch = options.fetch ?? globalThis.fetch
+    this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis)
   }
 
   async instance(signal?: AbortSignal): Promise<InstanceSummary> {
