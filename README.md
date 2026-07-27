@@ -89,8 +89,8 @@ provider-neutral AgentProvider
 ## What you get
 
 - **Portable workflow files** — the same `.js` runs here and in Claude Code.
-- **A durable MCP server** — thirteen stable tools (`workflow_list`,
-  `workflow_describe`, `workflow_validate`, `workflow_run`,
+- **A durable MCP server** — fourteen stable tools (`workflow_list`,
+  `workflow_author_guide`, `workflow_describe`, `workflow_validate`, `workflow_run`,
   `workflow_run_status`, `workflow_run_events`, `workflow_result_read`, `workflow_run_cancel`,
   `workflow_resume`, `workflow_agent_list`, `workflow_agent_result_read`,
   `workflow_agent_results_read`, `workflow_agent_transcript_read`) over stdio or an authenticated

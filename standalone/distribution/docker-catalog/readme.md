@@ -2,7 +2,7 @@
 
 Run Claude-compatible JavaScript workflow files from a selected project through the Codex provider.
 Definitions are discovered from the read-only `/workspace/.claude/workflows` tree and exposed as
-thirteen MCP tools for discovery, execution, durable status/events, resume, cancellation, results,
+fourteen MCP tools for discovery, execution, durable status/events, resume, cancellation, results,
 and per-agent evidence.
 
 ## Configuration

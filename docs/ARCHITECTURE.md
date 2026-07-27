@@ -113,7 +113,7 @@ await service.initialize()
 registerWorkflowMcpTools(mcpServer, service, { cwd: projectDirectory, clientId: sessionId })
 ```
 
-The thirteen stable tools are `workflow_list`, `workflow_describe`, `workflow_validate`,
+The fourteen stable tools are `workflow_list`, `workflow_author_guide`, `workflow_describe`, `workflow_validate`,
 `workflow_run`, `workflow_run_status`, `workflow_run_events`, `workflow_result_read`,
 `workflow_run_cancel`, `workflow_resume`, `workflow_agent_list`,
 `workflow_agent_result_read`, `workflow_agent_results_read`, and

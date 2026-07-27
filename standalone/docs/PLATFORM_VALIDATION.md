@@ -86,7 +86,7 @@ For each row:
     remains. Reinstall/adopt only through the documented identity path; finally test exact-ID
     confirmed deletion on the disposable fixture.
 12. On the current Docker Desktop release, install/enable the current MCP Gateway and rendered
-    Catalog entry, select a clean project, list exactly thirteen tools, and complete a
+    Catalog entry, select a clean project, list exactly fourteen tools, and complete a
     credential-free `workflow_list` call. Separately verify the maintainer image digest with Cosign;
     Gateway's default signature policy is not evidence for a non-Docker-owned image. Confirm that
     removing the Catalog server discards its anonymous state, as documented.
