@@ -4,7 +4,8 @@ import {
   type PublicRunState,
   type RunSummary,
 } from '../../src/client/apiClient.js'
-import { activityGlyph, reduceAgentTranscript, type AgentDetailContent } from '../../src/client/agentActivities.js'
+import { activityGlyph, type AgentDetailContent } from '../../src/client/agentActivities.js'
+import { followAgentActivity, followRun } from '../../src/client/liveWorkflow.js'
 import './style.css'
 
 /*
@@ -32,18 +33,19 @@ let connectionError: string | undefined
 // The panel currently zoomed fullscreen (Prompt/Result/Error), or undefined. Kept as state (not a
 // detached node) so it survives the full-DOM re-render every poll tick — render() re-appends it.
 let fullscreenPanel: { title: string; body: string; danger: boolean } | undefined
-// Per-agent transcript content (prompt/activities/result), lazily fetched on first expand.
+// Per-agent transcript content (prompt/activities/result), kept live by followExpandedAgent while an
+// agent is open — NOT fetched once on expand (that was the freeze bug the live engine fixes).
 const agentContent = new Map<string, AgentDetailContent>()
 const expandedActivities = new Set<string>()
+// stop() handles for the two live followers. Exactly one run follower and at most one agent follower
+// run at a time; selecting a run / expanding an agent stops the previous one before starting the next.
+let stopRunFollow: (() => void) | undefined
+let stopAgentFollow: (() => void) | undefined
 
 // Esc closes the fullscreen overlay (mirrors Ink's Esc-zooms-out). Registered once at module load.
 window.addEventListener('keydown', event => {
   if (event.key === 'Escape' && fullscreenPanel !== undefined) { fullscreenPanel = undefined; render() }
 })
-
-function isTerminal(status: string): boolean {
-  return ['completed', 'completed_with_errors', 'failed', 'cancelled', 'interrupted'].includes(status)
-}
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag)
@@ -132,9 +134,11 @@ async function authenticate(token: string): Promise<void> {
 
 async function poll(): Promise<void> {
   await refreshTop()
+  followSelectedRun() // live-follow whatever run refreshTop auto-selected
   render()
+  // The runs inventory + instance change slowly and have no per-run event feed, so they stay on a
+  // light interval. The SELECTED run and the EXPANDED agent are followed live, not polled here.
   window.setInterval(() => { if (document.visibilityState === 'visible') void refreshTop().then(render) }, 3_000)
-  window.setInterval(() => { if (document.visibilityState === 'visible') void refreshDetail().then(render) }, 2_000)
 }
 
 async function refreshTop(): Promise<void> {
@@ -144,29 +148,35 @@ async function refreshTop(): Promise<void> {
     instance = inst
     runs = page.items
     connectionError = undefined
-    if (selectedRunId === undefined && runs[0] !== undefined) selectedRunId = runs[0].runId
+    // Auto-select the newest run on first sighting and begin following it immediately.
+    if (selectedRunId === undefined && runs[0] !== undefined) { selectedRunId = runs[0].runId; followSelectedRun() }
   } catch (error) {
     connectionError = describeError(error)
   }
 }
 
-async function refreshDetail(): Promise<void> {
+// Live-follow the selected run: long-poll the event feed and refetch the authoritative snapshot on
+// each wake (see followRun), replacing the old fixed 2s detail poll. Stops any previous follower.
+function followSelectedRun(): void {
+  stopRunFollow?.()
+  stopRunFollow = undefined
   if (client === undefined || selectedRunId === undefined) { detail = undefined; return }
-  // A terminal run never changes; stop refetching/re-rendering it so reading a long result/transcript
-  // is not interrupted every 2s. Live runs keep polling.
-  if (detail !== undefined && detail.run.runId === selectedRunId && isTerminal(detail.state.status)) return
-  try {
-    detail = (await client.run(selectedRunId)) as RunDetail
-  } catch { /* keep last good detail */ }
+  stopRunFollow = followRun(client, selectedRunId, {
+    onSnapshot: snapshot => { detail = { run: snapshot.run, state: snapshot.state }; render() },
+  })
 }
 
-async function loadAgentContent(runId: string, agentId: string): Promise<void> {
-  if (client === undefined) return
-  try {
-    const page = await client.agentTranscript(runId, agentId, 0)
-    agentContent.set(agentId, reduceAgentTranscript(page.events))
-    render()
-  } catch { /* leave as loading; a later expand retries */ }
+// Live-follow the expanded agent's transcript so a running agent's new tool calls and streaming
+// result appear without re-expanding. Stops any previous follower; starts one only when an agent is
+// open. The follower self-terminates once the agent is done (see followAgentActivity).
+function followExpandedAgent(): void {
+  stopAgentFollow?.()
+  stopAgentFollow = undefined
+  if (client === undefined || detail === undefined || expandedAgentId === undefined) return
+  const agentId = expandedAgentId
+  stopAgentFollow = followAgentActivity(client, detail.run.runId, agentId, {
+    onUpdate: content => { agentContent.set(agentId, content); render() },
+  })
 }
 
 function render(): void {
@@ -252,7 +262,8 @@ function runsList(): HTMLElement {
       // don't show the previous run's content.
       agentContent.clear()
       expandedActivities.clear()
-      void refreshDetail().then(render)
+      followSelectedRun()   // start following the new run
+      followExpandedAgent() // stop the old agent follower (expandedAgentId is now undefined)
       render()
     })
     nav.append(btn)
@@ -305,12 +316,8 @@ function runDetail(): HTMLElement {
       )
       if (agent.reused) row.append(el('span', 'muted', ' · cached'))
       row.addEventListener('click', () => {
-        if (expanded) {
-          expandedAgentId = undefined
-        } else {
-          expandedAgentId = agent.id
-          if (detail !== undefined && !agentContent.has(agent.id)) void loadAgentContent(detail.run.runId, agent.id)
-        }
+        expandedAgentId = expanded ? undefined : agent.id
+        followExpandedAgent() // start/stop the live transcript follower for the newly (un)expanded agent
         render()
       })
       phaseBox.append(row)
