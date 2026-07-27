@@ -7,7 +7,8 @@ import {
   type PublicRunState,
   type RunSummary,
 } from '../client/apiClient.js'
-import { activityGlyph as activityKindGlyph, reduceAgentTranscript, type AgentDetailContent } from '../client/agentActivities.js'
+import { activityGlyph as activityKindGlyph, type AgentDetailContent } from '../client/agentActivities.js'
+import { followAgentActivity, followRun } from '../client/liveWorkflow.js'
 
 /*
  * Ink (React) terminal UI. Mostly white/gray with a restrained agent-code accent: the palette is
@@ -84,9 +85,6 @@ function wrapText(text: string, width: number): string[] {
   return out
 }
 
-function isTerminal(status: string): boolean {
-  return ['completed', 'completed_with_errors', 'failed', 'cancelled', 'interrupted'].includes(status)
-}
 
 type RunDetail = { run: RunSummary; state: PublicRunState }
 // Focus levels, each shown by an accent border on the active region so "where am I" is always visible:
@@ -182,24 +180,21 @@ function App({ client }: { client: StandaloneApiClient }): React.JSX.Element {
   const selectedRun = runs[selected]
   const selectedRunId = selectedRun?.runId
 
+  // Live-follow the selected run instead of polling on a timer: followRun long-polls the event feed
+  // (server blocks up to 25s) and refetches the authoritative snapshot on every cursor advance, then
+  // self-stops once the run is terminal. detailSig still gates re-render so identical snapshots never
+  // repaint (anti-flicker). Reset the signature on run-change so the new run's first snapshot applies.
   useEffect(() => {
-    if (selectedRunId === undefined) { setDetail(undefined); detailSig.current = ''; return }
-    let alive = true
-    const loadDetail = async (): Promise<void> => {
-      // Freeze terminal runs: once loaded they never change, so stop refetching and repainting.
-      if (detail !== undefined && detail.run.runId === selectedRunId && isTerminal(detail.state.status)) return
-      try {
-        const snapshot = (await client.run(selectedRunId)) as RunDetail
-        if (!alive) return
+    detailSig.current = ''
+    if (selectedRunId === undefined) { setDetail(undefined); return }
+    return followRun(client, selectedRunId, {
+      onSnapshot: snapshot => {
         const s = snapshot.state
         const dSig = `${s.runId}:${s.sequence}:${s.status}:${s.agents.map(a => `${a.id}${a.status}`).join('')}`
-        if (dSig !== detailSig.current) { detailSig.current = dSig; setDetail(snapshot) }
-      } catch { /* keep last good detail */ }
-    }
-    void loadDetail()
-    const timer = setInterval(() => void loadDetail(), 2_000)
-    return () => { alive = false; clearInterval(timer) }
-  }, [client, selectedRunId, detail])
+        if (dSig !== detailSig.current) { detailSig.current = dSig; setDetail({ run: snapshot.run, state: snapshot.state }) }
+      },
+    })
+  }, [client, selectedRunId])
 
   useEffect(() => { setAgentCursor(0); setAgentScroll(0); setAgentContent({}) }, [selectedRunId])
 
@@ -209,6 +204,21 @@ function App({ client }: { client: StandaloneApiClient }): React.JSX.Element {
   const focusedPanels = presentPanels(focusedContent)
   // Clamp the panel cursor into range as the transcript loads (present panels appear over time).
   const panelIndex = Math.min(panelCursor, Math.max(0, focusedPanels.length - 1))
+
+  // Live-follow the focused agent's transcript: new tool calls, the streaming result, and the
+  // running->completed flip appear WITHOUT re-expanding — the old code fetched once on expand and
+  // cached forever, which is exactly why a running agent looked frozen. The follower self-terminates
+  // once the agent is done; the effect cleanup stops it on collapse (focus leaves the agent) and on
+  // run-change (focusedAgentId/run become undefined). agentContent is keyed by agent id so each
+  // agent keeps its own live-reduced content.
+  const focusedAgentId = focusedAgent?.id
+  const followRunId = detail?.run.runId
+  useEffect(() => {
+    if (followRunId === undefined || focusedAgentId === undefined) return
+    return followAgentActivity(client, followRunId, focusedAgentId, {
+      onUpdate: content => setAgentContent(prev => ({ ...prev, [focusedAgentId]: content })),
+    })
+  }, [client, followRunId, focusedAgentId])
 
   useInput((input, key) => {
     if (key.ctrl && input === 'c') { exit(); return }
@@ -229,15 +239,11 @@ function App({ client }: { client: StandaloneApiClient }): React.JSX.Element {
       else if (key.return || key.rightArrow) {
         const agent = agents[agentCursor]
         if (agent === undefined) return
+        // Just enter the agent; the focused-agent live-follow effect fetches and keeps its transcript
+        // current (see followAgentActivity above). No once-on-expand fetch — that was the freeze bug.
         setFocus('agent')
         setPanelCursor(0)
         setAgentScroll(0)
-        const runId = detail?.run.runId
-        if (runId !== undefined && agentContent[agent.id] === undefined) {
-          void client.agentTranscript(runId, agent.id, 0)
-            .then(page => setAgentContent(prev => ({ ...prev, [agent.id]: reduceAgentTranscript(page.events) })))
-            .catch(() => { /* re-enter to retry */ })
-        }
       }
       return
     }
