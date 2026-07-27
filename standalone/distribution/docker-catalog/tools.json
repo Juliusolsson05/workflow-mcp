@@ -6,6 +6,12 @@
     "arguments": []
   },
   {
+    "name": "workflow_author_guide",
+    "description": "Return the workflow authoring contract: DSL signatures, inspection flow, and a runnable example.",
+    "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },
+    "arguments": []
+  },
+  {
     "name": "workflow_describe",
     "description": "Describe one visible workflow without executing it.",
     "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false },

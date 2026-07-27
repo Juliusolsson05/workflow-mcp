@@ -60,7 +60,7 @@ describe('stdio MCP proxy', () => {
     const client = new Client({ name: 'proxy-system-test', version: '1' })
     await client.connect(transport)
     const [firstList, secondList] = await Promise.all([client.listTools(), client.listTools()])
-    expect(firstList.tools).toHaveLength(13)
+    expect(firstList.tools).toHaveLength(14)
     expect(secondList.tools.map(tool => tool.name)).toEqual(firstList.tools.map(tool => tool.name))
     const started = await client.callTool({ name: 'workflow_run', arguments: { name: 'proxy' } })
     expect(started.structuredContent).toMatchObject({ ok: true, run: { status: expect.any(String) } })

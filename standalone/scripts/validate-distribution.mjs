@@ -184,8 +184,8 @@ if (
 ) {
   throw new Error('Docker Catalog readme must disclose its lifecycle boundary and durable alternative')
 }
-if (!Array.isArray(tools) || tools.length !== 13 || new Set(tools.map(tool => tool.name)).size !== 13) {
-  throw new Error('Docker Catalog tool inventory must name all thirteen stable MCP tools exactly once')
+if (!Array.isArray(tools) || tools.length !== 14 || new Set(tools.map(tool => tool.name)).size !== 14) {
+  throw new Error('Docker Catalog tool inventory must name all fourteen stable MCP tools exactly once')
 }
 for (const tool of tools) {
   if (!Array.isArray(tool.arguments)) throw new Error(`Docker Catalog tool ${tool.name} has no argument inventory`)

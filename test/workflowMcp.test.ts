@@ -22,7 +22,7 @@ describe('workflow MCP facade', () => {
     expect(workflowMcpInstructions(false, 1)).toContain('shared provider capacity of 1')
   })
 
-  it('registers the complete stable thirteen-tool surface', async () => {
+  it('registers the complete stable fourteen-tool surface', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'workflow-mcp-tools-'))
     const service = new WorkflowService({
       store: new FileWorkflowStore(join(cwd, 'state')),
@@ -41,6 +41,7 @@ describe('workflow MCP facade', () => {
       'workflow_agent_result_read',
       'workflow_agent_results_read',
       'workflow_agent_transcript_read',
+      'workflow_author_guide',
       'workflow_describe',
       'workflow_list',
       'workflow_result_read',

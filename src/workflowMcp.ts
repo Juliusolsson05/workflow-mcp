@@ -46,6 +46,62 @@ export function workflowMcpInstructions(inlineAuthoring = true, providerCapacity
   )
 }
 
+// A single, runnable authoring example — the ONE source of truth reused by the empty-state hint and
+// the workflow_author_guide tool, so they can never drift. It parses under the same rules the loader
+// enforces (first statement is the pure-literal meta) because it is surfaced as copy-paste: a broken
+// example is worse than none. String-concatenation (no inner template literals) keeps it embeddable.
+export const WORKFLOW_AUTHORING_EXAMPLE = `export const meta = {
+  name: 'review-index-html',
+  description: 'Two parallel reviewers and a synthesizer over a project file',
+  phases: [{ title: 'Review' }, { title: 'Synthesize' }],
+}
+
+// parallel(thunks) admits the whole independent collection at once so the scheduler keeps its
+// provider seats full; each thunk resolves to that agent's final text.
+phase('Review')
+const reviews = await parallel([
+  () => agent('Review index.html for HTML semantics and accessibility. Give concrete, prioritized findings.'),
+  () => agent('Review index.html for CSS and markup quality. Give concrete, prioritized findings.'),
+])
+
+// A dependent synthesis agent merges the two independent reviews into one prioritized report.
+phase('Synthesize')
+const report = await agent(
+  'Merge these two reviews into one prioritized report:\\n\\n' + reviews.join('\\n\\n---\\n\\n'),
+)
+
+return report
+`
+
+// The authoring contract as STRUCTURED data an agent receives inside a tool result — deliberately
+// redundant with the initialize instructions, because clients (observed live: Codex) may drop the
+// instructions field, and a flailing agent's next move is a tool call, not re-reading initialize.
+// Provider-neutral. The empty workflow_list result and workflow_author_guide both return this.
+export function workflowAuthoringGuide(inlineAuthoring = true): {
+  ok: true
+  authoring: string
+  primitives: string[]
+  inspect: string
+  example: string
+} {
+  return {
+    ok: true,
+    authoring: inlineAuthoring
+      ? 'Author by calling workflow_run with your script in `script`. The FIRST statement must be a pure literal: export const meta = { name, description } (optional title, whenToUse, phases). The script is saved under the project .claude/workflows and workflow_run returns its editable scriptPath; iterate by editing that file and calling workflow_run with scriptPath.'
+      : 'This instance is read-only. Create <project>/.claude/workflows/<name>.js on the host with the shape in `example` (first statement a pure-literal export const meta = { name, description }), then restart the daemon so the new source hash crosses the startup approval boundary. Run it with workflow_run { name }.',
+    primitives: [
+      'agent(prompt: string, opts?) => Promise<string> — run one sub-agent; resolves to its final text.',
+      'parallel(thunks: Array<() => Promise<any>>) => Promise<any[]> — run all concurrently and await every one (a barrier). Use for independent work.',
+      'pipeline(items: any[], ...stages) => Promise<any[]> — run each item through all stages independently, no barrier between stages. The default for multi-stage work.',
+      'phase(title: string) => void — start a phase group; log(message: string) => void — emit a progress line.',
+      'workflow(nameOrRef, args?) => Promise<any> — run another saved workflow inline and return its result.',
+      'args — the JSON value passed to workflow_run (pass real JSON, never a JSON-encoded string).',
+    ],
+    inspect: 'workflow_run returns immediately. Poll workflow_run_events with after=<last toCursor> (waitMs long-polls) until status is terminal, then workflow_run_status for run.result. Read each agent with workflow_agent_list then workflow_agent_result_read (or workflow_agent_results_read to sweep all).',
+    example: WORKFLOW_AUTHORING_EXAMPLE,
+  }
+}
+
 export type WorkflowMcpRegistrationHooks = {
   /** Called after a durable run exists, before its MCP result is returned. */
   onRunStarted?: (run: WorkflowRunStartResult) => void
@@ -68,7 +124,18 @@ export function registerWorkflowMcpTools(
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async () => result(await listResult(service, scope)),
+    async () => result(await listResult(service, scope, hooks.inlineAuthoring !== false)),
+  )
+
+  server.registerTool(
+    'workflow_author_guide',
+    {
+      title: 'How to author a workflow',
+      description: 'Return the workflow authoring contract as structured data: how to author, the DSL primitive signatures (agent/parallel/pipeline/phase/log/workflow), the post-run inspection flow, and a complete runnable example. Call this FIRST if you are unsure how to create or run a workflow — it needs no arguments and does not depend on the initialize instructions.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async () => result(workflowAuthoringGuide(hooks.inlineAuthoring !== false)),
   )
 
   server.registerTool(
@@ -353,15 +420,46 @@ export function registerWorkflowMcpTools(
       }),
     }),
   )
+
+  // MCP resources: a connecting agent's standard discovery move is resources/list — which returned
+  // -32601 before, because the server registered none. Registering these makes the capability real
+  // and hosts the authoring guide + a runnable example where that probe already looks (redundant with
+  // workflow_author_guide and the empty-list hint, deliberately, so no single dropped channel strands
+  // the agent).
+  const inlineAuthoring = hooks.inlineAuthoring !== false
+  server.registerResource(
+    'workflow-getting-started',
+    'workflow://getting-started',
+    {
+      title: 'Workflow authoring: getting started',
+      description: 'How to author and run a workflow: the DSL primitive signatures, the post-run inspection flow, and a runnable example.',
+      mimeType: 'application/json',
+    },
+    uri => ({ contents: [{ uri: uri.href, mimeType: 'application/json', text: JSON.stringify(workflowAuthoringGuide(inlineAuthoring), null, 2) }] }),
+  )
+  server.registerResource(
+    'workflow-example-review',
+    'workflow://examples/review',
+    {
+      title: 'Example workflow: parallel review + synthesis',
+      description: 'A complete, runnable workflow script — two parallel reviewers and a synthesizer. Copy it, adapt the prompts, and pass it as workflow_run { script }.',
+      mimeType: 'text/javascript',
+    },
+    uri => ({ contents: [{ uri: uri.href, mimeType: 'text/javascript', text: WORKFLOW_AUTHORING_EXAMPLE }] }),
+  )
 }
 
-async function listResult(service: WorkflowService, scope: WorkflowServiceScope) {
+async function listResult(service: WorkflowService, scope: WorkflowServiceScope, inlineAuthoring: boolean) {
   const found = await service.list(scope)
   return {
     ok: true,
     workflows: found.workflows.map(publicWorkflow),
     issues: found.issues,
     nearMisses: found.nearMisses,
+    // A fresh project has no workflows, and an empty list alone strands the agent — this is exactly
+    // where a client that started with workflow_list gets stuck. Teach the next step right here in
+    // the result (the same guide workflow_author_guide returns), not only in initialize instructions.
+    ...(found.workflows.length === 0 ? { gettingStarted: workflowAuthoringGuide(inlineAuthoring) } : {}),
   }
 }
 

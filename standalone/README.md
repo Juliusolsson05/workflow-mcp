@@ -138,9 +138,9 @@ The generated Codex stanza runs the installed, project-scoped launcher:
 
 The launcher revalidates instance/context identity and reconstructs every recorded Compose overlay
 before entering the proxy. The proxy keeps stdout exclusively for MCP JSON-RPC and authenticates to the loopback daemon with
-the MCP token stored in the named volume. It exposes thirteen tools:
+the MCP token stored in the named volume. It exposes fourteen tools:
 
-- `workflow_list`, `workflow_describe`, and `workflow_validate` discover definitions;
+- `workflow_list`, `workflow_author_guide`, `workflow_describe`, and `workflow_validate` discover definitions and teach authoring;
 - `workflow_run`, `workflow_resume`, and `workflow_run_cancel` mutate durable run state;
 - `workflow_run_status` and `workflow_run_events` follow a run by strict cursor; and
 - the five result/agent tools page complete workflow and per-agent evidence without filesystem

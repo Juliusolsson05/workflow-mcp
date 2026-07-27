@@ -57,7 +57,7 @@ try {
   }
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`)
   const listed = await request('tools/list', {})
-  if (listed.tools?.length !== 13) throw new Error(`Expected 13 tools, received ${listed.tools?.length}`)
+  if (listed.tools?.length !== 14) throw new Error(`Expected 14 tools, received ${listed.tools?.length}`)
   const started = await request('tools/call', {
     name: 'workflow_run',
     arguments: { name: 'smoke', idempotencyKey: 'registry-single-session-smoke' },
