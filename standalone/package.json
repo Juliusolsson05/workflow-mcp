@@ -19,8 +19,8 @@
     "check": "npm run typecheck && npm run test && npm run check:imports && npm run check:distribution && npm run check:host-launcher"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
-    "ink": "5.1.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "ink": "5.2.1",
     "react": "18.3.1",
     "workflow-mcp": "file:..",
     "zod": "4.4.3"
