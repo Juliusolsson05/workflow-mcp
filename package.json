@@ -52,9 +52,9 @@
     "node": ">=20.19.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
-    "@openai/codex-sdk": "0.144.6",
-    "acorn": "8.17.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@openai/codex-sdk": "0.149.1",
+    "acorn": "8.18.0",
     "ajv": "8.20.0",
     "zod": "4.4.3"
   },
@@ -64,7 +64,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.20.0",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
