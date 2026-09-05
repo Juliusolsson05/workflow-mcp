@@ -76,11 +76,14 @@ LABEL org.opencontainers.image.title="Workflow MCP" \
 # requested Git revision available. Naming the complete added closure makes repository movement
 # fail closed instead of silently changing a release retry; packages inherited from NODE_IMAGE are
 # already frozen by its multi-architecture digest.
+# Alpine retires older revisions even within a stable branch. Refresh unavailable
+# pins deliberately against both architectures' official indexes (#57); do not
+# replace these equalities with floating packages merely to make CI pass.
 RUN apk add --no-cache \
       brotli-libs=1.2.0-r0 c-ares=1.34.8-r0 git=2.52.0-r0 \
-      git-init-template=2.52.0-r0 libcurl=8.20.0-r0 libexpat=2.8.2-r0 \
+      git-init-template=2.52.0-r0 libcurl=8.22.0-r0 libexpat=2.8.4-r0 \
       libidn2=2.3.8-r0 libpsl=0.21.5-r3 libunistring=1.4.1-r0 \
-      nghttp2-libs=1.69.0-r0 pcre2=10.47-r0 ripgrep=15.1.0-r0 \
+      nghttp2-libs=1.69.0-r0 pcre2=10.48-r0 ripgrep=15.1.0-r0 \
       tini=0.19.0-r3 zstd-libs=1.5.7-r2 \
     # WHY: the final process invokes only `node` and checked-in entrypoints. npm, npx, Corepack,
     # and Yarn are build-time package managers; retaining them would add an unused executable
