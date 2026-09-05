@@ -1,3 +1,6 @@
-node_modules/
+# WHY no trailing slash: local development may use a node_modules symlink.
+# A directory-only rule does not ignore that link, and committing it makes clean
+# consumer installs depend on an author's sibling worktree (and fail ENOTDIR).
+node_modules
 dist/
 coverage/
