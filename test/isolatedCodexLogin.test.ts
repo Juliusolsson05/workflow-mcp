@@ -1,11 +1,11 @@
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { synchronizeIsolatedAuthentication } from '../src/processOwnedProviderHost.js'
-import { createIsolatedCodexLogin } from './support/isolatedCodexLogin.js'
+import { STALE_ROOT_MS, createIsolatedCodexLogin } from './support/isolatedCodexLogin.js'
 
 // WHY this deterministic test exists for a helper that only live tests use (agent-code#1295): the
 // live tier is opt-in and never runs in CI, so the one property that protects the developer's real
@@ -19,6 +19,14 @@ import { createIsolatedCodexLogin } from './support/isolatedCodexLogin.js'
 
 const NOW = Date.parse('2026-09-26T12:00:00.000Z')
 const roots: string[] = []
+// Each test gets its own parent for the helper's roots, so the "nothing was created" and sweep checks
+// cannot see a root that another runner or a real live run put in $TMPDIR (review of #63).
+let parent: string
+
+beforeEach(async () => {
+  parent = await mkdtemp(join(tmpdir(), 'workflow-live-parent-'))
+  roots.push(parent)
+})
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
@@ -39,7 +47,7 @@ async function sourceHome(auth: unknown): Promise<{ home: string; serialized: st
 
 // A refused login must strand nothing: no temp home, no half-written snapshot.
 async function isolatedRoots(): Promise<string[]> {
-  return (await readdir(tmpdir())).filter(name => name.startsWith('workflow-live-codex-')).sort()
+  return (await readdir(parent)).filter(name => name.startsWith('workflow-live-codex-')).sort()
 }
 
 const chatgptLogin = (accessToken: string) => ({
@@ -58,7 +66,7 @@ describe('isolated Codex login for live tests', () => {
   it('never lets the refresh token reach the isolated home, and leaves the source untouched', async () => {
     const accessToken = jwt(NOW / 1_000 + 3_600)
     const source = await sourceHome(chatgptLogin(accessToken))
-    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW })
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, parentDirectory: parent })
     roots.push(dirname(login.codexHome))
 
     // Exactly what every attempt does before starting Codex (prepareIsolatedCodexAttempt).
@@ -66,9 +74,14 @@ describe('isolated Codex login for live tests', () => {
 
     const isolated = await readFile(join(login.codexHome, 'auth.json'), 'utf8')
     expect(isolated).not.toContain('fixture-one-time-refresh-token')
-    expect(JSON.parse(isolated)).toMatchObject({
+    // Exact shape, mirroring Agent Code's CodexWorkflowAuthenticationBroker: the id_token is the
+    // bounded access token too, never the source's own id_token (review of #63 found that mutation
+    // surviving a partial match).
+    expect(JSON.parse(isolated)).toEqual({
       auth_mode: 'chatgptAuthTokens',
-      tokens: { access_token: accessToken, refresh_token: '', account_id: 'fixture-account' },
+      OPENAI_API_KEY: null,
+      tokens: { id_token: accessToken, access_token: accessToken, refresh_token: '', account_id: 'fixture-account' },
+      last_refresh: new Date(NOW).toISOString(),
     })
     // The snapshot is a sibling temp file, never a path inside the developer's real home.
     expect(relative(source.home, login.authenticationFile).startsWith('..')).toBe(true)
@@ -83,7 +96,7 @@ describe('isolated Codex login for live tests', () => {
 
   it('passes an API-key login through, since it has no rotating lineage', async () => {
     const source = await sourceHome({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-fixture', tokens: null })
-    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW })
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, parentDirectory: parent })
     roots.push(dirname(login.codexHome))
     expect(JSON.parse(await readFile(login.authenticationFile, 'utf8'))).toEqual({
       auth_mode: 'apikey', OPENAI_API_KEY: 'sk-fixture', tokens: null, last_refresh: null,
@@ -97,7 +110,7 @@ describe('isolated Codex login for live tests', () => {
   ])('refuses %s instead of falling back to the full file', async (_label, auth, message) => {
     const source = await sourceHome(auth)
     const before = await isolatedRoots()
-    await expect(createIsolatedCodexLogin(source.home, { now: () => NOW })).rejects.toThrow(message)
+    await expect(createIsolatedCodexLogin(source.home, { now: () => NOW, parentDirectory: parent })).rejects.toThrow(message)
     expect(await isolatedRoots()).toEqual(before)
   })
 
@@ -107,6 +120,7 @@ describe('isolated Codex login for live tests', () => {
     let createdPath: string | undefined
     await expect(createIsolatedCodexLogin(source.home, {
       now: () => NOW,
+      parentDirectory: parent,
       // Half the token reaches disk, then the write fails — the disk-full shape.
       writeSnapshot: async (path, contents) => {
         createdPath = path
@@ -119,11 +133,27 @@ describe('isolated Codex login for live tests', () => {
     expect(await isolatedRoots()).toEqual(before)
   })
 
+  it('sweeps roots stranded by a killed run, and leaves a live run\'s root alone', async () => {
+    const stale = join(parent, 'workflow-live-codex-killed')
+    const live = join(parent, 'workflow-live-codex-running')
+    for (const dir of [stale, live]) {
+      await mkdir(dir)
+      await writeFile(join(dir, 'auth-snapshot.json'), 'fixture bearer bytes')
+    }
+    const staleTime = new Date(Date.now() - STALE_ROOT_MS - 60_000)
+    await utimes(stale, staleTime, staleTime)
+    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, parentDirectory: parent })
+    await expect(stat(stale)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await stat(live)).isDirectory()).toBe(true)
+    await login.dispose()
+  })
+
   it('refuses a missing file-backed login without creating anything', async () => {
     const home = await mkdtemp(join(tmpdir(), 'workflow-live-source-'))
     roots.push(home)
     const before = await isolatedRoots()
-    await expect(createIsolatedCodexLogin(home, { now: () => NOW })).rejects.toThrow(/file-backed login/)
+    await expect(createIsolatedCodexLogin(home, { now: () => NOW, parentDirectory: parent })).rejects.toThrow(/file-backed login.*cli_auth_credentials_store = "file"/)
     expect(await isolatedRoots()).toEqual(before)
   })
 })

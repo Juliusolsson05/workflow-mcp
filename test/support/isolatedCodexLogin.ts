@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -43,30 +43,49 @@ const REFRESH_SKEW_MS = 5 * 60_000
 export type IsolatedCodexLoginOptions = {
   now?: () => number
   /**
+   * Where the throwaway root is created (default: the OS temp dir). Tests pass a private parent so
+   * their "nothing was created" and sweep checks cannot see another runner's roots (review of #63).
+   */
+  parentDirectory?: string
+  /**
    * Seam for the setup-failure test only: the real writer unless a test injects one that fails
-   * after creating the file. Nothing else about the file system is injectable on purpose.
+   * after creating the file.
    */
   writeSnapshot?: (path: string, contents: string) => Promise<void>
 }
+
+const ROOT_PREFIX = 'workflow-live-codex-'
+
+/**
+ * Roots older than this are leftovers of a run that was killed (SIGINT, a Vitest worker kill, a
+ * crash) before its `finally` ran — no in-process handler survives those. The live case takes about
+ * two minutes, so an hour-old root cannot belong to a run still in progress.
+ */
+export const STALE_ROOT_MS = 60 * 60_000
 
 export async function createIsolatedCodexLogin(
   sourceCodexHome: string,
   options: IsolatedCodexLoginOptions = {},
 ): Promise<IsolatedCodexLogin> {
   const now = options.now ?? Date.now
+  const parentDirectory = options.parentDirectory ?? tmpdir()
   const writeSnapshot = options.writeSnapshot ?? ((path, contents) => writeFile(path, contents, { mode: 0o600 }))
   // Parse and validate BEFORE creating anything, so a refused login strands nothing on disk.
   const snapshot = accessOnlySnapshot(await readSourceLogin(sourceCodexHome), now())
 
-  const root = await mkdtemp(join(tmpdir(), 'workflow-live-codex-'))
+  // WHY sweep at the start of the NEXT run (review of #63): a killed run leaves its snapshot behind
+  // and nothing in the dying process can remove it. Sweeping here bounds that residue to "until the
+  // next live run" without a daemon or a signal handler that Vitest's worker kill would skip anyway.
+  await sweepStaleRoots(parentDirectory, Date.now())
+
+  // mkdtemp creates the root 0700 on POSIX, and everything below lives inside it, so the snapshot
+  // is unreadable to other users without per-file chmods. (Windows ignores POSIX modes either way.)
+  const root = await mkdtemp(join(parentDirectory, ROOT_PREFIX))
   const dispose = () => rm(root, { recursive: true, force: true })
   const codexHome = join(root, 'codex-home')
   const authenticationFile = join(root, 'auth-snapshot.json')
   try {
-    // mkdtemp already creates 0700 on POSIX; the explicit chmod documents the requirement and covers
-    // platforms whose default differs. The snapshot is still a live bearer token for its lifetime.
-    await chmod(root, 0o700)
-    await mkdir(codexHome, { mode: 0o700 })
+    await mkdir(codexHome)
     await writeSnapshot(authenticationFile, `${JSON.stringify(snapshot)}\n`)
   } catch (error) {
     // WHY cleanup here and not only in the caller's `finally` (steering q43): the caller only gets
@@ -80,6 +99,24 @@ export async function createIsolatedCodexLogin(
   return { codexHome, authenticationFile, dispose }
 }
 
+async function sweepStaleRoots(parentDirectory: string, nowMs: number): Promise<void> {
+  let names: string[]
+  try {
+    names = await readdir(parentDirectory)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith(ROOT_PREFIX)) continue
+    const path = join(parentDirectory, name)
+    try {
+      if (nowMs - (await stat(path)).mtimeMs >= STALE_ROOT_MS) await rm(path, { recursive: true, force: true })
+    } catch {
+      // Raced with its owner's dispose, or not ours to remove: leave it.
+    }
+  }
+}
+
 async function readSourceLogin(sourceCodexHome: string): Promise<AuthDocument> {
   let serialized: string
   try {
@@ -89,7 +126,9 @@ async function readSourceLogin(sourceCodexHome: string): Promise<AuthDocument> {
     // keychain from a test is more reach than this tier needs. Say so instead of proceeding
     // without authentication and failing later with an opaque provider error.
     throw new Error(
-      `Codex live test needs a file-backed login at ${join(sourceCodexHome, 'auth.json')}`,
+      `Codex live test needs a file-backed login at ${join(sourceCodexHome, 'auth.json')}: set ` +
+        '`cli_auth_credentials_store = "file"` in that Codex home\'s config.toml, sign in with `codex login`, ' +
+        'then rerun (or point CODEX_HOME at a home that already uses the file store)',
       { cause },
     )
   }

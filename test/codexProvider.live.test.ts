@@ -1,5 +1,6 @@
+import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { describe, expect, it } from 'vitest'
 
@@ -50,6 +51,10 @@ describe.skipIf(process.env.WORKFLOW_CODEX_INTEGRATION !== '1')('Codex SDK integ
     // there. The real login then holds a used token and the developer is logged out
     // (`refresh_token_reused`). See test/support/isolatedCodexLogin.ts for the full reasoning.
     const login = await createIsolatedCodexLogin(process.env.CODEX_HOME ?? join(homedir(), '.codex'))
+    // WHY the first attempt is stopped from `finally` (review of #63): if the wait below gives up or
+    // an assertion throws, the attempt would otherwise keep its provider host (holding the snapshot
+    // as CODEX_HOME auth) running while `finally` deletes the credentials under it.
+    let stopFirst: (() => Promise<void>) | undefined
     try {
       const provider = new CodexAgentProvider({
         configurationIsolation: {
@@ -83,6 +88,18 @@ describe.skipIf(process.env.WORKFLOW_CODEX_INTEGRATION !== '1')('Codex SDK integ
           if (event.type === 'activity.started' && event.activity.kind === 'command') commandStarted = true
         },
       })
+      const firstSettled = first.then(() => undefined, () => undefined)
+      let firstStopped = false
+      stopFirst = async () => {
+        if (firstStopped) return
+        firstStopped = true
+        firstController.abort('forced integration interruption')
+        await provider.terminateAttempt?.(firstIdentity, {
+          code: 'timeout',
+          message: 'forced integration interruption',
+        })
+        await firstSettled
+      }
 
       // WHY the kill waits for the `sleep 30` command and not just session.started: Codex 0.157
       // announces the thread before it writes anything to the rollout, so a kill at session.started
@@ -94,11 +111,7 @@ describe.skipIf(process.env.WORKFLOW_CODEX_INTEGRATION !== '1')('Codex SDK integ
       }
       expect(sessionId).toBeTypeOf('string')
       expect(commandStarted).toBe(true)
-      firstController.abort('forced integration interruption')
-      await provider.terminateAttempt?.(firstIdentity, {
-        code: 'timeout',
-        message: 'forced integration interruption',
-      })
+      await stopFirst()
       await expect(first).rejects.toMatchObject({ name: 'AbortError' })
 
       const recoveryNote = 'The deliberate wait was interrupted for a lifecycle test. Do not run it again. Reply with exactly RECOVERED.'
@@ -121,9 +134,14 @@ describe.skipIf(process.env.WORKFLOW_CODEX_INTEGRATION !== '1')('Codex SDK integ
       expect(second.output).toEqual({ type: 'text', text: 'RECOVERED' })
       expect(firstEvents.some((event) => event.type === 'session.started')).toBe(true)
     } finally {
-      // The snapshot is still a live bearer token until it expires; never strand it in $TMPDIR.
-      await login.dispose()
+      try {
+        await stopFirst?.()
+      } finally {
+        // The snapshot is still a live bearer token until it expires; never strand it in $TMPDIR.
+        await login.dispose()
+      }
     }
+    expect(existsSync(dirname(login.codexHome)), 'isolated login root removed').toBe(false)
   }, 120_000)
 
   it('runs a Claude-style schema with an optional field through Codex strict output', async () => {
