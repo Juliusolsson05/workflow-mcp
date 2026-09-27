@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { COPYFILE_EXCL } from 'node:constants'
 import { execFile } from 'node:child_process'
-import { createReadStream, existsSync, readFileSync } from 'node:fs'
+import { createReadStream, readFileSync } from 'node:fs'
 import {
   chmod,
   copyFile,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -551,22 +552,36 @@ export class FileWorkflowStore implements WorkflowStore {
   async #deleteRun(runId: string): Promise<void> {
     await this.#writers.run(async () => {
       const directory = this.#runDirectory(runId)
-      const manifest = await this.getManifest(runId)
-      if (manifest === undefined) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`)
-      if (!TERMINAL_STATUSES.has(manifest.status)) {
-        throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${manifest.status}`)
+      // WHY fall back to the index (round 2 of #65): a removal that failed part-way can unlink
+      // manifest.json and still leave the directory (rm removes entries one by one and stops at
+      // the first it cannot remove). That run stays indexed below, so a retry must be able to
+      // finish it; refusing it as run-not-found here would make the remnant undeletable through
+      // the store forever. The index only ever holds a status this store read from the manifest,
+      // and a terminal status never changes, so trusting it for a run whose manifest vanished
+      // is sound.
+      const status = (await this.getManifest(runId))?.status ?? this.#runSummaries.get(runId)?.status
+      if (status === undefined) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`)
+      if (!TERMINAL_STATUSES.has(status)) {
+        throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${status}`)
       }
       // WHY remove first and unindex after (review of #65): unindexing first made a failed
       // removal (EACCES, an immutable directory) hide a run that was still on disk — invisible to
       // listRuns and to any retry until restart, while its manifest stayed readable. The index
-      // must follow the disk: it drops the run once its manifest is gone, and keeps it otherwise.
+      // must follow the disk: it drops the run only once the run DIRECTORY is confirmed gone.
+      //
+      // WHY the directory and not the manifest (round 2 of #65): gating on the manifest assumed
+      // "manifest gone ⇒ directory gone", which a partial removal breaks (manifest unlinked,
+      // transcripts/ refused). And `existsSync` answers false for any stat error, so a manifest
+      // made unreadable by a permission change also looked gone. Only an explicit ENOENT on the
+      // directory itself proves it is gone; anything else (it exists, or we cannot tell) keeps
+      // the run indexed — ambiguity fails closed, and the caller's retry cleans it up.
       let removalError: unknown
       try {
         await rm(directory, { recursive: true, force: true })
       } catch (cause) {
         removalError = cause
       }
-      if (removalError === undefined || !existsSync(this.#manifestPath(runId))) this.#unindexRun(runId)
+      if (removalError === undefined || await isConfirmedMissing(directory)) this.#unindexRun(runId)
       if (removalError !== undefined) {
         throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause: removalError })
       }
@@ -1044,7 +1059,7 @@ export class FileWorkflowStore implements WorkflowStore {
   async loadWorkflow(runId: string) {
     const manifest = await this.#requiredManifest(runId)
     const path = join(this.#runDirectory(runId), 'workflow.js')
-    const source = await readFile(path, 'utf8')
+    const source = await this.#readRunFile(runId, path)
     const loaded = parseWorkflowSource(source, manifest.workflow.filePath)
     if (loaded.sourceHash !== manifest.workflow.sourceHash) {
       throw new WorkflowStoreError('corrupt-store', `Stored workflow source changed for ${runId}`)
@@ -1055,11 +1070,32 @@ export class FileWorkflowStore implements WorkflowStore {
   async loadArgs(runId: string): Promise<{ provided: boolean; value?: unknown }> {
     await this.#requiredManifest(runId)
     const path = join(this.#runDirectory(runId), 'args.json')
-    const value = JSON.parse(await readFile(path, 'utf8')) as unknown
+    const value = JSON.parse(await this.#readRunFile(runId, path)) as unknown
     if (!isObject(value) || typeof value.provided !== 'boolean') {
       throw new WorkflowStoreError('corrupt-store', `Stored workflow arguments are invalid: ${path}`)
     }
     return value.provided ? { provided: true, value: value.value } : { provided: false }
+  }
+
+  /**
+   * Read a file that every run has, after its manifest check passed.
+   *
+   * WHY (round 2 of #65): with deleteRun, the run can vanish between #requiredManifest and this
+   * read, and the resume path then surfaced a raw ENOENT with no store error code. A missing
+   * file whose manifest is also gone now is that race, so it reports run-not-found like every
+   * other read of a deleted run. A missing file next to a manifest that is still there is a
+   * broken run, not a deleted one, so it stays corrupt-store rather than being explained away.
+   */
+  async #readRunFile(runId: string, path: string): Promise<string> {
+    try {
+      return await readFile(path, 'utf8')
+    } catch (cause) {
+      if (!isMissing(cause)) throw cause
+      if (await isConfirmedMissing(this.#manifestPath(runId))) {
+        throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`, { cause })
+      }
+      throw new WorkflowStoreError('corrupt-store', `Workflow run file is missing: ${path}`, { cause })
+    }
   }
 
   journalPath(runId: string): string {
@@ -2347,6 +2383,16 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isMissing(error: unknown): boolean {
   return isObject(error) && error.code === 'ENOENT'
+}
+
+/** True only when `lstat` says ENOENT; any other outcome (present, EACCES, …) is "not proven gone". */
+async function isConfirmedMissing(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return false
+  } catch (error) {
+    return isMissing(error)
+  }
 }
 
 function isAlreadyExists(error: unknown): boolean {

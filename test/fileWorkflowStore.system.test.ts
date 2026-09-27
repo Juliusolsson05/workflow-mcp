@@ -1,8 +1,8 @@
-import { appendFile, chmod, mkdtemp, readFile, stat, unlink } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
@@ -491,6 +491,76 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
     }
     await store.deleteRun('run_second')
     expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).not.toContain('run_second')
+  })
+
+  // Round 2 of #65: rm removes entries one by one, so it can unlink manifest.json and then fail
+  // on a later entry. Gating the unindex on the manifest hid that remnant from listRuns, and the
+  // retry refused it as run-not-found — debris no store call could ever remove.
+  it('keeps a partly removed run indexed, and a retry finishes it', async () => {
+    const { root, store } = await storeWithLineage()
+    const directory = join(root, 'runs', 'run_second')
+    const locked = join(directory, 'transcripts', 'locked')
+    await mkdir(locked, { recursive: true })
+    await writeFile(join(locked, 'agent.jsonl'), '{}\n')
+    await chmod(locked, 0o500)
+    try {
+      await expect(store.deleteRun('run_second')).rejects.toMatchObject({ code: 'io-error' })
+      // The shape under test: the manifest is gone, the directory is not. If a platform ever
+      // removed the locked entry first, this test would stop exercising the case — fail loudly.
+      await expect(stat(join(directory, 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect((await stat(directory)).isDirectory()).toBe(true)
+      expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).toContain('run_second')
+    } finally {
+      await chmod(locked, 0o700)
+    }
+    await store.deleteRun('run_second')
+    await expect(stat(directory)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).not.toContain('run_second')
+  })
+
+  // Round 2 of #65: existsSync answers false for EACCES, so a run directory that lost its
+  // search permission between the manifest read and rm looked "manifest gone" and was unindexed
+  // while every byte was still on disk. Only a proven ENOENT on the directory may unindex.
+  //
+  // Both locks matter: locking the run directory hides only its manifest, and locking `runs/`
+  // hides the directory itself, so a gate on `existsSync(directory)` would still unindex there.
+  it.each([
+    ['the run directory', ['runs', 'run_second']],
+    ['the runs directory', ['runs']],
+  ])('keeps a run indexed when a failed removal leaves it unreadable (%s locked)', async (_label, segments) => {
+    const { root, store } = await storeWithLineage()
+    const lockedDirectory = join(root, ...segments)
+    const read = store.getManifest.bind(store)
+    const spy = vi.spyOn(store, 'getManifest').mockImplementationOnce(async (runId) => {
+      const manifest = await read(runId)
+      await chmod(lockedDirectory, 0o000)
+      return manifest
+    })
+    try {
+      await expect(store.deleteRun('run_second')).rejects.toMatchObject({ code: 'io-error' })
+    } finally {
+      await chmod(lockedDirectory, 0o700)
+      spy.mockRestore()
+    }
+    expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).toContain('run_second')
+    await store.deleteRun('run_second')
+    expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).not.toContain('run_second')
+  })
+
+  // Round 2 of #65: the resume path reads workflow.js and args.json after its manifest check. A
+  // delete landing in between surfaced a raw ENOENT; it is run-not-found like any deleted run.
+  // A file missing next to a manifest that is still there is a broken run, not a deleted one.
+  it.each(['loadWorkflow', 'loadArgs'] as const)('%s reports a run deleted under it as run-not-found', async (method) => {
+    const { root, store } = await storeWithLineage()
+    const read = store.getManifest.bind(store)
+    vi.spyOn(store, 'getManifest').mockImplementationOnce(async (runId) => {
+      const manifest = await read(runId)
+      await rm(join(root, 'runs', runId), { recursive: true, force: true })
+      return manifest
+    })
+    await expect(store[method]('run_second')).rejects.toMatchObject({ code: 'run-not-found' })
+    await unlink(join(root, 'runs', 'run_first', method === 'loadWorkflow' ? 'workflow.js' : 'args.json'))
+    await expect(store[method]('run_first')).rejects.toMatchObject({ code: 'corrupt-store' })
   })
 
   // The per-run caches are keyed by run id. A run recreated under a deleted id must
