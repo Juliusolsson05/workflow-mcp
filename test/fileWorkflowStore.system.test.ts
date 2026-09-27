@@ -540,16 +540,21 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
   // Round 5 of #65 (C): the sweep recursively removes what it matches, and a bare `.deleted-`
   // prefix erased an unrelated directory. Only names deleteRun generates are reclaimed; anything
   // else stays on disk and is quarantined, so it is visible rather than gone.
+  // Round 6 (C), a surviving mutation: loosening the exact name check to `.deleted-run_<id>-<anything>`
+  // passed with only `.deleted-unrelated` on disk. `.deleted-run_x-not-a-uuid` looks generated but is
+  // not (deleteRun always appends a randomUUID), so it must survive too.
   it('never sweeps a directory whose name deleteRun could not have generated', async () => {
     const { root, lease } = await storeWithLineage()
-    const unrelated = join(root, 'runs', '.deleted-unrelated')
-    await mkdir(unrelated)
-    await writeFile(join(unrelated, 'payload'), 'keep me')
+    const names = ['.deleted-unrelated', '.deleted-run_x-not-a-uuid']
+    for (const name of names) {
+      await mkdir(join(root, 'runs', name))
+      await writeFile(join(root, 'runs', name, 'payload'), 'keep me')
+    }
     const reopened = await reopen(root, lease)
-    await expect(readFile(join(unrelated, 'payload'), 'utf8')).resolves.toBe('keep me')
-    expect(reopened.store.listQuarantinedRuns().map(entry => entry.runId)).toEqual(['.deleted-unrelated'])
+    for (const name of names) await expect(readFile(join(root, 'runs', name, 'payload'), 'utf8')).resolves.toBe('keep me')
+    expect(reopened.store.listQuarantinedRuns().map(entry => entry.runId).sort()).toEqual([...names].sort())
     await expect(reopened.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 0, remaining: 0 })
-    await expect(readFile(join(unrelated, 'payload'), 'utf8')).resolves.toBe('keep me')
+    for (const name of names) await expect(readFile(join(root, 'runs', name, 'payload'), 'utf8')).resolves.toBe('keep me')
   })
 
   // Round 5 of #65 (C), a surviving mutation: reclaiming mutates the store's disk, so it needs the
