@@ -14,6 +14,24 @@ import { registerWorkflowMcpTools, workflowMcpInstructions } from '../src/workfl
 import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
 
+/**
+ * Poll `read` until `done` holds.
+ *
+ * WHY there is no iteration count: these tests used `for (index < 100) { ...; sleep 5 }` and then
+ * asserted, which is a ~0.5 s wall-clock budget, not a condition. Under CI's Coverage and Tier
+ * jobs the run was still `running` when the budget ran out, and "honors changed Claude resume
+ * args" failed on package main (ef995af) and on every PR. The condition is what the test is
+ * about; the only bound on a real hang is the test's own timeout, which fails loudly by name.
+ * This matches the unbounded `while (cursor < 5)` waits in workflowService.test.ts.
+ */
+async function pollUntil<T>(read: () => Promise<T>, done: (value: T) => boolean): Promise<T> {
+  for (;;) {
+    const value = await read()
+    if (done(value)) return value
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5))
+  }
+}
+
 describe('workflow MCP facade', () => {
   it('describes the active source capability without teaching read-only clients to author', () => {
     expect(workflowMcpInstructions(false)).toContain('Inline script authoring is disabled')
@@ -132,13 +150,10 @@ describe('workflow MCP facade', () => {
     })
     expect(JSON.parse((started.content[0] as { text: string }).text)).toEqual(started.structuredContent)
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
-    let cursor = 0
-    for (let index = 0; index < 100; index += 1) {
-      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      cursor = (status.structuredContent as { run: { cursor: number } }).run.cursor
-      if (cursor >= 5) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await pollUntil(
+      () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
+      (status) => (status.structuredContent as { run: { cursor: number } }).run.cursor >= 5,
+    )
     const events = await client.callTool({
       name: 'workflow_run_events',
       arguments: { runId, after: 0, limit: 2 },
@@ -158,14 +173,10 @@ describe('workflow MCP facade', () => {
       arguments: { runId, idempotencyKey: 'roundtrip-resume' },
     })
     const resumedId = (resumed.structuredContent as { run: { runId: string } }).run.runId
-    for (let index = 0; index < 100; index += 1) {
-      const status = await client.callTool({
-        name: 'workflow_run_status',
-        arguments: { runId: resumedId },
-      })
-      if ((status.structuredContent as { run: { status: string } }).run.status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await pollUntil(
+      () => client.callTool({ name: 'workflow_run_status', arguments: { runId: resumedId } }),
+      (status) => (status.structuredContent as { run: { status: string } }).run.status === 'completed',
+    )
     const resumedStatus = await client.callTool({
       name: 'workflow_run_status',
       arguments: { runId: resumedId },
@@ -337,11 +348,10 @@ describe('workflow MCP facade', () => {
       args: { items: ['fast'] },
     })
 
-    let status = await service.status({ cwd: fixture.cwd }, started.runId)
-    for (let index = 0; index < 100 && status.status !== 'completed'; index += 1) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-      status = await service.status({ cwd: fixture.cwd }, started.runId)
-    }
+    const status = await pollUntil(
+      () => service.status({ cwd: fixture.cwd }, started.runId),
+      (current) => current.status === 'completed' || current.status === 'failed' || current.status === 'cancelled',
+    )
 
     expect(status.status).toBe('completed')
     expect(provider.calls.map((call) => call.request.prompt)).toEqual([
@@ -385,12 +395,10 @@ describe('workflow MCP facade', () => {
 
     const started = await client.callTool({ name: 'workflow_run', arguments: { name: 'fanout' } })
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
-    for (let index = 0; index < 400; index += 1) {
-      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      const state = (status.structuredContent as { run: { status: string } }).run.status
-      if (state === 'completed' || state === 'completed_with_errors') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await pollUntil(
+      () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
+      (status) => ['completed', 'completed_with_errors'].includes((status.structuredContent as { run: { status: string } }).run.status),
+    )
 
     const listed = await client.callTool({ name: 'workflow_agent_list', arguments: { runId } })
     const agents = (listed.structuredContent as {
