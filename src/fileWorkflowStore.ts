@@ -212,6 +212,12 @@ export class FileWorkflowStore implements WorkflowStore {
     const entries = await readdir(this.runsDirectory, { withFileTypes: true })
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
+      if (entry.name.startsWith(DELETED_RUN_PREFIX)) {
+        // A run deleteRun moved aside but could not fully remove (see #deleteRun). It is already
+        // deleted — never indexed, never quarantined — and this is where its bytes are retried.
+        await rm(join(this.runsDirectory, entry.name), { recursive: true, force: true }).catch(() => undefined)
+        continue
+      }
       try {
         await this.#recoverEventTail(entry.name)
         const manifest = await this.getManifest(entry.name)
@@ -552,39 +558,37 @@ export class FileWorkflowStore implements WorkflowStore {
   async #deleteRun(runId: string): Promise<void> {
     await this.#writers.run(async () => {
       const directory = this.#runDirectory(runId)
-      // WHY fall back to the index (round 2 of #65): a removal that failed part-way can unlink
-      // manifest.json and still leave the directory (rm removes entries one by one and stops at
-      // the first it cannot remove). That run stays indexed below, so a retry must be able to
-      // finish it; refusing it as run-not-found here would make the remnant undeletable through
-      // the store forever. The index only ever holds a status this store read from the manifest,
-      // and a terminal status never changes, so trusting it for a run whose manifest vanished
-      // is sound.
-      const status = (await this.getManifest(runId))?.status ?? this.#runSummaries.get(runId)?.status
-      if (status === undefined) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`)
-      if (!TERMINAL_STATUSES.has(status)) {
-        throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${status}`)
+      const manifest = await this.getManifest(runId)
+      if (manifest === undefined) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`)
+      if (!TERMINAL_STATUSES.has(manifest.status)) {
+        throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${manifest.status}`)
       }
-      // WHY remove first and unindex after (review of #65): unindexing first made a failed
-      // removal (EACCES, an immutable directory) hide a run that was still on disk — invisible to
-      // listRuns and to any retry until restart, while its manifest stayed readable. The index
-      // must follow the disk: it drops the run only once the run DIRECTORY is confirmed gone.
+      // WHY move the run aside atomically before removing anything (rounds 1-3 of #65):
       //
-      // WHY the directory and not the manifest (round 2 of #65): gating on the manifest assumed
-      // "manifest gone ⇒ directory gone", which a partial removal breaks (manifest unlinked,
-      // transcripts/ refused). And `existsSync` answers false for any stat error, so a manifest
-      // made unreadable by a permission change also looked gone. Only an explicit ENOENT on the
-      // directory itself proves it is gone; anything else (it exists, or we cannot tell) keeps
-      // the run indexed — ambiguity fails closed, and the caller's retry cleans it up.
-      let removalError: unknown
+      // - Unindex-then-rm hid a run that a failed rm left on disk (round 1).
+      // - rm-then-unindex, gated on the manifest or the directory, still left a PARTIAL removal:
+      //   `rm` unlinks entries one by one, so a failure after `manifest.json` went left a run
+      //   directory with no manifest. The live process could keep it indexed and retry (round 2),
+      //   but after a restart `initialize` skips a directory without a manifest, so the remnant
+      //   was in no index, not quarantined, and `deleteRun` said run-not-found — undeletable
+      //   through the store, and invisible to retention, forever (round 3, reviewer C).
+      //
+      // A same-parent `rename` is atomic: either the run is still whole under its own name (the
+      // rename failed; it stays indexed, the caller's retry tries again) or it is entirely gone
+      // from its name. What remains is only a `.deleted-` directory that no run id can name and
+      // that `initialize` sweeps on every start. Same PARENT on purpose: moving a directory to a
+      // different parent needs write permission on the directory itself (its `..` entry), which
+      // a locked run directory would refuse.
+      const trash = join(this.runsDirectory, `${DELETED_RUN_PREFIX}${runId}-${randomUUID()}`)
       try {
-        await rm(directory, { recursive: true, force: true })
+        await rename(directory, trash)
       } catch (cause) {
-        removalError = cause
+        throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause })
       }
-      if (removalError === undefined || await isConfirmedMissing(directory)) this.#unindexRun(runId)
-      if (removalError !== undefined) {
-        throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause: removalError })
-      }
+      this.#unindexRun(runId)
+      // The run is deleted once the rename lands. Reclaiming its bytes is best effort: whatever
+      // this rm cannot remove (a locked subdirectory) is retried by the next initialize().
+      await rm(trash, { recursive: true, force: true }).catch(() => undefined)
     })
   }
 
@@ -627,6 +631,7 @@ export class FileWorkflowStore implements WorkflowStore {
     const manifests: WorkflowRunManifest[] = []
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
+      if (entry.name.startsWith(DELETED_RUN_PREFIX)) continue
       if (this.#quarantinedRuns.has(entry.name)) continue
       const manifest = await this.getManifest(entry.name)
       if (manifest) manifests.push(manifest)
@@ -2380,6 +2385,12 @@ async function writePrivateFile(path: string, content: string): Promise<void> {
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
+
+/**
+ * Prefix of a deleted run's directory while its bytes are being reclaimed. A leading `.` can never
+ * match a run id (`run_…`), so no store call can name, index or quarantine it.
+ */
+const DELETED_RUN_PREFIX = '.deleted-'
 
 function isMissing(error: unknown): boolean {
   return isObject(error) && error.code === 'ENOENT'
