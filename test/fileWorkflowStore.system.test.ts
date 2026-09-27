@@ -463,14 +463,17 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
     expect(() => store.deleteRun('../escape')).rejects.toThrow(/Invalid workflow run ID/)
   })
 
-  it('refuses while the append that ends the run is still in flight', async () => {
+  // Review of #65: a delete issued while the append that ENDS the run is in flight waits for it
+  // (it joins the run's append tail), then deletes — never refuses a run that is about to be
+  // terminal, and never races it (the deterministic interleavings are in
+  // fileWorkflowStore.deleteRace.system.test.ts).
+  it('waits for the append that ends the run, then deletes it', async () => {
     const { store } = await storeWithLineage()
-    // Until the terminal event lands, the manifest is still `running`.
     const append = store.appendEvent('run_live', event('run_live', 2, 'run.cancelled', { reason: 'fixture' }))
-    await expect(store.deleteRun('run_live')).rejects.toMatchObject({ code: 'run-not-terminal' })
-    await append
     await store.deleteRun('run_live')
+    await append
     await expect(store.getManifest('run_live')).resolves.toBeUndefined()
+    expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).not.toContain('run_live')
   })
 
   // Review of #65: the run was unindexed BEFORE the directory removal, so a failed

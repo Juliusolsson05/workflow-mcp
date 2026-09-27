@@ -150,6 +150,13 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly #runKeysByStatus = new Map<WorkflowRunStatus, string[]>()
   readonly #lineageMembers = new Map<string, Set<string>>()
   readonly #successors = new Map<string, Set<string>>()
+  /**
+   * How many times each run id has been deleted in this process (review of #65). Reads take no
+   * permit, so a snapshot or event scan that started before a deleteRun can finish after it and
+   * re-cache the deleted run's state forever. Readers capture this before their first await and
+   * write caches only if it is unchanged.
+   */
+  readonly #deletions = new Map<string, number>()
   readonly #maxEventFileBytes: number
   readonly #maxResultBytes: number
   #leaseToken: string | undefined
@@ -524,6 +531,24 @@ export class FileWorkflowStore implements WorkflowStore {
    * a caller's partial pass from a mistake.
    */
   async deleteRun(runId: string): Promise<void> {
+    // WHY join the run's append tail (review of #65): the writer permit is an admission gate, not
+    // a mutex. Without the tail, a delete admitted between the terminal append's manifest rename
+    // and its re-index removed the directory and the append then re-indexed a run that no longer
+    // exists — a ghost in listRuns that no retry could delete.
+    const previous = this.#appendTails.get(runId) ?? Promise.resolve()
+    let releaseTail!: () => void
+    const owned = new Promise<void>((resolveOwned) => { releaseTail = resolveOwned })
+    this.#appendTails.set(runId, owned)
+    await previous.catch(() => undefined)
+    try {
+      await this.#deleteRun(runId)
+    } finally {
+      releaseTail()
+      if (this.#appendTails.get(runId) === owned) this.#appendTails.delete(runId)
+    }
+  }
+
+  async #deleteRun(runId: string): Promise<void> {
     await this.#writers.run(async () => {
       const directory = this.#runDirectory(runId)
       const manifest = await this.getManifest(runId)
@@ -549,6 +574,7 @@ export class FileWorkflowStore implements WorkflowStore {
   }
 
   #unindexRun(runId: string): void {
+    this.#deletions.set(runId, (this.#deletions.get(runId) ?? 0) + 1)
     const summary = this.#runSummaries.get(runId)
     this.#runSummaries.delete(runId)
     this.#snapshotCache.delete(runId)
@@ -1002,12 +1028,14 @@ export class FileWorkflowStore implements WorkflowStore {
     if (cached?.cursor === manifest.cursor) {
       return { manifest, state: cached.state, cursor: manifest.cursor }
     }
+    const epoch = this.#deletions.get(runId) ?? 0
     let state = createWorkflowState(runId)
     for await (const stored of this.#events(runId, manifest.cursor)) {
       state = reduceWorkflowState(state, stored.event)
     }
     const newerCache = this.#snapshotCache.get(runId)
-    if (newerCache === undefined || newerCache.cursor <= manifest.cursor) {
+    const deletedMeanwhile = (this.#deletions.get(runId) ?? 0) !== epoch
+    if (!deletedMeanwhile && (newerCache === undefined || newerCache.cursor <= manifest.cursor)) {
       this.#snapshotCache.set(runId, { cursor: manifest.cursor, state })
     }
     return { manifest, state, cursor: manifest.cursor }
@@ -1123,12 +1151,20 @@ export class FileWorkflowStore implements WorkflowStore {
     nearCursor = 0,
   ): AsyncGenerator<StoredWorkflowEvent> {
     const path = this.#eventsPath(runId)
-    const info = await stat(path)
+    const epoch = this.#deletions.get(runId) ?? 0
+    const info = await stat(path).catch((cause: unknown) => {
+      // A run deleted after the caller's manifest check surfaced as a bare ENOENT (review of #65);
+      // it is the same answer as a run that never existed.
+      if (isMissing(cause)) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`, { cause })
+      throw cause
+    })
     if (info.size > this.#maxEventFileBytes) {
       throw new WorkflowStoreError('corrupt-store', `Workflow event log is too large: ${path}`)
     }
     const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()
-    this.#eventOffsets.set(runId, offsets)
+    // Attach only if no delete ran while stat was in flight; otherwise this scan works on a detached
+    // map and the deleted run's offsets are not resurrected.
+    if ((this.#deletions.get(runId) ?? 0) === epoch) this.#eventOffsets.set(runId, offsets)
     let startCursor = 1
     let startOffset = 0
     for (const [indexedCursor, indexedOffset] of offsets) {
@@ -1142,32 +1178,39 @@ export class FileWorkflowStore implements WorkflowStore {
     })
     let cursor = startCursor - 1
     let lineNumber = 0
-    for await (const line of lines) {
-      lineNumber += 1
-      if (line.length === 0) continue
-      let value: unknown
-      try {
-        value = JSON.parse(line) as unknown
-      } catch (cause) {
-        throw new WorkflowStoreError(
-          'corrupt-store',
-          `Workflow event ${lineNumber} is invalid JSON: ${path}`,
-          { cause },
-        )
+    try {
+      for await (const line of lines) {
+        lineNumber += 1
+        if (line.length === 0) continue
+        let value: unknown
+        try {
+          value = JSON.parse(line) as unknown
+        } catch (cause) {
+          throw new WorkflowStoreError(
+            'corrupt-store',
+            `Workflow event ${lineNumber} is invalid JSON: ${path}`,
+            { cause },
+          )
+        }
+        cursor += 1
+        if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
+        const event = parseStoredEvent(value, runId, cursor, path)
+        // WHY the upper-bound check must happen before yield: append fsyncs events.jsonl before it
+        // advances manifest.cursor. A concurrent health/snapshot read can therefore see one durable
+        // record beyond its manifest. Yielding that future record under the old cursor poisons the
+        // projection cache, then the writer applies the same event a second time and fails the run
+        // with a false duplicate-sequence error. The manifest is the published commit boundary even
+        // though the append-only file intentionally reaches disk first for crash recovery.
+        if (cursor > throughCursor) break
+        yield event
+        startOffset += Buffer.byteLength(line, 'utf8') + 1
+        if (cursor >= throughCursor) break
       }
-      cursor += 1
-      if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
-      const event = parseStoredEvent(value, runId, cursor, path)
-      // WHY the upper-bound check must happen before yield: append fsyncs events.jsonl before it
-      // advances manifest.cursor. A concurrent health/snapshot read can therefore see one durable
-      // record beyond its manifest. Yielding that future record under the old cursor poisons the
-      // projection cache, then the writer applies the same event a second time and fails the run
-      // with a false duplicate-sequence error. The manifest is the published commit boundary even
-      // though the append-only file intentionally reaches disk first for crash recovery.
-      if (cursor > throughCursor) break
-      yield event
-      startOffset += Buffer.byteLength(line, 'utf8') + 1
-      if (cursor >= throughCursor) break
+    } catch (cause) {
+      // The log can disappear between the stat above and the stream's open when the run is deleted
+      // concurrently (review of #65); report it as the missing run it is, not a bare ENOENT.
+      if (isMissing(cause)) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`, { cause })
+      throw cause
     }
   }
 
