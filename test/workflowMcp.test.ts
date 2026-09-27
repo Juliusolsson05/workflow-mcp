@@ -13,24 +13,8 @@ import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { registerWorkflowMcpTools, workflowMcpInstructions } from '../src/workflowMcp.js'
 import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
+import { isTerminalRunStatus, pollUntil } from './support/pollUntil.js'
 
-/**
- * Poll `read` until `done` holds.
- *
- * WHY there is no iteration count: these tests used `for (index < 100) { ...; sleep 5 }` and then
- * asserted, which is a ~0.5 s wall-clock budget, not a condition. Under CI's Coverage and Tier
- * jobs the run was still `running` when the budget ran out, and "honors changed Claude resume
- * args" failed on package main (ef995af) and on every PR. The condition is what the test is
- * about; the only bound on a real hang is the test's own timeout, which fails loudly by name.
- * This matches the unbounded `while (cursor < 5)` waits in workflowService.test.ts.
- */
-async function pollUntil<T>(read: () => Promise<T>, done: (value: T) => boolean): Promise<T> {
-  for (;;) {
-    const value = await read()
-    if (done(value)) return value
-    await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-  }
-}
 
 describe('workflow MCP facade', () => {
   it('describes the active source capability without teaching read-only clients to author', () => {
@@ -152,7 +136,11 @@ describe('workflow MCP facade', () => {
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
     await pollUntil(
       () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
-      (status) => (status.structuredContent as { run: { cursor: number } }).run.cursor >= 5,
+      // Or finished: a run that ends before cursor 5 fails the page assertion below by name.
+      (status) => {
+        const run = (status.structuredContent as { run: { cursor: number; status: string } }).run
+        return run.cursor >= 5 || isTerminalRunStatus(run.status)
+      },
     )
     const events = await client.callTool({
       name: 'workflow_run_events',
@@ -175,7 +163,7 @@ describe('workflow MCP facade', () => {
     const resumedId = (resumed.structuredContent as { run: { runId: string } }).run.runId
     await pollUntil(
       () => client.callTool({ name: 'workflow_run_status', arguments: { runId: resumedId } }),
-      (status) => (status.structuredContent as { run: { status: string } }).run.status === 'completed',
+      (status) => isTerminalRunStatus((status.structuredContent as { run: { status: string } }).run.status),
     )
     const resumedStatus = await client.callTool({
       name: 'workflow_run_status',
@@ -350,7 +338,7 @@ describe('workflow MCP facade', () => {
 
     const status = await pollUntil(
       () => service.status({ cwd: fixture.cwd }, started.runId),
-      (current) => current.status === 'completed' || current.status === 'failed' || current.status === 'cancelled',
+      (current) => isTerminalRunStatus(current.status),
     )
 
     expect(status.status).toBe('completed')
@@ -397,7 +385,7 @@ describe('workflow MCP facade', () => {
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
     await pollUntil(
       () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
-      (status) => ['completed', 'completed_with_errors'].includes((status.structuredContent as { run: { status: string } }).run.status),
+      (status) => isTerminalRunStatus((status.structuredContent as { run: { status: string } }).run.status),
     )
 
     const listed = await client.callTool({ name: 'workflow_agent_list', arguments: { runId } })

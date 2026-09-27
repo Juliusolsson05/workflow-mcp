@@ -11,6 +11,7 @@ import type { AgentProvider, AgentProviderResult } from '../src/agentProvider.js
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
 import { WorkflowService, WorkflowServiceError } from '../src/workflowService.js'
+import { isTerminalRunStatus, pollUntil } from './support/pollUntil.js'
 
 async function project(source: string): Promise<{ cwd: string; storeRoot: string }> {
   const cwd = await mkdtemp(join(tmpdir(), 'workflow-project-'))
@@ -21,12 +22,7 @@ async function project(source: string): Promise<{ cwd: string; storeRoot: string
 }
 
 async function terminal(service: WorkflowService, cwd: string, runId: string) {
-  for (let index = 0; index < 200; index += 1) {
-    const status = await service.status({ cwd }, runId)
-    if (['completed', 'completed_with_errors', 'failed', 'cancelled', 'interrupted'].includes(status.status)) return status
-    await new Promise((resolveWait) => setTimeout(resolveWait, 10))
-  }
-  throw new Error(`Run ${runId} did not become terminal`)
+  return pollUntil(() => service.status({ cwd }, runId), status => isTerminalRunStatus(status.status), 10)
 }
 
 const twoPhaseSource = `export const meta = {
