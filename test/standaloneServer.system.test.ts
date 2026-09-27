@@ -12,6 +12,7 @@ import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { serveWorkflowMcpHttp, serveWorkflowMcpStdio } from '../src/standaloneServer.js'
 import { WorkflowService } from '../src/workflowService.js'
+import { isTerminalRunStatus, pollUntil } from './support/pollUntil.js'
 
 describe('standalone Streamable HTTP server', () => {
   it('requires bearer auth, rejects non-loopback Origin, and reconnects through durable cursors', async () => {
@@ -63,11 +64,13 @@ describe('standalone Streamable HTTP server', () => {
       arguments: { name: 'http-fixture' },
     })
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
-    for (let index = 0; index < 100; index += 1) {
-      const status = await first.client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      if ((status.structuredContent as { run: { status: string } }).run.status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    // Review of #71 (a): the counted loop fell through after 100 polls, and the
+    // event-page assertions below could then pass without the run ever finishing.
+    const finished = await pollUntil(
+      () => first.client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
+      (status) => isTerminalRunStatus((status.structuredContent as { run: { status: string } }).run.status),
+    )
+    expect((finished.structuredContent as { run: { status: string } }).run.status).toBe('completed')
     const firstPage = await first.client.callTool({
       name: 'workflow_run_events',
       arguments: { runId, after: 0, limit: 1 },
@@ -153,13 +156,9 @@ async function httpClient(url: string, token: string, name: string) {
 }
 
 async function waitForResponse(read: () => string, id: number): Promise<unknown> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    for (const line of read().split('\n')) {
-      if (line.length === 0) continue
-      const message = JSON.parse(line) as { id?: unknown }
-      if (message.id === id) return message
-    }
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  throw new Error(`Timed out waiting for STDIO response ${id}`)
+  const found = (): unknown => read().split('\n')
+    .filter(line => line.length > 0)
+    .map(line => JSON.parse(line) as { id?: unknown })
+    .find(message => message.id === id)
+  return pollUntil(found, message => message !== undefined)
 }
