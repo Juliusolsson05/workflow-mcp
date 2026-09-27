@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, unlink } from 'node:fs/promises'
+import { appendFile, mkdtemp, readFile, stat, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -25,6 +25,18 @@ function started(runId: string): WorkflowEvent {
     type: 'run.started',
     payload: { workflow: { name: 'stored', description: 'Stored workflow' } },
   }
+}
+
+function event(runId: string, sequence: number, type: WorkflowEvent['type'], payload: unknown): WorkflowEvent {
+  return {
+    schemaVersion: 1,
+    runId,
+    sequence,
+    eventId: `event-${sequence}`,
+    timestamp: new Date().toISOString(),
+    type,
+    payload,
+  } as WorkflowEvent
 }
 
 describe('FileWorkflowStore', () => {
@@ -401,5 +413,70 @@ describe('FileWorkflowStore', () => {
       artifactId: reference.artifactId!,
       maxBytes: 16,
     })).rejects.toMatchObject({ code: 'result-not-found' })
+  })
+})
+
+describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
+  async function storeWithLineage() {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-store-delete-'))
+    const store = new FileWorkflowStore(root)
+    const lease = await store.acquireLease('retention-test')
+    await store.initialize()
+    // An interrupted run and its (cancelled) successor, created through the real paths.
+    await store.createRun({ runId: 'run_first', cwd: root, workflow: loaded() })
+    await store.appendEvent('run_first', started('run_first'))
+    await store.appendEvent('run_first', event('run_first', 2, 'run.interrupted', { reason: 'fixture' }))
+    await store.createRun({
+      runId: 'run_second', cwd: root, workflow: loaded(), resumedFromRunId: 'run_first', lineageId: 'run_first',
+    })
+    await store.appendEvent('run_second', started('run_second'))
+    await store.appendEvent('run_second', event('run_second', 2, 'run.cancelled', { reason: 'fixture' }))
+    await store.createRun({ runId: 'run_live', cwd: root, workflow: loaded() })
+    await store.appendEvent('run_live', started('run_live'))
+    return { root, store, lease }
+  }
+
+  it('removes a terminal run from disk and from every index', async () => {
+    const { root, store, lease } = await storeWithLineage()
+    await expect(store.findLatestSuccessor('run_first')).resolves.toMatchObject({ runId: 'run_second' })
+    await store.deleteRun('run_second')
+    await expect(stat(join(root, 'runs', 'run_second'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(store.getManifest('run_second')).resolves.toBeUndefined()
+    await expect(store.findLatestSuccessor('run_first')).resolves.toBeUndefined()
+    const all = await store.listRuns({ limit: 10 })
+    expect(all.items.map(item => item.runId)).toEqual(['run_first', 'run_live'])
+    const cancelled = await store.listRuns({ statuses: ['cancelled'], limit: 10 })
+    expect(cancelled.items).toEqual([])
+    // A deleted run leaves nothing that a fresh store would index either.
+    await lease.release()
+    const reopened = new FileWorkflowStore(root)
+    await reopened.acquireLease('retention-reopen')
+    await reopened.initialize()
+    expect((await reopened.listRuns({ limit: 10 })).items.map(item => item.runId)).toEqual(['run_first', 'run_live'])
+  })
+
+  it('refuses a run that is still live, and one that does not exist', async () => {
+    const { root, store } = await storeWithLineage()
+    await expect(store.deleteRun('run_live')).rejects.toMatchObject({ code: 'run-not-terminal' })
+    expect((await stat(join(root, 'runs', 'run_live'))).isDirectory()).toBe(true)
+    await expect(store.deleteRun('run_missing')).rejects.toMatchObject({ code: 'run-not-found' })
+    expect(() => store.deleteRun('../escape')).rejects.toThrow(/Invalid workflow run ID/)
+  })
+
+  it('refuses while the append that ends the run is still in flight', async () => {
+    const { store } = await storeWithLineage()
+    // Until the terminal event lands, the manifest is still `running`.
+    const append = store.appendEvent('run_live', event('run_live', 2, 'run.cancelled', { reason: 'fixture' }))
+    await expect(store.deleteRun('run_live')).rejects.toMatchObject({ code: 'run-not-terminal' })
+    await append
+    await store.deleteRun('run_live')
+    await expect(store.getManifest('run_live')).resolves.toBeUndefined()
+  })
+
+  it('cannot delete after the lease is released', async () => {
+    const { root, store, lease } = await storeWithLineage()
+    await lease.release()
+    await expect(store.deleteRun('run_second')).rejects.toMatchObject({ code: 'owner-conflict' })
+    expect((await stat(join(root, 'runs', 'run_second'))).isDirectory()).toBe(true)
   })
 })

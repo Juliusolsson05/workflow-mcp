@@ -100,6 +100,7 @@ export class WorkflowStoreError extends Error {
     | 'corrupt-store'
     | 'event-log-full'
     | 'lineage-active'
+    | 'run-not-terminal'
     | 'io-error'
     | 'owner-conflict'
     | 'result-too-large'
@@ -503,6 +504,58 @@ export class FileWorkflowStore implements WorkflowStore {
       throw new WorkflowStoreError('io-error', `Cannot initialize workflow run: ${input.runId}`, {
         cause,
       })
+    }
+  }
+
+  /**
+   * Remove one terminal run: its directory and every in-memory index entry.
+   *
+   * WHY the store owns this and the embedding app owns WHEN to call it (agent-code #1275): nothing
+   * deleted runs before, and `<userData>/workflows/runs` grew by ~140 MB a day for one developer. The
+   * app decides the retention policy (as it does for its other disk budgets); only the store can
+   * delete a run without leaving its lease-scoped writer, summaries, status keys, lineage and
+   * successor indexes, snapshot cache and event offsets pointing at a directory that is gone.
+   *
+   * WHY only terminal runs: a live run is still being written. That also covers an append in
+   * flight — until the append that makes a run terminal lands, its manifest is not terminal, and
+   * a terminal manifest refuses further appends (see #appendEvent) — so no separate check. Whole-lineage policy — never delete a successor while an
+   * interrupted predecessor stays, or startup would treat that predecessor as un-continued and may
+   * auto-recover it — is the caller's, because it needs the whole inventory; the store cannot tell
+   * a caller's partial pass from a mistake.
+   */
+  async deleteRun(runId: string): Promise<void> {
+    await this.#writers.run(async () => {
+      const directory = this.#runDirectory(runId)
+      const manifest = await this.getManifest(runId)
+      if (manifest === undefined) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`)
+      if (!TERMINAL_STATUSES.has(manifest.status)) {
+        throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${manifest.status}`)
+      }
+      this.#unindexRun(runId)
+      try {
+        await rm(directory, { recursive: true, force: true })
+      } catch (cause) {
+        throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause })
+      }
+    })
+  }
+
+  #unindexRun(runId: string): void {
+    const summary = this.#runSummaries.get(runId)
+    this.#runSummaries.delete(runId)
+    this.#snapshotCache.delete(runId)
+    this.#eventOffsets.delete(runId)
+    if (summary === undefined) return
+    removeSortedKey(this.#runKeysByStatus.get(summary.status), runIndexKey(summary))
+    const lineage = this.#lineageMembers.get(summary.lineageId)
+    lineage?.delete(runId)
+    if (lineage?.size === 0) this.#lineageMembers.delete(summary.lineageId)
+    // Lookups already filter through #runSummaries, so a stale id here would be invisible; it is
+    // removed anyway so deleted runs do not accumulate in memory for the life of the process.
+    if (summary.resumedFromRunId !== undefined) {
+      const successors = this.#successors.get(summary.resumedFromRunId)
+      successors?.delete(runId)
+      if (successors?.size === 0) this.#successors.delete(summary.resumedFromRunId)
     }
   }
 

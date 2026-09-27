@@ -152,6 +152,11 @@ export interface WorkflowStore {
    * generation as run state. This callback grants no reusable permit and drains before release.
    */
   runOwnedMutation?<T>(operation: () => Promise<T>): Promise<T>
+  /**
+   * Remove one TERMINAL run and every index entry for it. Retention policy (which runs, when, and
+   * whole lineages only) belongs to the embedding application.
+   */
+  deleteRun?(runId: string): Promise<void>
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>
   getManifest(runId: string): Promise<WorkflowRunManifest | undefined>
   listManifests(): Promise<WorkflowRunManifest[]>
