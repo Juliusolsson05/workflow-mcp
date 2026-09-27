@@ -81,7 +81,7 @@ LABEL org.opencontainers.image.title="Workflow MCP" \
 # replace these equalities with floating packages merely to make CI pass.
 RUN apk add --no-cache \
       brotli-libs=1.2.0-r0 c-ares=1.34.8-r0 git=2.52.0-r0 \
-      git-init-template=2.52.0-r0 libcurl=8.22.0-r0 libexpat=2.8.4-r0 \
+      git-init-template=2.52.0-r0 libcurl=8.22.0-r0 libexpat=2.8.5-r0 \
       libidn2=2.3.8-r0 libpsl=0.21.5-r3 libunistring=1.4.1-r0 \
       nghttp2-libs=1.69.0-r0 pcre2=10.48-r0 ripgrep=15.1.0-r0 \
       tini=0.19.0-r3 zstd-libs=1.5.7-r2 \
