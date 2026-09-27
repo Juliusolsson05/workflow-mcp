@@ -537,6 +537,29 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
     }
   })
 
+  // Round 5 of #65 (C): the sweep recursively removes what it matches, and a bare `.deleted-`
+  // prefix erased an unrelated directory. Only names deleteRun generates are reclaimed; anything
+  // else stays on disk and is quarantined, so it is visible rather than gone.
+  it('never sweeps a directory whose name deleteRun could not have generated', async () => {
+    const { root, lease } = await storeWithLineage()
+    const unrelated = join(root, 'runs', '.deleted-unrelated')
+    await mkdir(unrelated)
+    await writeFile(join(unrelated, 'payload'), 'keep me')
+    const reopened = await reopen(root, lease)
+    await expect(readFile(join(unrelated, 'payload'), 'utf8')).resolves.toBe('keep me')
+    expect(reopened.store.listQuarantinedRuns().map(entry => entry.runId)).toEqual(['.deleted-unrelated'])
+    await expect(reopened.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 0, remaining: 0 })
+    await expect(readFile(join(unrelated, 'payload'), 'utf8')).resolves.toBe('keep me')
+  })
+
+  // Round 5 of #65 (C), a surviving mutation: reclaiming mutates the store's disk, so it needs the
+  // lease like every other write.
+  it('refuses to reclaim without the lease', async () => {
+    const { lease, store } = await storeWithLineage()
+    await lease.release()
+    await expect(store.reclaimDeletedRuns()).rejects.toMatchObject({ code: 'owner-conflict' })
+  })
+
   // Rounds 1-2 of #65: a run whose directory cannot be moved (here `runs/` loses its write and
   // search permission between the manifest read and the move) must stay whole, indexed and
   // retryable — never hidden while it is still on disk.

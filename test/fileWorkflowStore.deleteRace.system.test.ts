@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -9,15 +9,27 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 // the same way every time instead of depending on scheduling. Nothing else about the file system is
 // faked.
 const gate = vi.hoisted(() => ({
-  park: null as null | { call: 'chmod' | 'stat'; match: (path: string) => boolean; reached: () => void; release: Promise<void> },
+  park: null as null | {
+    call: 'chmod' | 'stat' | 'rm'
+    match: (path: string) => boolean
+    reached: () => void
+    release: Promise<void>
+    /** rm only: instead of running, report this failure once released (the trash stays put). */
+    failWith?: Error
+  },
 }))
 vi.mock('node:fs/promises', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  const parked = <F extends (path: never, ...rest: never[]) => Promise<unknown>>(call: 'chmod' | 'stat', fn: F) =>
+  const parked = <F extends (path: never, ...rest: never[]) => Promise<unknown>>(call: 'chmod' | 'stat' | 'rm', fn: F) =>
     (async (path: never, ...rest: never[]) => {
       const park = gate.park
       if (park?.call === call && park.match(String(path))) {
         gate.park = null
+        if (park.failWith !== undefined) {
+          park.reached()
+          await park.release
+          throw park.failWith
+        }
         // chmod parks AFTER the manifest rename (the real gap the reviewer found); stat parks after
         // the real stat has succeeded, i.e. after the reader's "the file is there" check.
         const result = await fn(path, ...rest)
@@ -27,7 +39,7 @@ vi.mock('node:fs/promises', async importOriginal => {
       }
       return fn(path, ...rest)
     }) as unknown as F
-  return { ...actual, chmod: parked('chmod', actual.chmod), stat: parked('stat', actual.stat) }
+  return { ...actual, chmod: parked('chmod', actual.chmod), stat: parked('stat', actual.stat), rm: parked('rm', actual.rm) }
 })
 
 const { FileWorkflowStore } = await import('../src/fileWorkflowStore.js')
@@ -43,12 +55,12 @@ function event(runId: string, sequence: number, type: WorkflowEvent['type'], pay
   return { schemaVersion: 1, runId, sequence, eventId: `event-${sequence}`, timestamp: new Date().toISOString(), type, payload } as WorkflowEvent
 }
 
-function park(call: 'chmod' | 'stat', match: (path: string) => boolean) {
+function park(call: 'chmod' | 'stat' | 'rm', match: (path: string) => boolean, failWith?: Error) {
   let reached!: () => void
   let release!: () => void
   const hit = new Promise<void>(resolve => { reached = resolve })
   const released = new Promise<void>(resolve => { release = resolve })
-  gate.park = { call, match, reached, release: released }
+  gate.park = { call, match, reached, release: released, ...(failWith === undefined ? {} : { failWith }) }
   return { hit, release }
 }
 
@@ -88,5 +100,21 @@ describe('deleteRun against concurrent writers and readers (review of #65)', () 
     await store.deleteRun('run_read')
     parked.release()
     await expect(read).rejects.toMatchObject({ code: expect.stringMatching(/run-not-found/) })
+  })
+
+  // Round 5 of #65 (C): deleteRun's rm of its trash fails while a concurrent reclaim has already
+  // removed that trash. The failure must not be recorded as bytes still on disk.
+  it('a reclaim that won the race is not reported as an unreclaimed deletion', async () => {
+    const { root, store } = await liveRun('run_trash')
+    await store.appendEvent('run_trash', event('run_trash', 2, 'run.cancelled', { reason: 'fixture' }))
+    const failure = Object.assign(new Error('synthetic EACCES'), { code: 'EACCES' })
+    const parked = park('rm', path => path.includes('.deleted-run_trash-'), failure)
+    const deletion = store.deleteRun('run_trash')
+    await parked.hit
+    await expect(store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 1, remaining: 0 })
+    parked.release()
+    await deletion
+    expect(store.listUnreclaimedDeletions()).toEqual([])
+    expect((await readdir(join(root, 'runs'))).filter(name => name.startsWith('.deleted-'))).toEqual([])
   })
 })

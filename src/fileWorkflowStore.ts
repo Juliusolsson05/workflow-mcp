@@ -220,7 +220,7 @@ export class FileWorkflowStore implements WorkflowStore {
       if (!entry.isDirectory()) continue
       // A run deleteRun moved aside but could not fully remove (see #deleteRun). It is already
       // deleted — never indexed, never quarantined; #sweepDeletedRuns below retries its bytes.
-      if (entry.name.startsWith(DELETED_RUN_PREFIX)) continue
+      if (isDeletedRunName(entry.name)) continue
       try {
         await this.#recoverEventTail(entry.name)
         const manifest = await this.getManifest(entry.name)
@@ -592,8 +592,11 @@ export class FileWorkflowStore implements WorkflowStore {
       this.#unindexRun(runId)
       // The run is deleted once the rename lands. Reclaiming its bytes is best effort: whatever
       // this rm cannot remove (a locked subdirectory) is retried by the next initialize().
-      await rm(trash, { recursive: true, force: true }).catch(() => {
-        this.#unreclaimed.add(basename(trash))
+      await rm(trash, { recursive: true, force: true }).catch(async () => {
+        // Only if it is really still there (round 5 of #65, C): a concurrent reclaimDeletedRuns may
+        // have removed it while this rm was failing, and reporting gone bytes as "still on disk"
+        // would send the embedder chasing a disk problem that does not exist.
+        if (!(await isConfirmedMissing(trash))) this.#unreclaimed.add(basename(trash))
       })
     })
   }
@@ -616,7 +619,7 @@ export class FileWorkflowStore implements WorkflowStore {
     let reclaimed = 0
     const entries = await readdir(this.runsDirectory, { withFileTypes: true })
     for (const entry of entries) {
-      if (!entry.isDirectory() || !entry.name.startsWith(DELETED_RUN_PREFIX)) continue
+      if (!entry.isDirectory() || !isDeletedRunName(entry.name)) continue
       try {
         await rm(join(this.runsDirectory, entry.name), { recursive: true, force: true })
         reclaimed += 1
@@ -666,7 +669,7 @@ export class FileWorkflowStore implements WorkflowStore {
     const manifests: WorkflowRunManifest[] = []
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
-      if (entry.name.startsWith(DELETED_RUN_PREFIX)) continue
+      if (isDeletedRunName(entry.name)) continue
       if (this.#quarantinedRuns.has(entry.name)) continue
       const manifest = await this.getManifest(entry.name)
       if (manifest) manifests.push(manifest)
@@ -2426,6 +2429,20 @@ function isObject(value: unknown): value is Record<string, unknown> {
  * match a run id (`run_…`), so no store call can name, index or quarantine it.
  */
 const DELETED_RUN_PREFIX = '.deleted-'
+
+/**
+ * Only a name `deleteRun` itself generates: `.deleted-<run id>-<uuid>`.
+ *
+ * WHY exact (round 5 of #65, reviewer C): the sweep recursively removes what it matches, and a bare
+ * prefix check erased any directory someone had put under `runs/` whose name merely began with
+ * `.deleted-`. Anything else is left alone; startup then quarantines it (its name is not a run id),
+ * which keeps it visible instead of silently gone.
+ */
+const DELETED_RUN_NAME = /^\.deleted-run_[A-Za-z0-9_-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+function isDeletedRunName(name: string): boolean {
+  return DELETED_RUN_NAME.test(name)
+}
 
 function isMissing(error: unknown): boolean {
   return isObject(error) && error.code === 'ENOENT'
