@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -18,11 +18,10 @@ import { join } from 'node:path'
  * exercising the real production credential contract instead of a test-only one, and a child that
  * holds no refresh token cannot rotate anything no matter what Codex decides to do.
  *
- * WHY API-key logins are REFUSED (round 2 of #63, steering q55): an API key cannot rotate, so it
- * could never cause the logout above — but it never expires either. A run killed after writing
- * its snapshot (SIGINT, a Vitest worker kill) leaves the key in $TMPDIR until something removes
- * it, and nothing guarantees another run ever will. A ChatGPT access token left the same way
- * expires on its own. Only credentials with a bounded lifetime enter this test's temp files.
+ * WHY API-key logins are REFUSED (round 2 of #63, steering q55/q57): an API key cannot rotate, so
+ * it could never cause the logout above — but it never expires either. A run killed after writing
+ * its snapshot leaves its root behind (see createIsolatedCodexLogin for why nothing sweeps it), so
+ * only credentials with a bounded lifetime may enter this test's temp files.
  *
  * WHY there is no fallback to copying the full file when the access token is unusable: that
  * fallback IS the bug. An explicit opt-in run fails loudly with the same instruction the product
@@ -49,8 +48,8 @@ const REFRESH_SKEW_MS = 5 * 60_000
 export type IsolatedCodexLoginOptions = {
   now?: () => number
   /**
-   * Directory under which the helper creates its OWN private parent (default: the OS temp dir).
-   * Tests pass a synthetic one so nothing they do can touch a real run.
+   * Directory the throwaway root is created in (default: the OS temp dir). Tests pass a synthetic
+   * one so nothing they do can touch a real run.
    */
   baseDirectory?: string
   /** Seams for the setup-failure tests only; the real fs calls unless a test injects a failure. */
@@ -58,11 +57,19 @@ export type IsolatedCodexLoginOptions = {
   createHome?: (path: string) => Promise<void>
 }
 
-/** The helper's own parent directory: nothing outside it is ever deleted. */
-export const PARENT_NAME = 'workflow-live-codex'
-const ROOT_PREFIX = 'root-'
-const LEASE_FILE = 'lease.json'
-
+/**
+ * WHY this helper deletes ONLY the root it created, and never sweeps leftovers (steering q55/q57):
+ * two sweep designs were tried and both deleted data they did not own. Name + one-hour mtime
+ * removed an unrelated temp directory and a live run's root (a root's mtime does not move when
+ * Codex writes inside it). A private parent + pid lease still removed a same-user
+ * `root-project-notes` directory whose lease named a dead pid — a location and a liveness hint are
+ * not ownership, and nothing on disk can prove it. So there is no sweep.
+ *
+ * The residue that leaves, stated plainly: a run KILLED before its `finally` (SIGINT, a Vitest
+ * worker kill) leaves one 0700 `workflow-live-codex-*` directory holding an access-only snapshot.
+ * That token expires on its own (a readable `exp` is required below) and carries no refresh token,
+ * and API keys are refused outright, so no non-expiring credential can ever be left behind.
+ */
 export async function createIsolatedCodexLogin(
   sourceCodexHome: string,
   options: IsolatedCodexLoginOptions = {},
@@ -70,25 +77,16 @@ export async function createIsolatedCodexLogin(
   const now = options.now ?? Date.now
   const writeSnapshot = options.writeSnapshot ?? ((path, contents) => writeFile(path, contents, { mode: 0o600 }))
   const createHome = options.createHome ?? (path => mkdir(path).then(() => undefined))
-  const parent = await ownedParent(options.baseDirectory ?? tmpdir())
-
-  // WHY the sweep runs FIRST, before the source login is even read (round 2 of #63): a killed run
-  // strands its snapshot and nothing in the dying process can remove it. When validation came
-  // first, a later run whose source login was missing, malformed or near expiry refused before
-  // cleaning up, so the residue survived every future attempt.
-  await sweepAbandonedRoots(parent)
-
-  // Parse and validate BEFORE creating a root, so a refused login creates nothing.
+  // Parse and validate BEFORE creating anything, so a refused login creates nothing to clean up.
   const snapshot = accessOnlySnapshot(await readSourceLogin(sourceCodexHome), now())
 
-  const root = await mkdtemp(join(parent, ROOT_PREFIX))
+  // mkdtemp creates a fresh, uniquely named 0700 directory owned by us — the only directory this
+  // helper will ever remove. Everything below lives inside it.
+  const root = await mkdtemp(join(options.baseDirectory ?? tmpdir(), 'workflow-live-codex-'))
   const dispose = () => rm(root, { recursive: true, force: true })
   const codexHome = join(root, 'codex-home')
   const authenticationFile = join(root, 'auth-snapshot.json')
   try {
-    // The lease goes in BEFORE any credential: a root without one holds nothing worth sweeping,
-    // so the sweep can leave lease-less roots alone (they may be mid-setup in another process).
-    await writeFile(join(root, LEASE_FILE), JSON.stringify({ pid: process.pid }), { mode: 0o600 })
     await createHome(codexHome)
     await writeSnapshot(authenticationFile, `${JSON.stringify(snapshot)}\n`)
   } catch (error) {
@@ -100,62 +98,6 @@ export async function createIsolatedCodexLogin(
   }
 
   return { codexHome, authenticationFile, dispose }
-}
-
-/**
- * `<base>/workflow-live-codex`, created 0700 and verified to be a real directory owned by us.
- *
- * WHY a private parent (round 2 of #63, steering q55): the first sweep deleted anything in the
- * shared temp dir whose NAME matched and whose mtime was an hour old. That removed an unrelated
- * user directory and a live run's root (a root's mtime does not move when Codex writes inside it).
- * Everything this helper may ever delete now lives under one directory it owns, and a symlink or a
- * foreign-owned directory at that path is refused rather than trusted.
- */
-async function ownedParent(base: string): Promise<string> {
-  const parent = join(base, PARENT_NAME)
-  await mkdir(parent, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== 'EEXIST') throw error
-  })
-  const info = await lstat(parent)
-  const uid = process.getuid?.()
-  if (!info.isDirectory() || (uid !== undefined && info.uid !== uid)) {
-    throw new Error(`Refusing to use ${parent}: not a directory owned by this user`)
-  }
-  await chmod(parent, 0o700)
-  return parent
-}
-
-/**
- * Remove roots under the private parent whose lease names a process that no longer exists.
- *
- * Liveness is the lease's pid, never a name or an age: an old root whose owner is alive (a paused
- * debugger, a stalled provider) is kept. A root without a readable lease is kept too — the lease
- * is written before any credential, so such a root holds none. A reused pid only makes us keep a
- * dead root longer; it can never make us delete a live one.
- */
-async function sweepAbandonedRoots(parent: string): Promise<void> {
-  for (const name of await readdir(parent)) {
-    if (!name.startsWith(ROOT_PREFIX)) continue
-    const root = join(parent, name)
-    let pid: unknown
-    try {
-      pid = (JSON.parse(await readFile(join(root, LEASE_FILE), 'utf8')) as { pid?: unknown }).pid
-    } catch {
-      continue
-    }
-    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || processIsAlive(pid)) continue
-    await rm(root, { recursive: true, force: true }).catch(() => {})
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    // EPERM: it exists but belongs to someone else — alive, keep the root.
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
-  }
 }
 
 async function readSourceLogin(sourceCodexHome: string): Promise<AuthDocument> {

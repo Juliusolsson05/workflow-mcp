@@ -1,12 +1,12 @@
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { synchronizeIsolatedAuthentication } from '../src/processOwnedProviderHost.js'
-import { PARENT_NAME, createIsolatedCodexLogin } from './support/isolatedCodexLogin.js'
+import { createIsolatedCodexLogin } from './support/isolatedCodexLogin.js'
 
 // WHY this deterministic test exists for a helper that only live tests use (agent-code#1295): the
 // live tier is opt-in and never runs in CI, so the one property that protects the developer's real
@@ -20,14 +20,12 @@ import { PARENT_NAME, createIsolatedCodexLogin } from './support/isolatedCodexLo
 
 const NOW = Date.parse('2026-09-26T12:00:00.000Z')
 const roots: string[] = []
-// Each test gets its own synthetic base directory; the helper creates its private parent inside it.
-// Nothing here can touch a real run's roots in $TMPDIR (review of #63).
+// Each test gets its own synthetic base directory, so nothing here can touch a real run's roots in
+// $TMPDIR (review of #63).
 let base: string
-let parent: string
 
 beforeEach(async () => {
   base = await mkdtemp(join(tmpdir(), 'workflow-live-base-'))
-  parent = join(base, PARENT_NAME)
   roots.push(base)
 })
 
@@ -50,22 +48,7 @@ async function sourceHome(auth: unknown): Promise<{ home: string; serialized: st
 
 // A refused login must strand nothing: no temp home, no half-written snapshot.
 async function isolatedRoots(): Promise<string[]> {
-  return (await readdir(parent).catch(() => [] as string[])).filter(name => name.startsWith('root-')).sort()
-}
-
-/** A pid that is certainly dead: a child we spawned and waited for. */
-function deadPid(): number {
-  const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })
-  return Number(child.stdout)
-}
-
-/** A root the way a killed run leaves it: lease, home and a snapshot. */
-async function strandedRoot(name: string, pid: number): Promise<string> {
-  const root = join(parent, name)
-  await mkdir(join(root, 'codex-home'), { recursive: true })
-  await writeFile(join(root, 'lease.json'), JSON.stringify({ pid }))
-  await writeFile(join(root, 'auth-snapshot.json'), 'fixture bearer bytes')
-  return root
+  return (await readdir(base)).filter(name => name.startsWith('workflow-live-codex-')).sort()
 }
 
 const chatgptLogin = (accessToken: string) => ({
@@ -160,62 +143,34 @@ describe('isolated Codex login for live tests', () => {
     expect(await isolatedRoots()).toEqual([])
   })
 
-  // Round 2 of #63 (q55): the first sweep deleted by NAME and root mtime. These pin ownership and
-  // liveness: only a root under the helper's own parent, named like its roots, whose lease pid is dead.
-  it('sweeps a root whose lease owner is dead', async () => {
-    const stranded = await strandedRoot('root-killed', deadPid())
-    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
-    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: base })
-    await expect(stat(stranded)).rejects.toMatchObject({ code: 'ENOENT' })
-    await login.dispose()
-  })
-
-  it('keeps an old root whose lease owner is alive', async () => {
-    const live = await strandedRoot('root-paused-debugger', process.pid)
+  // Steering q55/q57: two sweep designs deleted data they did not own — name + mtime, then a private
+  // parent + pid lease that still removed a same-user `root-project-notes` with a dead-pid lease.
+  // The helper now removes only the root it created. Everything that existed before survives,
+  // whatever it is named, however old, whatever lease it carries.
+  it('never deletes anything that existed before it ran', async () => {
+    const deadPid = Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout)
     const old = new Date(Date.now() - 24 * 60 * 60_000)
-    await utimes(live, old, old)
+    const preexisting = [
+      join(base, 'workflow-live-codex', 'root-project-notes'),
+      join(base, 'workflow-live-codex-killed-run'),
+      join(base, 'workflow-live-codex-unrelated-data'),
+    ]
+    for (const dir of preexisting) {
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, 'lease.json'), JSON.stringify({ pid: deadPid }))
+      await writeFile(join(dir, 'keep.txt'), 'user data')
+      await utimes(dir, old, old)
+    }
     const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
     const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: base })
-    expect(await readFile(join(live, 'auth-snapshot.json'), 'utf8')).toBe('fixture bearer bytes')
     await login.dispose()
-  })
-
-  it('never touches what it does not own: other names in its parent, and anything beside the parent', async () => {
-    const pid = deadPid()
-    await mkdir(parent, { recursive: true })
-    // Same parent, not a root name, dead lease: not ours.
-    const unrelatedInParent = join(parent, 'project-notes')
-    await mkdir(unrelatedInParent)
-    await writeFile(join(unrelatedInParent, 'lease.json'), JSON.stringify({ pid }))
-    await writeFile(join(unrelatedInParent, 'keep.txt'), 'user data')
-    // Beside the parent, matching the OLD prefix, dead lease: not ours either.
-    const besideParent = join(base, 'workflow-live-codex-root-old')
-    await mkdir(besideParent)
-    await writeFile(join(besideParent, 'lease.json'), JSON.stringify({ pid }))
-    await writeFile(join(besideParent, 'keep.txt'), 'user data')
-    // A root with no lease holds no credential (the lease is written first): left alone.
-    const leaseless = join(parent, 'root-mid-setup')
-    await mkdir(leaseless)
-    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
-    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: base })
-    expect(await readFile(join(unrelatedInParent, 'keep.txt'), 'utf8')).toBe('user data')
-    expect(await readFile(join(besideParent, 'keep.txt'), 'utf8')).toBe('user data')
-    expect((await stat(leaseless)).isDirectory()).toBe(true)
-    await login.dispose()
-  })
-
-  it('cleans up a stranded root even when this run then refuses its own login', async () => {
-    const stranded = await strandedRoot('root-killed-api-key-era', deadPid())
-    const home = await mkdtemp(join(tmpdir(), 'workflow-live-source-'))
-    roots.push(home)
-    await expect(createIsolatedCodexLogin(home, { now: () => NOW, baseDirectory: base })).rejects.toThrow(/file-backed login/)
-    await expect(stat(stranded)).rejects.toMatchObject({ code: 'ENOENT' })
-  })
-
-  it('refuses a parent that is not a directory it owns', async () => {
-    await symlink(tmpdir(), parent)
-    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
-    await expect(createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: base })).rejects.toThrow(/not a directory owned/)
+    // A refused run must not delete them either.
+    const empty = await mkdtemp(join(tmpdir(), 'workflow-live-source-'))
+    roots.push(empty)
+    await expect(createIsolatedCodexLogin(empty, { now: () => NOW, baseDirectory: base })).rejects.toThrow(/file-backed login/)
+    for (const dir of preexisting) expect(await readFile(join(dir, 'keep.txt'), 'utf8')).toBe('user data')
+    // And its own root is the one thing gone.
+    await expect(stat(dirname(login.codexHome))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('refuses a missing file-backed login without creating anything', async () => {
