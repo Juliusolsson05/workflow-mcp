@@ -1,8 +1,8 @@
-import { appendFile, mkdtemp, readFile, unlink } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { parseWorkflowSource } from '../src/loadWorkflow.js'
@@ -25,6 +25,18 @@ function started(runId: string): WorkflowEvent {
     type: 'run.started',
     payload: { workflow: { name: 'stored', description: 'Stored workflow' } },
   }
+}
+
+function event(runId: string, sequence: number, type: WorkflowEvent['type'], payload: unknown): WorkflowEvent {
+  return {
+    schemaVersion: 1,
+    runId,
+    sequence,
+    eventId: `event-${sequence}`,
+    timestamp: new Date().toISOString(),
+    type,
+    payload,
+  } as WorkflowEvent
 }
 
 describe('FileWorkflowStore', () => {
@@ -401,5 +413,248 @@ describe('FileWorkflowStore', () => {
       artifactId: reference.artifactId!,
       maxBytes: 16,
     })).rejects.toMatchObject({ code: 'result-not-found' })
+  })
+})
+
+describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
+  async function storeWithLineage() {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-store-delete-'))
+    const store = new FileWorkflowStore(root)
+    const lease = await store.acquireLease('retention-test')
+    await store.initialize()
+    // An interrupted run and its (cancelled) successor, created through the real paths.
+    await store.createRun({ runId: 'run_first', cwd: root, workflow: loaded() })
+    await store.appendEvent('run_first', started('run_first'))
+    await store.appendEvent('run_first', event('run_first', 2, 'run.interrupted', { reason: 'fixture' }))
+    await store.createRun({
+      runId: 'run_second', cwd: root, workflow: loaded(), resumedFromRunId: 'run_first', lineageId: 'run_first',
+    })
+    await store.appendEvent('run_second', started('run_second'))
+    await store.appendEvent('run_second', event('run_second', 2, 'run.cancelled', { reason: 'fixture' }))
+    await store.createRun({ runId: 'run_live', cwd: root, workflow: loaded() })
+    await store.appendEvent('run_live', started('run_live'))
+    return { root, store, lease }
+  }
+
+  it('removes a terminal run from disk and from every index', async () => {
+    const { root, store, lease } = await storeWithLineage()
+    await expect(store.findLatestSuccessor('run_first')).resolves.toMatchObject({ runId: 'run_second' })
+    await store.deleteRun('run_second')
+    await expect(stat(join(root, 'runs', 'run_second'))).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(store.getManifest('run_second')).resolves.toBeUndefined()
+    await expect(store.findLatestSuccessor('run_first')).resolves.toBeUndefined()
+    const all = await store.listRuns({ limit: 10 })
+    expect(all.items.map(item => item.runId)).toEqual(['run_first', 'run_live'])
+    const cancelled = await store.listRuns({ statuses: ['cancelled'], limit: 10 })
+    expect(cancelled.items).toEqual([])
+    // A deleted run leaves nothing that a fresh store would index either.
+    await lease.release()
+    const reopened = new FileWorkflowStore(root)
+    await reopened.acquireLease('retention-reopen')
+    await reopened.initialize()
+    expect((await reopened.listRuns({ limit: 10 })).items.map(item => item.runId)).toEqual(['run_first', 'run_live'])
+  })
+
+  it('refuses a run that is still live, and one that does not exist', async () => {
+    const { root, store } = await storeWithLineage()
+    await expect(store.deleteRun('run_live')).rejects.toMatchObject({ code: 'run-not-terminal' })
+    expect((await stat(join(root, 'runs', 'run_live'))).isDirectory()).toBe(true)
+    await expect(store.deleteRun('run_missing')).rejects.toMatchObject({ code: 'run-not-found' })
+    await expect(store.deleteRun('../escape')).rejects.toThrow(/Invalid workflow run ID/)
+  })
+
+  // Review of #65: a delete issued while the append that ENDS the run is in flight waits for it
+  // (it joins the run's append tail), then deletes — never refuses a run that is about to be
+  // terminal, and never races it (the deterministic interleavings are in
+  // fileWorkflowStore.deleteRace.system.test.ts).
+  it('waits for the append that ends the run, then deletes it', async () => {
+    const { store } = await storeWithLineage()
+    const append = store.appendEvent('run_live', event('run_live', 2, 'run.cancelled', { reason: 'fixture' }))
+    await store.deleteRun('run_live')
+    await append
+    await expect(store.getManifest('run_live')).resolves.toBeUndefined()
+    expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).not.toContain('run_live')
+  })
+
+  // Rounds 1-3 of #65. deleteRun renames the run to `runs/.deleted-…` (atomic, same parent) before
+  // removing anything, so a run is either whole under its name or gone from it; initialize sweeps
+  // whatever the removal could not reclaim. These three helpers observe that from outside.
+  async function runsEntries(root: string): Promise<string[]> {
+    return (await readdir(join(root, 'runs'))).sort()
+  }
+  async function reopen(root: string, lease: { release(): Promise<void> }) {
+    await lease.release()
+    const store = new FileWorkflowStore(root)
+    const nextLease = await store.acquireLease('retention-reopen')
+    await store.initialize()
+    return { store, lease: nextLease }
+  }
+  const listed = async (store: FileWorkflowStore) => (await store.listRuns({ limit: 10 })).items.map(item => item.runId)
+
+  // Round 3 of #65 (reviewer C): rm unlinks entries one by one, so a removal that failed on a
+  // locked subdirectory after manifest.json was gone left a manifest-less run directory. After a
+  // restart no index held it, nothing quarantined it, and deleteRun said run-not-found: debris
+  // no store call could ever remove. Now the run leaves its name first, and the leftovers are a
+  // `.deleted-` directory that the next start reclaims.
+  it('deletes a run whose removal fails part-way, and reclaims the leftovers on the next start', async () => {
+    const { root, store, lease } = await storeWithLineage()
+    const locked = join(root, 'runs', 'run_second', 'transcripts', 'locked')
+    await mkdir(locked, { recursive: true })
+    await writeFile(join(locked, 'agent.jsonl'), '{}\n')
+    await chmod(locked, 0o500)
+    let trash: string | undefined
+    try {
+      await store.deleteRun('run_second')
+      expect(await listed(store)).not.toContain('run_second')
+      await expect(stat(join(root, 'runs', 'run_second'))).rejects.toMatchObject({ code: 'ENOENT' })
+      // The shape under test: the removal really did fail part-way and left bytes behind.
+      trash = (await runsEntries(root)).find(name => name.startsWith('.deleted-run_second-'))
+      expect(trash).toBeDefined()
+      await expect(stat(join(root, 'runs', trash!, 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      // Nothing that walks `runs/` may trip over the leftovers (a `.deleted-` name is not a run id).
+      expect((await store.listManifests()).map(manifest => manifest.runId)).toEqual(['run_first', 'run_live'])
+      // Round 4 (reviewer C): the leftovers are not silent. The caller can see them...
+      expect(store.listUnreclaimedDeletions()).toEqual([trash])
+      // ...and a restart while they are still locked neither indexes nor quarantines them, but
+      // still reports them, and a reclaim says how many remain.
+      const again = await reopen(root, lease)
+      expect(await listed(again.store)).toEqual(['run_first', 'run_live'])
+      expect(again.store.listQuarantinedRuns()).toEqual([])
+      expect(again.store.listUnreclaimedDeletions()).toEqual([trash])
+      await expect(again.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 0, remaining: 1 })
+      await expect(again.store.deleteRun('run_second')).rejects.toMatchObject({ code: 'run-not-found' })
+      await chmod(join(root, 'runs', trash!, 'transcripts', 'locked'), 0o700)
+      // Once the leftovers can be removed, the next reclaim removes them...
+      await expect(again.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 1, remaining: 0 })
+      expect(again.store.listUnreclaimedDeletions()).toEqual([])
+      expect(await runsEntries(root)).toEqual(['run_first', 'run_live'])
+      // ...and a start with nothing left over reports nothing.
+      const third = await reopen(root, again.lease)
+      expect(third.store.listQuarantinedRuns()).toEqual([])
+      expect(third.store.listUnreclaimedDeletions()).toEqual([])
+    } finally {
+      await chmod(trash === undefined ? locked : join(root, 'runs', trash, 'transcripts', 'locked'), 0o700).catch(() => undefined)
+    }
+  })
+
+  // Round 5 of #65 (C): the sweep recursively removes what it matches, and a bare `.deleted-`
+  // prefix erased an unrelated directory. Only names deleteRun generates are reclaimed; anything
+  // else stays on disk and is quarantined, so it is visible rather than gone.
+  // Round 6 (C), a surviving mutation: loosening the exact name check to `.deleted-run_<id>-<anything>`
+  // passed with only `.deleted-unrelated` on disk. `.deleted-run_x-not-a-uuid` looks generated but is
+  // not (deleteRun always appends a randomUUID), so it must survive too.
+  it('never sweeps a directory whose name deleteRun could not have generated', async () => {
+    const { root, lease } = await storeWithLineage()
+    const names = ['.deleted-unrelated', '.deleted-run_x-not-a-uuid']
+    for (const name of names) {
+      await mkdir(join(root, 'runs', name))
+      await writeFile(join(root, 'runs', name, 'payload'), 'keep me')
+    }
+    const reopened = await reopen(root, lease)
+    for (const name of names) await expect(readFile(join(root, 'runs', name, 'payload'), 'utf8')).resolves.toBe('keep me')
+    expect(reopened.store.listQuarantinedRuns().map(entry => entry.runId).sort()).toEqual([...names].sort())
+    await expect(reopened.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 0, remaining: 0 })
+    for (const name of names) await expect(readFile(join(root, 'runs', name, 'payload'), 'utf8')).resolves.toBe('keep me')
+  })
+
+  // Round 5 of #65 (C), a surviving mutation: reclaiming mutates the store's disk, so it needs the
+  // lease like every other write.
+  it('refuses to reclaim without the lease', async () => {
+    const { lease, store } = await storeWithLineage()
+    await lease.release()
+    await expect(store.reclaimDeletedRuns()).rejects.toMatchObject({ code: 'owner-conflict' })
+  })
+
+  // Rounds 1-2 of #65: a run whose directory cannot be moved (here `runs/` loses its write and
+  // search permission between the manifest read and the move) must stay whole, indexed and
+  // retryable — never hidden while it is still on disk.
+  it('keeps a run indexed and retryable when it cannot be moved aside', async () => {
+    const { root, store } = await storeWithLineage()
+    const runs = join(root, 'runs')
+    const read = store.getManifest.bind(store)
+    const spy = vi.spyOn(store, 'getManifest').mockImplementationOnce(async (runId) => {
+      const manifest = await read(runId)
+      await chmod(runs, 0o000)
+      return manifest
+    })
+    try {
+      await expect(store.deleteRun('run_second')).rejects.toMatchObject({ code: 'io-error' })
+    } finally {
+      await chmod(runs, 0o700)
+      spy.mockRestore()
+    }
+    expect(await listed(store)).toContain('run_second')
+    await expect(store.getManifest('run_second')).resolves.toMatchObject({ status: 'cancelled' })
+    await store.deleteRun('run_second')
+    expect(await listed(store)).not.toContain('run_second')
+    expect(await runsEntries(root)).toEqual(['run_first', 'run_live'])
+  })
+
+  // Round 2 of #65: a run directory that lost its own permissions between the manifest read and
+  // the removal. The same-parent move needs only `runs/` to be writable, so the run is deleted;
+  // its unreadable bytes wait in `.deleted-` for a start that can remove them.
+  it('deletes a run whose own directory became unreadable', async () => {
+    const { root, store, lease } = await storeWithLineage()
+    const directory = join(root, 'runs', 'run_second')
+    const read = store.getManifest.bind(store)
+    const spy = vi.spyOn(store, 'getManifest').mockImplementationOnce(async (runId) => {
+      const manifest = await read(runId)
+      await chmod(directory, 0o000)
+      return manifest
+    })
+    let trash: string | undefined
+    try {
+      await store.deleteRun('run_second')
+      expect(await listed(store)).not.toContain('run_second')
+      trash = (await runsEntries(root)).find(name => name.startsWith('.deleted-run_second-'))
+      expect(trash).toBeDefined()
+    } finally {
+      spy.mockRestore()
+      await chmod(trash === undefined ? directory : join(root, 'runs', trash), 0o700).catch(() => undefined)
+    }
+    await reopen(root, lease)
+    expect(await runsEntries(root)).toEqual(['run_first', 'run_live'])
+  })
+
+  // Round 2 of #65: the resume path reads workflow.js and args.json after its manifest check. A
+  // delete landing in between surfaced a raw ENOENT; it is run-not-found like any deleted run.
+  // A file missing next to a manifest that is still there is a broken run, not a deleted one.
+  it.each(['loadWorkflow', 'loadArgs'] as const)('%s reports a run deleted under it as run-not-found', async (method) => {
+    const { root, store } = await storeWithLineage()
+    const read = store.getManifest.bind(store)
+    vi.spyOn(store, 'getManifest').mockImplementationOnce(async (runId) => {
+      const manifest = await read(runId)
+      await rm(join(root, 'runs', runId), { recursive: true, force: true })
+      return manifest
+    })
+    await expect(store[method]('run_second')).rejects.toMatchObject({ code: 'run-not-found' })
+    await unlink(join(root, 'runs', 'run_first', method === 'loadWorkflow' ? 'workflow.js' : 'args.json'))
+    await expect(store[method]('run_first')).rejects.toMatchObject({ code: 'corrupt-store' })
+  })
+
+  // The per-run caches are keyed by run id. A run recreated under a deleted id must
+  // never be served the deleted run's snapshot or event byte offsets.
+  it('serves nothing cached from a deleted run to a new run with the same id', async () => {
+    const { root, store } = await storeWithLineage()
+    const before = await store.snapshot('run_second')
+    expect(before.state.status).toBe('cancelled')
+    await store.readEvents('run_second', 0, 10)
+    await store.deleteRun('run_second')
+    await store.createRun({ runId: 'run_second', cwd: root, workflow: loaded() })
+    await store.appendEvent('run_second', started('run_second'))
+    await store.appendEvent('run_second', event('run_second', 2, 'run.failed', {
+      error: { code: 'fixture', message: 'the recreated run' },
+    }))
+    const after = await store.snapshot('run_second')
+    expect(after.state.status).toBe('failed')
+    const page = await store.readEvents('run_second', 0, 10)
+    expect(page.events.map(stored => stored.event.type)).toEqual(['run.started', 'run.failed'])
+  })
+
+  it('cannot delete after the lease is released', async () => {
+    const { root, store, lease } = await storeWithLineage()
+    await lease.release()
+    await expect(store.deleteRun('run_second')).rejects.toMatchObject({ code: 'owner-conflict' })
+    expect((await stat(join(root, 'runs', 'run_second'))).isDirectory()).toBe(true)
   })
 })
