@@ -40,27 +40,44 @@ type AuthDocument = {
 // Same skew as the product broker: a token that expires mid-attempt is as bad as an expired one.
 const REFRESH_SKEW_MS = 5 * 60_000
 
+export type IsolatedCodexLoginOptions = {
+  now?: () => number
+  /**
+   * Seam for the setup-failure test only: the real writer unless a test injects one that fails
+   * after creating the file. Nothing else about the file system is injectable on purpose.
+   */
+  writeSnapshot?: (path: string, contents: string) => Promise<void>
+}
+
 export async function createIsolatedCodexLogin(
   sourceCodexHome: string,
-  now: () => number = Date.now,
+  options: IsolatedCodexLoginOptions = {},
 ): Promise<IsolatedCodexLogin> {
+  const now = options.now ?? Date.now
+  const writeSnapshot = options.writeSnapshot ?? ((path, contents) => writeFile(path, contents, { mode: 0o600 }))
   // Parse and validate BEFORE creating anything, so a refused login strands nothing on disk.
   const snapshot = accessOnlySnapshot(await readSourceLogin(sourceCodexHome), now())
 
   const root = await mkdtemp(join(tmpdir(), 'workflow-live-codex-'))
-  // mkdtemp already creates 0700 on POSIX; the explicit chmod documents the requirement and covers
-  // platforms whose default differs. The snapshot is still a live bearer token for its lifetime.
-  await chmod(root, 0o700)
+  const dispose = () => rm(root, { recursive: true, force: true })
   const codexHome = join(root, 'codex-home')
   const authenticationFile = join(root, 'auth-snapshot.json')
-  await mkdir(codexHome, { mode: 0o700 })
-  await writeFile(authenticationFile, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 })
-
-  return {
-    codexHome,
-    authenticationFile,
-    dispose: () => rm(root, { recursive: true, force: true }),
+  try {
+    // mkdtemp already creates 0700 on POSIX; the explicit chmod documents the requirement and covers
+    // platforms whose default differs. The snapshot is still a live bearer token for its lifetime.
+    await chmod(root, 0o700)
+    await mkdir(codexHome, { mode: 0o700 })
+    await writeSnapshot(authenticationFile, `${JSON.stringify(snapshot)}\n`)
+  } catch (error) {
+    // WHY cleanup here and not only in the caller's `finally` (steering q43): the caller only gets
+    // `dispose` if this function RETURNS. A write that creates the file and then fails (disk full,
+    // EIO) would otherwise strand a partial access-token file in $TMPDIR with nobody holding a
+    // handle to remove it.
+    await dispose()
+    throw error
   }
+
+  return { codexHome, authenticationFile, dispose }
 }
 
 async function readSourceLogin(sourceCodexHome: string): Promise<AuthDocument> {

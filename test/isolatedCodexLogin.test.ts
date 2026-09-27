@@ -58,7 +58,7 @@ describe('isolated Codex login for live tests', () => {
   it('never lets the refresh token reach the isolated home, and leaves the source untouched', async () => {
     const accessToken = jwt(NOW / 1_000 + 3_600)
     const source = await sourceHome(chatgptLogin(accessToken))
-    const login = await createIsolatedCodexLogin(source.home, () => NOW)
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW })
     roots.push(dirname(login.codexHome))
 
     // Exactly what every attempt does before starting Codex (prepareIsolatedCodexAttempt).
@@ -83,7 +83,7 @@ describe('isolated Codex login for live tests', () => {
 
   it('passes an API-key login through, since it has no rotating lineage', async () => {
     const source = await sourceHome({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-fixture', tokens: null })
-    const login = await createIsolatedCodexLogin(source.home, () => NOW)
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW })
     roots.push(dirname(login.codexHome))
     expect(JSON.parse(await readFile(login.authenticationFile, 'utf8'))).toEqual({
       auth_mode: 'apikey', OPENAI_API_KEY: 'sk-fixture', tokens: null, last_refresh: null,
@@ -97,7 +97,25 @@ describe('isolated Codex login for live tests', () => {
   ])('refuses %s instead of falling back to the full file', async (_label, auth, message) => {
     const source = await sourceHome(auth)
     const before = await isolatedRoots()
-    await expect(createIsolatedCodexLogin(source.home, () => NOW)).rejects.toThrow(message)
+    await expect(createIsolatedCodexLogin(source.home, { now: () => NOW })).rejects.toThrow(message)
+    expect(await isolatedRoots()).toEqual(before)
+  })
+
+  it('removes a partially written snapshot when setup fails after the file exists', async () => {
+    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
+    const before = await isolatedRoots()
+    let createdPath: string | undefined
+    await expect(createIsolatedCodexLogin(source.home, {
+      now: () => NOW,
+      // Half the token reaches disk, then the write fails — the disk-full shape.
+      writeSnapshot: async (path, contents) => {
+        createdPath = path
+        await writeFile(path, contents.slice(0, contents.length / 2), { mode: 0o600 })
+        throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+      },
+    })).rejects.toMatchObject({ code: 'ENOSPC' })
+    expect(createdPath).toBeTypeOf('string')
+    await expect(stat(createdPath!)).rejects.toMatchObject({ code: 'ENOENT' })
     expect(await isolatedRoots()).toEqual(before)
   })
 
@@ -105,7 +123,7 @@ describe('isolated Codex login for live tests', () => {
     const home = await mkdtemp(join(tmpdir(), 'workflow-live-source-'))
     roots.push(home)
     const before = await isolatedRoots()
-    await expect(createIsolatedCodexLogin(home, () => NOW)).rejects.toThrow(/file-backed login/)
+    await expect(createIsolatedCodexLogin(home, { now: () => NOW })).rejects.toThrow(/file-backed login/)
     expect(await isolatedRoots()).toEqual(before)
   })
 })
