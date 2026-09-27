@@ -134,14 +134,20 @@ describe('workflow MCP facade', () => {
     })
     expect(JSON.parse((started.content[0] as { text: string }).text)).toEqual(started.structuredContent)
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
-    await pollUntil(
+    const reached = await pollUntil(
       () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
-      // Or finished: a run that ends before cursor 5 fails the page assertion below by name.
+      // Cursor 5 (session.started) is the durable resume boundary the cancel and
+      // resume below rely on. A run that finishes first ends the wait at once
+      // instead of polling to the test timeout, and the assertion below names it.
       (status) => {
         const run = (status.structuredContent as { run: { cursor: number; status: string } }).run
         return run.cursor >= 5 || isTerminalRunStatus(run.status)
       },
     )
+    // Asserted separately from the wait (review of #71, round 2, a): the page
+    // assertions below need only three events, so without this a wait that
+    // returned early (at cursor 4, still running) passed unnoticed.
+    expect((reached.structuredContent as { run: { cursor: number } }).run.cursor).toBeGreaterThanOrEqual(5)
     const events = await client.callTool({
       name: 'workflow_run_events',
       arguments: { runId, after: 0, limit: 2 },
