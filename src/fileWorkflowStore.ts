@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { COPYFILE_EXCL } from 'node:constants'
 import { execFile } from 'node:child_process'
-import { createReadStream, readFileSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync } from 'node:fs'
 import {
   chmod,
   copyFile,
@@ -531,11 +531,19 @@ export class FileWorkflowStore implements WorkflowStore {
       if (!TERMINAL_STATUSES.has(manifest.status)) {
         throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${manifest.status}`)
       }
-      this.#unindexRun(runId)
+      // WHY remove first and unindex after (review of #65): unindexing first made a failed
+      // removal (EACCES, an immutable directory) hide a run that was still on disk — invisible to
+      // listRuns and to any retry until restart, while its manifest stayed readable. The index
+      // must follow the disk: it drops the run once its manifest is gone, and keeps it otherwise.
+      let removalError: unknown
       try {
         await rm(directory, { recursive: true, force: true })
       } catch (cause) {
-        throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause })
+        removalError = cause
+      }
+      if (removalError === undefined || !existsSync(this.#manifestPath(runId))) this.#unindexRun(runId)
+      if (removalError !== undefined) {
+        throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause: removalError })
       }
     })
   }
@@ -545,6 +553,7 @@ export class FileWorkflowStore implements WorkflowStore {
     this.#runSummaries.delete(runId)
     this.#snapshotCache.delete(runId)
     this.#eventOffsets.delete(runId)
+    if (this.#journalResultCache?.runId === runId) this.#journalResultCache = undefined
     if (summary === undefined) return
     removeSortedKey(this.#runKeysByStatus.get(summary.status), runIndexKey(summary))
     const lineage = this.#lineageMembers.get(summary.lineageId)

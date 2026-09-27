@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, stat, unlink } from 'node:fs/promises'
+import { appendFile, chmod, mkdtemp, readFile, stat, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -471,6 +471,42 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
     await append
     await store.deleteRun('run_live')
     await expect(store.getManifest('run_live')).resolves.toBeUndefined()
+  })
+
+  // Review of #65: the run was unindexed BEFORE the directory removal, so a failed
+  // removal hid a run that was still on disk from listRuns and every retry.
+  it('keeps a run indexed and retryable when its directory cannot be removed', async () => {
+    const { root, store } = await storeWithLineage()
+    const directory = join(root, 'runs', 'run_second')
+    await chmod(directory, 0o500)
+    try {
+      await expect(store.deleteRun('run_second')).rejects.toMatchObject({ code: 'io-error' })
+      expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).toContain('run_second')
+      await expect(store.getManifest('run_second')).resolves.toMatchObject({ status: 'cancelled' })
+    } finally {
+      await chmod(directory, 0o700)
+    }
+    await store.deleteRun('run_second')
+    expect((await store.listRuns({ limit: 10 })).items.map(item => item.runId)).not.toContain('run_second')
+  })
+
+  // The per-run caches are keyed by run id. A run recreated under a deleted id must
+  // never be served the deleted run's snapshot or event byte offsets.
+  it('serves nothing cached from a deleted run to a new run with the same id', async () => {
+    const { root, store } = await storeWithLineage()
+    const before = await store.snapshot('run_second')
+    expect(before.state.status).toBe('cancelled')
+    await store.readEvents('run_second', 0, 10)
+    await store.deleteRun('run_second')
+    await store.createRun({ runId: 'run_second', cwd: root, workflow: loaded() })
+    await store.appendEvent('run_second', started('run_second'))
+    await store.appendEvent('run_second', event('run_second', 2, 'run.failed', {
+      error: { code: 'fixture', message: 'the recreated run' },
+    }))
+    const after = await store.snapshot('run_second')
+    expect(after.state.status).toBe('failed')
+    const page = await store.readEvents('run_second', 0, 10)
+    expect(page.events.map(stored => stored.event.type)).toEqual(['run.started', 'run.failed'])
   })
 
   it('cannot delete after the lease is released', async () => {
