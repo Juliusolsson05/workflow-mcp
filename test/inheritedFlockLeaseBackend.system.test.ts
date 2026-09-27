@@ -9,6 +9,7 @@ import { FakeAgentProvider } from '../src/fakeProvider.js'
 import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { InheritedFlockLeaseBackend } from '../src/inheritedFlockLeaseBackend.js'
 import { WorkflowService } from '../src/workflowService.js'
+import { pollUntil } from './support/pollUntil.js'
 
 describe('inherited flock pathname monitor', () => {
   it.skipIf(process.platform !== 'linux')(
@@ -62,9 +63,7 @@ describe('inherited flock pathname monitor', () => {
       await second.initialize()
       expect(second.lifecycleState()).toBe('READY')
 
-      for (let attempt = 0; attempt < 100 && first.lifecycleState() !== 'FAILED'; attempt += 1) {
-        await new Promise(resolve => setTimeout(resolve, 5))
-      }
+      await pollUntil(() => first.lifecycleState(), state => state === 'FAILED')
       expect(first.lifecycleState()).toBe('FAILED')
       await expect(first.listRuns()).rejects.toMatchObject({ code: 'invalid-request' })
 

@@ -8,6 +8,13 @@ import type {
   AgentRequest,
 } from '../src/agentProvider.js'
 import { buildCodexRecoveryFingerprint, CodexAgentProvider } from '../src/codexProvider.js'
+import { readFileSync } from 'node:fs'
+
+// Read the way scripts/generate-build-metadata.mjs reads it: package.json's
+// exact dependency is the source of truth for the reported SDK version.
+const declaredCodexSdkVersion = (JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')) as {
+  dependencies: Record<string, string>
+}).dependencies['@openai/codex-sdk']
 import type { CodexClientLike } from '../src/codexProvider.js'
 
 function eventStream(events: readonly ThreadEvent[]): AsyncGenerator<ThreadEvent> {
@@ -244,7 +251,11 @@ describe('CodexAgentProvider', () => {
       providerSession: { provider: 'codex', id: 'thread-1' },
       diagnostics: {
         sdk: '@openai/codex-sdk',
-        sdkVersion: '0.144.6',
+        // The exact version package.json declares, which the build copies into
+        // generatedBuildMetadata.ts. A literal here broke on every SDK bump
+        // (the 0.144.6 -> 0.154.0 Dependabot group) without the diagnostics
+        // being wrong.
+        sdkVersion: declaredCodexSdkVersion,
       },
     })
   })
