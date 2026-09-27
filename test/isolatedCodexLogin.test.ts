@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
@@ -107,6 +107,8 @@ describe('isolated Codex login for live tests', () => {
     ['a near-expiry access token', chatgptLogin(jwt(NOW / 1_000 + 60)), /near expiry/],
     ['a login without an access token', { tokens: { refresh_token: 'fixture-one-time-refresh-token' } }, /access token/],
     ['an opaque access token whose expiry cannot be read', chatgptLogin('opaque-token'), /readable expiry/],
+    // Round 4 of #63: JSON `1e309` parses as Infinity.
+    ['an access token whose exp is not finite', chatgptLogin(`${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from('{"exp":1e309}').toString('base64url')}.sig`), /readable expiry/],
   ])('refuses %s instead of falling back to the full file', async (_label, auth, message) => {
     const source = await sourceHome(auth)
     const before = await isolatedRoots()
@@ -171,6 +173,41 @@ describe('isolated Codex login for live tests', () => {
     for (const dir of preexisting) expect(await readFile(join(dir, 'keep.txt'), 'utf8')).toBe('user data')
     // And its own root is the one thing gone.
     await expect(stat(dirname(login.codexHome))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  // Round 4 of #63 (steering q58): the root was created and removed through the same pathname. A
+  // symlinked base retargeted in between made `rm` delete an unrelated same-named directory under the
+  // new target and leave the real snapshot behind.
+  it('deletes nothing unrelated when a symlinked base is retargeted between create and dispose', async () => {
+    const first = join(base, 'first')
+    const second = join(base, 'second')
+    await mkdir(first)
+    await mkdir(second)
+    const link = join(base, 'link')
+    await symlink(first, link)
+    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: link })
+    const rootName = basename(dirname(login.codexHome))
+    // Retarget the base and plant an unrelated directory under the same name there.
+    await rm(link)
+    await symlink(second, link)
+    await mkdir(join(second, rootName))
+    await writeFile(join(second, rootName, 'keep.txt'), 'user data')
+    await login.dispose()
+    expect(await readFile(join(second, rootName, 'keep.txt'), 'utf8')).toBe('user data')
+    // Its own root, under the original target, is the one that went.
+    await expect(stat(join(first, rootName))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses to remove a root that was replaced by something else', async () => {
+    const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
+    const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: base })
+    const root = dirname(login.codexHome)
+    await rm(root, { recursive: true })
+    await mkdir(root)
+    await writeFile(join(root, 'keep.txt'), 'user data')
+    await expect(login.dispose()).rejects.toThrow(/no longer the directory this run created/)
+    expect(await readFile(join(root, 'keep.txt'), 'utf8')).toBe('user data')
   })
 
   it('refuses a missing file-backed login without creating anything', async () => {

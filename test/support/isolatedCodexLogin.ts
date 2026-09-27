@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -82,8 +82,28 @@ export async function createIsolatedCodexLogin(
 
   // mkdtemp creates a fresh, uniquely named 0700 directory owned by us — the only directory this
   // helper will ever remove. Everything below lives inside it.
-  const root = await mkdtemp(join(options.baseDirectory ?? tmpdir(), 'workflow-live-codex-'))
-  const dispose = () => rm(root, { recursive: true, force: true })
+  //
+  // WHY realpath first and an identity check in dispose (round 4 of #63, steering q58): the root
+  // was created and later removed through the same pathname. With a symlinked base retargeted in
+  // between, `rm` followed the new target and deleted an unrelated same-named directory there,
+  // while the real snapshot stayed behind. The base is resolved once, so the root's path holds no
+  // symlink, and dispose removes the directory only if it is still the very inode mkdtemp created.
+  const base = await realpath(options.baseDirectory ?? tmpdir())
+  const root = await mkdtemp(join(base, 'workflow-live-codex-'))
+  const created = await lstat(root)
+  const dispose = async () => {
+    const now = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    if (now === null) return
+    if (!now.isDirectory() || now.dev !== created.dev || now.ino !== created.ino) {
+      // Refuse loudly rather than delete something else. The caller's own snapshot may then remain;
+      // it is an expiring access-only token (see above), and the message says where.
+      throw new Error(`Refusing to remove ${root}: it is no longer the directory this run created`)
+    }
+    await rm(root, { recursive: true, force: true })
+  }
   const codexHome = join(root, 'codex-home')
   const authenticationFile = join(root, 'auth-snapshot.json')
   try {
@@ -161,7 +181,9 @@ function tokenExpiry(token: string): number | null {
   if (payload === undefined) return null
   try {
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { exp?: unknown }
-    return typeof claims.exp === 'number' ? claims.exp * 1_000 : null
+    // Finite only (round 4 of #63): `exp: 1e309` parses as Infinity, which is a number and would
+    // pass as "expires later" — an unbounded residue if a run is killed.
+    return typeof claims.exp === 'number' && Number.isFinite(claims.exp) ? claims.exp * 1_000 : null
   } catch {
     return null
   }
