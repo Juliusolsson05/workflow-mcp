@@ -61,7 +61,7 @@ export type IsolatedCodexLoginOptions = {
 }
 
 /**
- * WHY this helper deletes ONLY the root it created, and never sweeps leftovers (steering q55/q57):
+ * WHY this helper removes the root it created and never sweeps leftovers (steering q55/q57):
  * two sweep designs were tried and both deleted data they did not own. Name + one-hour mtime
  * removed an unrelated temp directory and a live run's root (a root's mtime does not move when
  * Codex writes inside it). A private parent + pid lease still removed a same-user
@@ -83,8 +83,18 @@ export async function createIsolatedCodexLogin(
   // Parse and validate BEFORE creating anything, so a refused login creates nothing to clean up.
   const snapshot = accessOnlySnapshot(await readSourceLogin(sourceCodexHome), now())
 
-  // mkdtemp creates a fresh, uniquely named 0700 directory owned by us — the only directory this
-  // helper will ever remove. Everything below lives inside it.
+  // mkdtemp creates a fresh, uniquely named 0700 directory owned by us; it is the directory this
+  // helper means to remove. Everything below lives inside it.
+  //
+  // KNOWN RACES (a same-user process acting within them can still misdirect cleanup; the owner
+  // decides whether that is in scope — steering q59):
+  //   1. mkdtemp -> lstat: a swap of the new root before `created` is recorded makes the helper
+  //      adopt the replacement as its root, write the snapshot there, and later remove it, leaving
+  //      the real root behind.
+  //   2. lstat -> rm inside dispose(): a swap after the identity check is removed anyway.
+  // Outside those windows, a root replaced by a DIFFERENT directory is refused, not removed. The
+  // identity is dev+inode, which the OS may reuse after the original is deleted, so a delete-then-
+  // recreate at the same path can also pass the check.
   //
   // WHY realpath first and an identity check in dispose (round 4 of #63, steering q58): the root
   // was created and later removed through the same pathname. With a symlinked base retargeted in

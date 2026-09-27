@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 
@@ -150,7 +150,7 @@ describe('isolated Codex login for live tests', () => {
 
   // Steering q55/q57: two sweep designs deleted data they did not own — name + mtime, then a private
   // parent + pid lease that still removed a same-user `root-project-notes` with a dead-pid lease.
-  // The helper now removes only the root it created. Everything that existed before survives,
+  // The helper no longer sweeps anything. Everything that existed before survives,
   // whatever it is named, however old, whatever lease it carries.
   it('never deletes anything that existed before it ran', async () => {
     const deadPid = Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout)
@@ -202,11 +202,14 @@ describe('isolated Codex login for live tests', () => {
     await expect(stat(join(first, rootName))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('refuses to remove a root that was replaced by something else', async () => {
+  // A rename swap keeps the original directory alive, so its replacement is guaranteed a different
+  // inode. (Deleting and recreating the path instead lets the OS reuse the inode — Linux CI did —
+  // and dev+inode cannot tell those apart; that case is a stated residual, not asserted here.)
+  it('refuses to remove a root that was swapped for another directory', async () => {
     const source = await sourceHome(chatgptLogin(jwt(NOW / 1_000 + 3_600)))
     const login = await createIsolatedCodexLogin(source.home, { now: () => NOW, baseDirectory: base })
     const root = dirname(login.codexHome)
-    await rm(root, { recursive: true })
+    await rename(root, `${root}-moved`)
     await mkdir(root)
     await writeFile(join(root, 'keep.txt'), 'user data')
     await expect(login.dispose()).rejects.toThrow(/no longer the directory this run created/)
