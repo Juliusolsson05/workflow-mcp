@@ -513,16 +513,25 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
       await expect(stat(join(root, 'runs', trash!, 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
       // Nothing that walks `runs/` may trip over the leftovers (a `.deleted-` name is not a run id).
       expect((await store.listManifests()).map(manifest => manifest.runId)).toEqual(['run_first', 'run_live'])
-      // A restart while the leftovers are still locked neither indexes, quarantines nor fails.
+      // Round 4 (reviewer C): the leftovers are not silent. The caller can see them...
+      expect(store.listUnreclaimedDeletions()).toEqual([trash])
+      // ...and a restart while they are still locked neither indexes nor quarantines them, but
+      // still reports them, and a reclaim says how many remain.
       const again = await reopen(root, lease)
       expect(await listed(again.store)).toEqual(['run_first', 'run_live'])
       expect(again.store.listQuarantinedRuns()).toEqual([])
+      expect(again.store.listUnreclaimedDeletions()).toEqual([trash])
+      await expect(again.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 0, remaining: 1 })
       await expect(again.store.deleteRun('run_second')).rejects.toMatchObject({ code: 'run-not-found' })
       await chmod(join(root, 'runs', trash!, 'transcripts', 'locked'), 0o700)
-      // Once the leftovers can be removed, the next start removes them.
-      const third = await reopen(root, again.lease)
+      // Once the leftovers can be removed, the next reclaim removes them...
+      await expect(again.store.reclaimDeletedRuns()).resolves.toEqual({ reclaimed: 1, remaining: 0 })
+      expect(again.store.listUnreclaimedDeletions()).toEqual([])
       expect(await runsEntries(root)).toEqual(['run_first', 'run_live'])
+      // ...and a start with nothing left over reports nothing.
+      const third = await reopen(root, again.lease)
       expect(third.store.listQuarantinedRuns()).toEqual([])
+      expect(third.store.listUnreclaimedDeletions()).toEqual([])
     } finally {
       await chmod(trash === undefined ? locked : join(root, 'runs', trash, 'transcripts', 'locked'), 0o700).catch(() => undefined)
     }

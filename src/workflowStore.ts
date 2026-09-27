@@ -157,6 +157,12 @@ export interface WorkflowStore {
    * whole lineages only) belongs to the embedding application.
    */
   deleteRun?(runId: string): Promise<void>
+  /**
+   * Retry reclaiming the bytes of runs `deleteRun` already deleted but could not fully remove
+   * (a locked subdirectory, a filesystem error). `remaining` is what is still on disk afterwards, so
+   * an embedder's disk policy can see — and report — leftovers instead of assuming success.
+   */
+  reclaimDeletedRuns?(): Promise<{ reclaimed: number; remaining: number }>
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>
   getManifest(runId: string): Promise<WorkflowRunManifest | undefined>
   listManifests(): Promise<WorkflowRunManifest[]>

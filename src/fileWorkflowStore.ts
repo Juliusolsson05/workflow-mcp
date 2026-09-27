@@ -15,7 +15,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 
@@ -158,6 +158,12 @@ export class FileWorkflowStore implements WorkflowStore {
    * write caches only if it is unchanged.
    */
   readonly #deletions = new Map<string, number>()
+  /**
+   * `.deleted-` directories whose removal has failed (review of #65, round 4 C). Without this a
+   * persistent failure was silent: deleteRun had succeeded, initialize swallowed every retry, and
+   * the caller's disk policy believed the bytes were gone. Rebuilt by every initialize/reclaim.
+   */
+  readonly #unreclaimed = new Set<string>()
   readonly #maxEventFileBytes: number
   readonly #maxResultBytes: number
   #leaseToken: string | undefined
@@ -212,12 +218,9 @@ export class FileWorkflowStore implements WorkflowStore {
     const entries = await readdir(this.runsDirectory, { withFileTypes: true })
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
-      if (entry.name.startsWith(DELETED_RUN_PREFIX)) {
-        // A run deleteRun moved aside but could not fully remove (see #deleteRun). It is already
-        // deleted — never indexed, never quarantined — and this is where its bytes are retried.
-        await rm(join(this.runsDirectory, entry.name), { recursive: true, force: true }).catch(() => undefined)
-        continue
-      }
+      // A run deleteRun moved aside but could not fully remove (see #deleteRun). It is already
+      // deleted — never indexed, never quarantined; #sweepDeletedRuns below retries its bytes.
+      if (entry.name.startsWith(DELETED_RUN_PREFIX)) continue
       try {
         await this.#recoverEventTail(entry.name)
         const manifest = await this.getManifest(entry.name)
@@ -235,6 +238,7 @@ export class FileWorkflowStore implements WorkflowStore {
         this.#quarantinedRuns.set(entry.name, error)
       }
     }
+    await this.#sweepDeletedRuns()
   }
 
   listQuarantinedRuns(): readonly { runId: string; code: string; message: string }[] {
@@ -588,8 +592,39 @@ export class FileWorkflowStore implements WorkflowStore {
       this.#unindexRun(runId)
       // The run is deleted once the rename lands. Reclaiming its bytes is best effort: whatever
       // this rm cannot remove (a locked subdirectory) is retried by the next initialize().
-      await rm(trash, { recursive: true, force: true }).catch(() => undefined)
+      await rm(trash, { recursive: true, force: true }).catch(() => {
+        this.#unreclaimed.add(basename(trash))
+      })
     })
+  }
+
+  /** Deleted runs whose bytes are still on disk; see `reclaimDeletedRuns`. */
+  listUnreclaimedDeletions(): readonly string[] {
+    return [...this.#unreclaimed].sort()
+  }
+
+  async reclaimDeletedRuns(): Promise<{ reclaimed: number; remaining: number }> {
+    return await this.#writers.run(async () => {
+      const reclaimed = await this.#sweepDeletedRuns()
+      return { reclaimed, remaining: this.#unreclaimed.size }
+    })
+  }
+
+  /** Remove every `.deleted-` directory it can; the rest stay listed as unreclaimed. */
+  async #sweepDeletedRuns(): Promise<number> {
+    this.#unreclaimed.clear()
+    let reclaimed = 0
+    const entries = await readdir(this.runsDirectory, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith(DELETED_RUN_PREFIX)) continue
+      try {
+        await rm(join(this.runsDirectory, entry.name), { recursive: true, force: true })
+        reclaimed += 1
+      } catch {
+        this.#unreclaimed.add(entry.name)
+      }
+    }
+    return reclaimed
   }
 
   #unindexRun(runId: string): void {
