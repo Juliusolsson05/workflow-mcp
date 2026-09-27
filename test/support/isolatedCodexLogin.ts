@@ -44,6 +44,9 @@ type AuthDocument = {
 
 // Same skew as the product broker: a token that expires mid-attempt is as bad as an expired one.
 const REFRESH_SKEW_MS = 5 * 60_000
+// Measured 2026-09-26: a real Codex ChatGPT access token's exp - iat is exactly 10 days. 31 days
+// leaves room for a longer server policy while keeping any residue short-lived.
+const MAX_TOKEN_LIFETIME_MS = 31 * 24 * 60 * 60_000
 
 export type IsolatedCodexLoginOptions = {
   now?: () => number
@@ -156,6 +159,11 @@ function accessOnlySnapshot(document: AuthDocument, nowMs: number): unknown {
     // Ambiguity fails closed: a token whose lifetime we cannot read is not known to be bounded.
     throw new Error('Codex live test refuses an access token without a readable expiry')
   }
+  if (expiresAt > nowMs + MAX_TOKEN_LIFETIME_MS) {
+    // A finite `exp` can still be absurd (1e16 s is ~300 million years) and would make killed-run
+    // residue effectively permanent (round 5 of #63). Real ChatGPT access tokens live 10 days.
+    throw new Error('Codex live test refuses an access token that claims to live longer than 31 days')
+  }
   if (expiresAt <= nowMs + REFRESH_SKEW_MS) {
     throw new Error(
       'Codex access token is near expiry; run or reopen interactive Codex to refresh it, then rerun the live test',
@@ -183,7 +191,9 @@ function tokenExpiry(token: string): number | null {
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { exp?: unknown }
     // Finite only (round 4 of #63): `exp: 1e309` parses as Infinity, which is a number and would
     // pass as "expires later" — an unbounded residue if a run is killed.
-    return typeof claims.exp === 'number' && Number.isFinite(claims.exp) ? claims.exp * 1_000 : null
+    // Checked AFTER the seconds-to-ms conversion: `exp: 1e308` is finite but overflows to Infinity.
+    const expiresAt = typeof claims.exp === 'number' ? claims.exp * 1_000 : Number.NaN
+    return Number.isFinite(expiresAt) ? expiresAt : null
   } catch {
     return null
   }

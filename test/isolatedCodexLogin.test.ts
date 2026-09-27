@@ -109,6 +109,9 @@ describe('isolated Codex login for live tests', () => {
     ['an opaque access token whose expiry cannot be read', chatgptLogin('opaque-token'), /readable expiry/],
     // Round 4 of #63: JSON `1e309` parses as Infinity.
     ['an access token whose exp is not finite', chatgptLogin(`${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from('{"exp":1e309}').toString('base64url')}.sig`), /readable expiry/],
+    // Round 5 of #63: finite seconds that overflow to infinite ms, and a finite but absurd lifetime.
+    ['an access token whose exp overflows in milliseconds', chatgptLogin(`${Buffer.from('{"alg":"none"}').toString('base64url')}.${Buffer.from('{"exp":1e308}').toString('base64url')}.sig`), /readable expiry/],
+    ['an access token that claims to live for centuries', chatgptLogin(jwt(1e16)), /longer than 31 days/],
   ])('refuses %s instead of falling back to the full file', async (_label, auth, message) => {
     const source = await sourceHome(auth)
     const before = await isolatedRoots()
