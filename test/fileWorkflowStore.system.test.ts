@@ -460,7 +460,7 @@ describe('FileWorkflowStore.deleteRun (agent-code #1275)', () => {
     await expect(store.deleteRun('run_live')).rejects.toMatchObject({ code: 'run-not-terminal' })
     expect((await stat(join(root, 'runs', 'run_live'))).isDirectory()).toBe(true)
     await expect(store.deleteRun('run_missing')).rejects.toMatchObject({ code: 'run-not-found' })
-    expect(() => store.deleteRun('../escape')).rejects.toThrow(/Invalid workflow run ID/)
+    await expect(store.deleteRun('../escape')).rejects.toThrow(/Invalid workflow run ID/)
   })
 
   // Review of #65: a delete issued while the append that ENDS the run is in flight waits for it
