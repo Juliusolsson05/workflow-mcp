@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 
 import { ProcessOwnedCodexHost } from '../src/processOwnedProviderHost.js'
 import type { AgentProviderAttemptIdentity, AgentRequest } from '../src/agentProvider.js'
+import { pollUntil } from './support/pollUntil.js'
 
 const fixture = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -93,15 +94,7 @@ describe('ProcessOwnedCodexHost', () => {
       emit: async () => undefined,
     })
 
-    let grandchildPid: number | undefined
-    for (let index = 0; index < 100; index += 1) {
-      const value = await readFile(pidPath, 'utf8').catch(() => undefined)
-      if (value !== undefined) {
-        grandchildPid = Number(value)
-        break
-      }
-      await new Promise((resolveWait) => setTimeout(resolveWait, 10))
-    }
+    const grandchildPid = Number(await pollUntil(() => readFile(pidPath, 'utf8').catch(() => undefined), value => value !== undefined, 10))
     expect(grandchildPid).toBeTypeOf('number')
 
     await host.terminateAttempt(identity, { code: 'timeout', message: 'fixture timeout' })
@@ -147,12 +140,7 @@ describe('ProcessOwnedCodexHost', () => {
       emit: async () => undefined,
     })
 
-    let options: { env?: Record<string, string> } | undefined
-    for (let index = 0; index < 100; index += 1) {
-      options = await readCompleteJson(`${pidPath}.options.json`)
-      if (options !== undefined) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 10))
-    }
+    const options: { env?: Record<string, string> } | undefined = await pollUntil(() => readCompleteJson<{ env?: Record<string, string> }>(`${pidPath}.options.json`), value => value !== undefined, 10)
 
     expect(options?.env).toMatchObject({ CODEX_HOME: codexHome })
     expect(preparationCalls).toBe(1)
@@ -248,12 +236,7 @@ describe('ProcessOwnedCodexHost', () => {
       emit: async () => undefined,
     }, { allowFreshSessionFallback: true })
 
-    let hostedRequest: AgentRequest | undefined
-    for (let index = 0; index < 100; index += 1) {
-      hostedRequest = await readCompleteJson(`${pidPath}.request.json`)
-      if (hostedRequest !== undefined) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 10))
-    }
+    const hostedRequest: AgentRequest | undefined = await pollUntil(() => readCompleteJson<AgentRequest>(`${pidPath}.request.json`), value => value !== undefined, 10)
 
     expect(hostedRequest?.session).toEqual({ provider: 'codex', id: sessionId })
     expect(await readFile(join(codexHome, 'sessions', relativeRollout), 'utf8'))
@@ -299,12 +282,7 @@ describe('ProcessOwnedCodexHost', () => {
       emit: async () => undefined,
     }, { allowFreshSessionFallback: true })
 
-    let hostedRequest: AgentRequest | undefined
-    for (let index = 0; index < 100; index += 1) {
-      hostedRequest = await readCompleteJson(`${pidPath}.request.json`)
-      if (hostedRequest !== undefined) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 10))
-    }
+    const hostedRequest: AgentRequest | undefined = await pollUntil(() => readCompleteJson<AgentRequest>(`${pidPath}.request.json`), value => value !== undefined, 10)
 
     expect(hostedRequest?.session).toBeUndefined()
     expect(hostedRequest?.prompt).toBe(pidPath)

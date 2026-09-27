@@ -13,6 +13,8 @@ import { FileWorkflowStore } from '../src/fileWorkflowStore.js'
 import { registerWorkflowMcpTools, workflowMcpInstructions } from '../src/workflowMcp.js'
 import { WorkflowService } from '../src/workflowService.js'
 import { createJournalKey } from '../src/workflowJournal.js'
+import { isTerminalRunStatus, pollUntil } from './support/pollUntil.js'
+
 
 describe('workflow MCP facade', () => {
   it('describes the active source capability without teaching read-only clients to author', () => {
@@ -132,13 +134,20 @@ describe('workflow MCP facade', () => {
     })
     expect(JSON.parse((started.content[0] as { text: string }).text)).toEqual(started.structuredContent)
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
-    let cursor = 0
-    for (let index = 0; index < 100; index += 1) {
-      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      cursor = (status.structuredContent as { run: { cursor: number } }).run.cursor
-      if (cursor >= 5) break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    const reached = await pollUntil(
+      () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
+      // Cursor 5 (session.started) is the durable resume boundary the cancel and
+      // resume below rely on. A run that finishes first ends the wait at once
+      // instead of polling to the test timeout, and the assertion below names it.
+      (status) => {
+        const run = (status.structuredContent as { run: { cursor: number; status: string } }).run
+        return run.cursor >= 5 || isTerminalRunStatus(run.status)
+      },
+    )
+    // Asserted separately from the wait (review of #71, round 2, a): the page
+    // assertions below need only three events, so without this a wait that
+    // returned early (at cursor 4, still running) passed unnoticed.
+    expect((reached.structuredContent as { run: { cursor: number } }).run.cursor).toBeGreaterThanOrEqual(5)
     const events = await client.callTool({
       name: 'workflow_run_events',
       arguments: { runId, after: 0, limit: 2 },
@@ -158,14 +167,10 @@ describe('workflow MCP facade', () => {
       arguments: { runId, idempotencyKey: 'roundtrip-resume' },
     })
     const resumedId = (resumed.structuredContent as { run: { runId: string } }).run.runId
-    for (let index = 0; index < 100; index += 1) {
-      const status = await client.callTool({
-        name: 'workflow_run_status',
-        arguments: { runId: resumedId },
-      })
-      if ((status.structuredContent as { run: { status: string } }).run.status === 'completed') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await pollUntil(
+      () => client.callTool({ name: 'workflow_run_status', arguments: { runId: resumedId } }),
+      (status) => isTerminalRunStatus((status.structuredContent as { run: { status: string } }).run.status),
+    )
     const resumedStatus = await client.callTool({
       name: 'workflow_run_status',
       arguments: { runId: resumedId },
@@ -337,11 +342,10 @@ describe('workflow MCP facade', () => {
       args: { items: ['fast'] },
     })
 
-    let status = await service.status({ cwd: fixture.cwd }, started.runId)
-    for (let index = 0; index < 100 && status.status !== 'completed'; index += 1) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-      status = await service.status({ cwd: fixture.cwd }, started.runId)
-    }
+    const status = await pollUntil(
+      () => service.status({ cwd: fixture.cwd }, started.runId),
+      (current) => isTerminalRunStatus(current.status),
+    )
 
     expect(status.status).toBe('completed')
     expect(provider.calls.map((call) => call.request.prompt)).toEqual([
@@ -385,12 +389,10 @@ describe('workflow MCP facade', () => {
 
     const started = await client.callTool({ name: 'workflow_run', arguments: { name: 'fanout' } })
     const runId = (started.structuredContent as { run: { runId: string } }).run.runId
-    for (let index = 0; index < 400; index += 1) {
-      const status = await client.callTool({ name: 'workflow_run_status', arguments: { runId } })
-      const state = (status.structuredContent as { run: { status: string } }).run.status
-      if (state === 'completed' || state === 'completed_with_errors') break
-      await new Promise((resolveWait) => setTimeout(resolveWait, 5))
-    }
+    await pollUntil(
+      () => client.callTool({ name: 'workflow_run_status', arguments: { runId } }),
+      (status) => isTerminalRunStatus((status.structuredContent as { run: { status: string } }).run.status),
+    )
 
     const listed = await client.callTool({ name: 'workflow_agent_list', arguments: { runId } })
     const agents = (listed.structuredContent as {
