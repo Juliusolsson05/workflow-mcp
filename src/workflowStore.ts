@@ -152,6 +152,17 @@ export interface WorkflowStore {
    * generation as run state. This callback grants no reusable permit and drains before release.
    */
   runOwnedMutation?<T>(operation: () => Promise<T>): Promise<T>
+  /**
+   * Remove one TERMINAL run and every index entry for it. Retention policy (which runs, when, and
+   * whole lineages only) belongs to the embedding application.
+   */
+  deleteRun?(runId: string): Promise<void>
+  /**
+   * Retry reclaiming the bytes of runs `deleteRun` already deleted but could not fully remove
+   * (a locked subdirectory, a filesystem error). `remaining` is what is still on disk afterwards, so
+   * an embedder's disk policy can see — and report — leftovers instead of assuming success.
+   */
+  reclaimDeletedRuns?(): Promise<{ reclaimed: number; remaining: number }>
   createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunManifest>
   getManifest(runId: string): Promise<WorkflowRunManifest | undefined>
   listManifests(): Promise<WorkflowRunManifest[]>

@@ -5,6 +5,7 @@ import { createReadStream, readFileSync } from 'node:fs'
 import {
   chmod,
   copyFile,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -14,7 +15,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
 
@@ -100,6 +101,7 @@ export class WorkflowStoreError extends Error {
     | 'corrupt-store'
     | 'event-log-full'
     | 'lineage-active'
+    | 'run-not-terminal'
     | 'io-error'
     | 'owner-conflict'
     | 'result-too-large'
@@ -149,6 +151,19 @@ export class FileWorkflowStore implements WorkflowStore {
   readonly #runKeysByStatus = new Map<WorkflowRunStatus, string[]>()
   readonly #lineageMembers = new Map<string, Set<string>>()
   readonly #successors = new Map<string, Set<string>>()
+  /**
+   * How many times each run id has been deleted in this process (review of #65). Reads take no
+   * permit, so a snapshot or event scan that started before a deleteRun can finish after it and
+   * re-cache the deleted run's state forever. Readers capture this before their first await and
+   * write caches only if it is unchanged.
+   */
+  readonly #deletions = new Map<string, number>()
+  /**
+   * `.deleted-` directories whose removal has failed (review of #65, round 4 C). Without this a
+   * persistent failure was silent: deleteRun had succeeded, initialize swallowed every retry, and
+   * the caller's disk policy believed the bytes were gone. Rebuilt by every initialize/reclaim.
+   */
+  readonly #unreclaimed = new Set<string>()
   readonly #maxEventFileBytes: number
   readonly #maxResultBytes: number
   #leaseToken: string | undefined
@@ -203,6 +218,9 @@ export class FileWorkflowStore implements WorkflowStore {
     const entries = await readdir(this.runsDirectory, { withFileTypes: true })
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
+      // A run deleteRun moved aside but could not fully remove (see #deleteRun). It is already
+      // deleted — never indexed, never quarantined; #sweepDeletedRuns below retries its bytes.
+      if (isDeletedRunName(entry.name)) continue
       try {
         await this.#recoverEventTail(entry.name)
         const manifest = await this.getManifest(entry.name)
@@ -220,6 +238,7 @@ export class FileWorkflowStore implements WorkflowStore {
         this.#quarantinedRuns.set(entry.name, error)
       }
     }
+    await this.#sweepDeletedRuns()
   }
 
   listQuarantinedRuns(): readonly { runId: string; code: string; message: string }[] {
@@ -506,6 +525,132 @@ export class FileWorkflowStore implements WorkflowStore {
     }
   }
 
+  /**
+   * Remove one terminal run: its directory and every in-memory index entry.
+   *
+   * WHY the store owns this and the embedding app owns WHEN to call it (agent-code #1275): nothing
+   * deleted runs before, and `<userData>/workflows/runs` grew by ~140 MB a day for one developer. The
+   * app decides the retention policy (as it does for its other disk budgets); only the store can
+   * delete a run without leaving its lease-scoped writer, summaries, status keys, lineage and
+   * successor indexes, snapshot cache and event offsets pointing at a directory that is gone.
+   *
+   * WHY only terminal runs: a live run is still being written. That also covers an append in
+   * flight — until the append that makes a run terminal lands, its manifest is not terminal, and
+   * a terminal manifest refuses further appends (see #appendEvent) — so no separate check. Whole-lineage policy — never delete a successor while an
+   * interrupted predecessor stays, or startup would treat that predecessor as un-continued and may
+   * auto-recover it — is the caller's, because it needs the whole inventory; the store cannot tell
+   * a caller's partial pass from a mistake.
+   */
+  async deleteRun(runId: string): Promise<void> {
+    // WHY join the run's append tail (review of #65): the writer permit is an admission gate, not
+    // a mutex. Without the tail, a delete admitted between the terminal append's manifest rename
+    // and its re-index removed the directory and the append then re-indexed a run that no longer
+    // exists — a ghost in listRuns that no retry could delete.
+    const previous = this.#appendTails.get(runId) ?? Promise.resolve()
+    let releaseTail!: () => void
+    const owned = new Promise<void>((resolveOwned) => { releaseTail = resolveOwned })
+    this.#appendTails.set(runId, owned)
+    await previous.catch(() => undefined)
+    try {
+      await this.#deleteRun(runId)
+    } finally {
+      releaseTail()
+      if (this.#appendTails.get(runId) === owned) this.#appendTails.delete(runId)
+    }
+  }
+
+  async #deleteRun(runId: string): Promise<void> {
+    await this.#writers.run(async () => {
+      const directory = this.#runDirectory(runId)
+      const manifest = await this.getManifest(runId)
+      if (manifest === undefined) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`)
+      if (!TERMINAL_STATUSES.has(manifest.status)) {
+        throw new WorkflowStoreError('run-not-terminal', `Workflow run ${runId} is ${manifest.status}`)
+      }
+      // WHY move the run aside atomically before removing anything (rounds 1-3 of #65):
+      //
+      // - Unindex-then-rm hid a run that a failed rm left on disk (round 1).
+      // - rm-then-unindex, gated on the manifest or the directory, still left a PARTIAL removal:
+      //   `rm` unlinks entries one by one, so a failure after `manifest.json` went left a run
+      //   directory with no manifest. The live process could keep it indexed and retry (round 2),
+      //   but after a restart `initialize` skips a directory without a manifest, so the remnant
+      //   was in no index, not quarantined, and `deleteRun` said run-not-found — undeletable
+      //   through the store, and invisible to retention, forever (round 3, reviewer C).
+      //
+      // A same-parent `rename` is atomic: either the run is still whole under its own name (the
+      // rename failed; it stays indexed, the caller's retry tries again) or it is entirely gone
+      // from its name. What remains is only a `.deleted-` directory that no run id can name and
+      // that `initialize` sweeps on every start. Same PARENT on purpose: moving a directory to a
+      // different parent needs write permission on the directory itself (its `..` entry), which
+      // a locked run directory would refuse.
+      const trash = join(this.runsDirectory, `${DELETED_RUN_PREFIX}${runId}-${randomUUID()}`)
+      try {
+        await rename(directory, trash)
+      } catch (cause) {
+        throw new WorkflowStoreError('io-error', `Cannot delete workflow run: ${runId}`, { cause })
+      }
+      this.#unindexRun(runId)
+      // The run is deleted once the rename lands. Reclaiming its bytes is best effort: whatever
+      // this rm cannot remove (a locked subdirectory) is retried by the next initialize().
+      await rm(trash, { recursive: true, force: true }).catch(async () => {
+        // Only if it is really still there (round 5 of #65, C): a concurrent reclaimDeletedRuns may
+        // have removed it while this rm was failing, and reporting gone bytes as "still on disk"
+        // would send the embedder chasing a disk problem that does not exist.
+        if (!(await isConfirmedMissing(trash))) this.#unreclaimed.add(basename(trash))
+      })
+    })
+  }
+
+  /** Deleted runs whose bytes are still on disk; see `reclaimDeletedRuns`. */
+  listUnreclaimedDeletions(): readonly string[] {
+    return [...this.#unreclaimed].sort()
+  }
+
+  async reclaimDeletedRuns(): Promise<{ reclaimed: number; remaining: number }> {
+    return await this.#writers.run(async () => {
+      const reclaimed = await this.#sweepDeletedRuns()
+      return { reclaimed, remaining: this.#unreclaimed.size }
+    })
+  }
+
+  /** Remove every `.deleted-` directory it can; the rest stay listed as unreclaimed. */
+  async #sweepDeletedRuns(): Promise<number> {
+    this.#unreclaimed.clear()
+    let reclaimed = 0
+    const entries = await readdir(this.runsDirectory, { withFileTypes: true })
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !isDeletedRunName(entry.name)) continue
+      try {
+        await rm(join(this.runsDirectory, entry.name), { recursive: true, force: true })
+        reclaimed += 1
+      } catch {
+        this.#unreclaimed.add(entry.name)
+      }
+    }
+    return reclaimed
+  }
+
+  #unindexRun(runId: string): void {
+    this.#deletions.set(runId, (this.#deletions.get(runId) ?? 0) + 1)
+    const summary = this.#runSummaries.get(runId)
+    this.#runSummaries.delete(runId)
+    this.#snapshotCache.delete(runId)
+    this.#eventOffsets.delete(runId)
+    if (this.#journalResultCache?.runId === runId) this.#journalResultCache = undefined
+    if (summary === undefined) return
+    removeSortedKey(this.#runKeysByStatus.get(summary.status), runIndexKey(summary))
+    const lineage = this.#lineageMembers.get(summary.lineageId)
+    lineage?.delete(runId)
+    if (lineage?.size === 0) this.#lineageMembers.delete(summary.lineageId)
+    // Lookups already filter through #runSummaries, so a stale id here would be invisible; it is
+    // removed anyway so deleted runs do not accumulate in memory for the life of the process.
+    if (summary.resumedFromRunId !== undefined) {
+      const successors = this.#successors.get(summary.resumedFromRunId)
+      successors?.delete(runId)
+      if (successors?.size === 0) this.#successors.delete(summary.resumedFromRunId)
+    }
+  }
+
   async getManifest(runId: string): Promise<WorkflowRunManifest | undefined> {
     const quarantined = this.#quarantinedRuns.get(runId)
     if (quarantined !== undefined) throw quarantined
@@ -524,6 +669,7 @@ export class FileWorkflowStore implements WorkflowStore {
     const manifests: WorkflowRunManifest[] = []
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
+      if (isDeletedRunName(entry.name)) continue
       if (this.#quarantinedRuns.has(entry.name)) continue
       const manifest = await this.getManifest(entry.name)
       if (manifest) manifests.push(manifest)
@@ -940,12 +1086,14 @@ export class FileWorkflowStore implements WorkflowStore {
     if (cached?.cursor === manifest.cursor) {
       return { manifest, state: cached.state, cursor: manifest.cursor }
     }
+    const epoch = this.#deletions.get(runId) ?? 0
     let state = createWorkflowState(runId)
     for await (const stored of this.#events(runId, manifest.cursor)) {
       state = reduceWorkflowState(state, stored.event)
     }
     const newerCache = this.#snapshotCache.get(runId)
-    if (newerCache === undefined || newerCache.cursor <= manifest.cursor) {
+    const deletedMeanwhile = (this.#deletions.get(runId) ?? 0) !== epoch
+    if (!deletedMeanwhile && (newerCache === undefined || newerCache.cursor <= manifest.cursor)) {
       this.#snapshotCache.set(runId, { cursor: manifest.cursor, state })
     }
     return { manifest, state, cursor: manifest.cursor }
@@ -954,7 +1102,7 @@ export class FileWorkflowStore implements WorkflowStore {
   async loadWorkflow(runId: string) {
     const manifest = await this.#requiredManifest(runId)
     const path = join(this.#runDirectory(runId), 'workflow.js')
-    const source = await readFile(path, 'utf8')
+    const source = await this.#readRunFile(runId, path)
     const loaded = parseWorkflowSource(source, manifest.workflow.filePath)
     if (loaded.sourceHash !== manifest.workflow.sourceHash) {
       throw new WorkflowStoreError('corrupt-store', `Stored workflow source changed for ${runId}`)
@@ -965,11 +1113,32 @@ export class FileWorkflowStore implements WorkflowStore {
   async loadArgs(runId: string): Promise<{ provided: boolean; value?: unknown }> {
     await this.#requiredManifest(runId)
     const path = join(this.#runDirectory(runId), 'args.json')
-    const value = JSON.parse(await readFile(path, 'utf8')) as unknown
+    const value = JSON.parse(await this.#readRunFile(runId, path)) as unknown
     if (!isObject(value) || typeof value.provided !== 'boolean') {
       throw new WorkflowStoreError('corrupt-store', `Stored workflow arguments are invalid: ${path}`)
     }
     return value.provided ? { provided: true, value: value.value } : { provided: false }
+  }
+
+  /**
+   * Read a file that every run has, after its manifest check passed.
+   *
+   * WHY (round 2 of #65): with deleteRun, the run can vanish between #requiredManifest and this
+   * read, and the resume path then surfaced a raw ENOENT with no store error code. A missing
+   * file whose manifest is also gone now is that race, so it reports run-not-found like every
+   * other read of a deleted run. A missing file next to a manifest that is still there is a
+   * broken run, not a deleted one, so it stays corrupt-store rather than being explained away.
+   */
+  async #readRunFile(runId: string, path: string): Promise<string> {
+    try {
+      return await readFile(path, 'utf8')
+    } catch (cause) {
+      if (!isMissing(cause)) throw cause
+      if (await isConfirmedMissing(this.#manifestPath(runId))) {
+        throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`, { cause })
+      }
+      throw new WorkflowStoreError('corrupt-store', `Workflow run file is missing: ${path}`, { cause })
+    }
   }
 
   journalPath(runId: string): string {
@@ -1061,12 +1230,20 @@ export class FileWorkflowStore implements WorkflowStore {
     nearCursor = 0,
   ): AsyncGenerator<StoredWorkflowEvent> {
     const path = this.#eventsPath(runId)
-    const info = await stat(path)
+    const epoch = this.#deletions.get(runId) ?? 0
+    const info = await stat(path).catch((cause: unknown) => {
+      // A run deleted after the caller's manifest check surfaced as a bare ENOENT (review of #65);
+      // it is the same answer as a run that never existed.
+      if (isMissing(cause)) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`, { cause })
+      throw cause
+    })
     if (info.size > this.#maxEventFileBytes) {
       throw new WorkflowStoreError('corrupt-store', `Workflow event log is too large: ${path}`)
     }
     const offsets = this.#eventOffsets.get(runId) ?? new Map<number, number>()
-    this.#eventOffsets.set(runId, offsets)
+    // Attach only if no delete ran while stat was in flight; otherwise this scan works on a detached
+    // map and the deleted run's offsets are not resurrected.
+    if ((this.#deletions.get(runId) ?? 0) === epoch) this.#eventOffsets.set(runId, offsets)
     let startCursor = 1
     let startOffset = 0
     for (const [indexedCursor, indexedOffset] of offsets) {
@@ -1080,32 +1257,39 @@ export class FileWorkflowStore implements WorkflowStore {
     })
     let cursor = startCursor - 1
     let lineNumber = 0
-    for await (const line of lines) {
-      lineNumber += 1
-      if (line.length === 0) continue
-      let value: unknown
-      try {
-        value = JSON.parse(line) as unknown
-      } catch (cause) {
-        throw new WorkflowStoreError(
-          'corrupt-store',
-          `Workflow event ${lineNumber} is invalid JSON: ${path}`,
-          { cause },
-        )
+    try {
+      for await (const line of lines) {
+        lineNumber += 1
+        if (line.length === 0) continue
+        let value: unknown
+        try {
+          value = JSON.parse(line) as unknown
+        } catch (cause) {
+          throw new WorkflowStoreError(
+            'corrupt-store',
+            `Workflow event ${lineNumber} is invalid JSON: ${path}`,
+            { cause },
+          )
+        }
+        cursor += 1
+        if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
+        const event = parseStoredEvent(value, runId, cursor, path)
+        // WHY the upper-bound check must happen before yield: append fsyncs events.jsonl before it
+        // advances manifest.cursor. A concurrent health/snapshot read can therefore see one durable
+        // record beyond its manifest. Yielding that future record under the old cursor poisons the
+        // projection cache, then the writer applies the same event a second time and fails the run
+        // with a false duplicate-sequence error. The manifest is the published commit boundary even
+        // though the append-only file intentionally reaches disk first for crash recovery.
+        if (cursor > throughCursor) break
+        yield event
+        startOffset += Buffer.byteLength(line, 'utf8') + 1
+        if (cursor >= throughCursor) break
       }
-      cursor += 1
-      if ((cursor - 1) % EVENT_INDEX_STRIDE === 0) offsets.set(cursor, startOffset)
-      const event = parseStoredEvent(value, runId, cursor, path)
-      // WHY the upper-bound check must happen before yield: append fsyncs events.jsonl before it
-      // advances manifest.cursor. A concurrent health/snapshot read can therefore see one durable
-      // record beyond its manifest. Yielding that future record under the old cursor poisons the
-      // projection cache, then the writer applies the same event a second time and fails the run
-      // with a false duplicate-sequence error. The manifest is the published commit boundary even
-      // though the append-only file intentionally reaches disk first for crash recovery.
-      if (cursor > throughCursor) break
-      yield event
-      startOffset += Buffer.byteLength(line, 'utf8') + 1
-      if (cursor >= throughCursor) break
+    } catch (cause) {
+      // The log can disappear between the stat above and the stream's open when the run is deleted
+      // concurrently (review of #65); report it as the missing run it is, not a bare ENOENT.
+      if (isMissing(cause)) throw new WorkflowStoreError('run-not-found', `Workflow run not found: ${runId}`, { cause })
+      throw cause
     }
   }
 
@@ -2240,8 +2424,38 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/**
+ * Prefix of a deleted run's directory while its bytes are being reclaimed. A leading `.` can never
+ * match a run id (`run_…`), so no store call can name, index or quarantine it.
+ */
+const DELETED_RUN_PREFIX = '.deleted-'
+
+/**
+ * Only a name `deleteRun` itself generates: `.deleted-<run id>-<uuid>`.
+ *
+ * WHY exact (round 5 of #65, reviewer C): the sweep recursively removes what it matches, and a bare
+ * prefix check erased any directory someone had put under `runs/` whose name merely began with
+ * `.deleted-`. Anything else is left alone; startup then quarantines it (its name is not a run id),
+ * which keeps it visible instead of silently gone.
+ */
+const DELETED_RUN_NAME = /^\.deleted-run_[A-Za-z0-9_-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+function isDeletedRunName(name: string): boolean {
+  return DELETED_RUN_NAME.test(name)
+}
+
 function isMissing(error: unknown): boolean {
   return isObject(error) && error.code === 'ENOENT'
+}
+
+/** True only when `lstat` says ENOENT; any other outcome (present, EACCES, …) is "not proven gone". */
+async function isConfirmedMissing(path: string): Promise<boolean> {
+  try {
+    await lstat(path)
+    return false
+  } catch (error) {
+    return isMissing(error)
+  }
 }
 
 function isAlreadyExists(error: unknown): boolean {

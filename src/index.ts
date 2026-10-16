@@ -33,7 +33,11 @@ export {
 } from './claudeResume.js'
 export type { ClaudeWorkflowResume, ClaudeWorkflowRunMetadata } from './claudeResume.js'
 
-export { PersistentJournalError, PersistentWorkflowJournal } from './persistentWorkflowJournal.js'
+// readWorkflowJournalSnapshots is the read-only door to a run's journal, with the same validation
+// resume uses. Embedders that must know which provider sessions a kept run references (agent-code's
+// workflow retention, #1275) read through it instead of pattern-matching the file, so an unknown or
+// corrupt journal fails the same way for them as for a resume.
+export { PersistentJournalError, PersistentWorkflowJournal, readWorkflowJournalSnapshots } from './persistentWorkflowJournal.js'
 export {
   AgentAttemptTimeoutError,
   AttemptLivenessMonitor,
