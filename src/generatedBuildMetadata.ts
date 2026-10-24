@@ -2,5 +2,5 @@
 export const WORKFLOW_MCP_VERSION = "0.0.0"
 export const WORKFLOW_MCP_REVISION = "development"
 export const CODEX_SDK_VERSION = "0.154.0"
-export const MCP_SDK_VERSION = "1.30.0"
+export const MCP_SDK_VERSION = "1.32.2"
 export const MCP_STABLE_PROTOCOL_VERSION = '2025-11-25'
