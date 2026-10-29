@@ -10,6 +10,6 @@ permissions:
 
 jobs:
   package:
-    uses: Juliusolsson05/agent-code/.github/workflows/reusable-package-ci.yml@04071925e234eb9ec76f0b9c3a4daec58710e551
+    uses: Juliusolsson05/agent-code/.github/workflows/reusable-package-ci.yml@a7074ea19afbfcd5e492f797e861d03500ed8e69
     with:
       node-versions: '["20.19.0", "24"]'
